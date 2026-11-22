@@ -452,21 +452,49 @@ def _extract_spoken_dialogue_for_reveal(pa: PageAnalysis) -> str:
     return " ".join(chunks)
 
 
+_DESCRIPTIVE_ANON_MARKERS = (
+    "người ",
+    "kẻ ",
+    "cô gái",
+    "chàng trai",
+    "cậu bé",
+    "cô bé",
+    "ông lão",
+    "bà lão",
+    "bóng đen",
+    "quái vật",
+    "sinh vật",
+    "chưa rõ",
+    "bí ẩn",
+    "vô danh",
+    "đầu ",
+    "hình ",
+)
+
+
 def extract_distinctive_char_patterns(
     ch: CharacterProfile,
     canonical_set: set[str],
 ) -> list[re.Pattern[str]]:
-    """Build word-boundary regexes for distinctive name tokens of a character."""
+    """Build word-boundary regexes for proper/distinctive character names (ignoring generic descriptive labels)."""
     cname = ch.canonical_name.strip()
-    if not cname:
+    if not cname or cname.startswith("["):
+        return []
+    low_c = cname.lower()
+    if any(m in low_c for m in _DESCRIPTIVE_ANON_MARKERS):
         return []
     tokens: list[str] = [cname]
     words = [w for w in re.split(r"[\s\-]+", cname) if len(w) >= 3 and w.lower() not in _GENERIC_NAME_TOKENS]
-    if len(words) > 1:
+    if len(words) > 1 and all(w[0].isupper() for w in words):
         tokens.extend(words)
     for al in ch.aliases:
         al_c = al.strip()
-        if len(al_c) >= 3 and al_c.lower() not in canonical_set:
+        if (
+            len(al_c) >= 3
+            and not al_c.startswith("[")
+            and al_c.lower() not in canonical_set
+            and not any(m in al_c.lower() for m in _DESCRIPTIVE_ANON_MARKERS)
+        ):
             tokens.append(al_c)
     return [
         re.compile(rf"(?<!\w){re.escape(tok)}(?!\w)", flags=re.IGNORECASE | re.UNICODE)
@@ -666,7 +694,7 @@ class PageIndexBuilder:
         seed_info = ""
         if seed_path.exists():
             try:
-                seed_info = seed_path.read_text(encoding="utf-8")[:6000]
+                seed_info = seed_path.read_text(encoding="utf-8")
             except Exception:
                 seed_info = ""
 
@@ -697,9 +725,9 @@ class PageIndexBuilder:
 
         label_summary = "\n".join(
             f"- {lbl!r} (xuất hiện ở {len(pgs)} trang: {pgs[:6]})"
-            for lbl, pgs in sorted(label_pages.items(), key=lambda kv: -len(kv[1]))[:45]
+            for lbl, pgs in sorted(label_pages.items(), key=lambda kv: -len(kv[1]))
         )
-        unk_block = "\n".join(unknown_contexts[:30])
+        unk_block = "\n".join(unknown_contexts)
 
         try:
             res = self.llm.complete_json(
@@ -997,7 +1025,7 @@ class PageIndexBuilder:
                         "(ví dụ: '[p101-p105] ...'), TUYỆT ĐỐI KHÔNG bỏ sót nửa cuối và trang cuối.\n"
                         "4) Thuộc tính `weight` (1..5) và `transition` ('continuous'|'pov_switch'|'flashback'|'time_skip')."
                     ),
-                    user_prompt=f"Đoạn {nid} ({job['page_range']}):\n{job['md_body'][:48000]}",
+                    user_prompt=f"Đoạn {nid} ({job['page_range']}):\n{job['md_body']}",
                     xml_template=_SCENE_SUMMARIES_XML_TEMPLATE,
                     parse_fn=_parse_scenes_xml,
                 )
@@ -1019,7 +1047,7 @@ class PageIndexBuilder:
                     cached_summaries[batch_jobs[0]["node_id"]] = got
                 return
             joined = "\n\n".join(
-                f"=== SCENE {j['node_id']} ({j['page_range']}, gợi ý weight={j['weight']}, {j['transition']}) ===\n{j['md_body'][:18000]}"
+                f"=== SCENE {j['node_id']} ({j['page_range']}, gợi ý weight={j['weight']}, {j['transition']}) ===\n{j['md_body']}"
                 for j in batch_jobs
             )
             expected_ids = [j["node_id"] for j in batch_jobs]
@@ -1159,7 +1187,7 @@ class PageIndexBuilder:
         seed_cast_txt = ""
         if seed_path.exists():
             try:
-                seed_cast_txt = seed_path.read_text(encoding="utf-8")[:5000]
+                seed_cast_txt = seed_path.read_text(encoding="utf-8")
             except Exception:
                 seed_cast_txt = ""
 
@@ -1173,7 +1201,7 @@ class PageIndexBuilder:
                 prev_bible = None
 
         prev_bible_note = (
-            f"\nHồ sơ tập trước để giữ đồng bộ tên & phiên âm:\n{prev_bible.model_dump_json(indent=2)[:4000]}\n"
+            f"\nHồ sơ tập trước để giữ đồng bộ tên & phiên âm:\n{prev_bible.model_dump_json(indent=2)}\n"
             if prev_bible
             else ""
         )

@@ -681,21 +681,28 @@ def test_xml_parser_verify_code_reveal_spoiler_and_sanitize_retry(tmp_path: Path
     analyses_r[4].panels[0].dialogue_summary = 'Elena mỉm cười: "Tên tôi là Elena."'  # actual reveal at p005
     bible = StoryBible(
         series_title_guess="Test",
-        characters=[CharacterProfile(canonical_name="Elena", aliases=["Tiểu thư E"])],
+        characters=[
+            CharacterProfile(canonical_name="Elena", aliases=["Tiểu thư E"]),
+            CharacterProfile(canonical_name="Người bí ẩn sau rèm"),
+            CharacterProfile(canonical_name="Chain hình búp bê khâu vá"),
+        ],
         pronunciation_map={},
     )
     _compute_character_reveal_pages(analyses_r, bible)
     assert bible.characters[0].first_named_page_id == "ch01_p005"
+    assert bible.characters[1].first_named_page_id == ""
+    assert bible.characters[2].first_named_page_id == ""
 
     critic = CriticAgent(LLMClient(LLMConfig(offline_fallback=True)), polish_seams=False)
     spoiler_beats = [
         ScriptBeat(beat_id="b001", narration_vi="Elena bước vào sảnh tối.", panel_ids=["ch01_p002_P1"]),
-        ScriptBeat(beat_id="b002", narration_vi="Cô gái cười tự xưng là Elena.", panel_ids=["ch01_p005_P1"]),
+        ScriptBeat(beat_id="b002", narration_vi="Cô gái sau rèm cười tự xưng là Elena.", panel_ids=["ch01_p005_P1"]),
     ]
     j_sp = tmp_path / "j_sp"
     j_sp.mkdir(parents=True, exist_ok=True)
     _, rep = critic.review(RecapScript(title_vi="S", beats=spoiler_beats), manifest_r, bible, j_sp)
     assert any(i.category == "spoiler_name" and i.beat_id == "b001" for i in rep.issues)
+    assert not any(i.category == "spoiler_name" and i.beat_id == "b002" for i in rep.issues)
 
     # 4) _sanitize_part_beats normalizes short suffix and retries on empty fallback_count > 0
     part_xml = """<part_script><beats>

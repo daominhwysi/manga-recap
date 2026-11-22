@@ -308,7 +308,7 @@ class CriticAgent:
             if i in flagged_indices and panel_text_lookup:
                 facts = [panel_text_lookup[pid] for pid in b.panel_ids if pid in panel_text_lookup]
                 if facts:
-                    facts_txt = " | ".join(facts)[:360].replace('"', "'")
+                    facts_txt = " | ".join(facts).replace('"', "'")
                     facts_attr = f"\n    <grounded_facts>{facts_txt}</grounded_facts>"
             payload_lines.append(
                 f'  <beat id="{b.beat_id}" section="{b.section}" beat_type="{b.beat_type}" mood="{b.mood}">\n'
@@ -321,7 +321,7 @@ class CriticAgent:
             f"{c.canonical_name} (lộ từ {c.first_named_page_id})" if c.first_named_page_id else c.canonical_name
             for c in bible.characters
         ]
-        notes_txt = "\n".join(f"- {n}" for n in flagged_notes[:12]) or "Không có lỗi nghiêm trọng — hãy chuốt văn nói mượt mà."
+        notes_txt = "\n".join(f"- {n}" for n in flagged_notes) or "Không có lỗi nghiêm trọng — hãy chuốt văn nói mượt mà."
         budget_hint = (
             f"Tổng ngân sách mục tiêu toàn tập: ~{target_total_words} từ (cắt gọn câu thừa nếu vượt quá nhiều)."
             if target_total_words
