@@ -118,15 +118,17 @@ def test_page_analyzer_batch_partial_fallback(tmp_path: Path) -> None:
     cfg = LLMConfig(api_key="dummy", vision_api_key="dummy")
     llm = LLMClient(cfg)
 
-    def fake_complete(agent_name, system_prompt, user_prompt, schema_cls, image_paths=None, **kw):
-        if schema_cls is PageBatchAnalysis:
+    def fake_complete_xml(agent_name, system_prompt, user_prompt, xml_template, parse_fn, image_paths=None, **kw):
+        if "ảnh trang truyện" in user_prompt or "cần xuất kết quả" in user_prompt:
             # Return only page 1; page 2 is omitted -> must trigger single-page fallback
             return PageBatchAnalysis(
                 pages=[PageAnalysis(page_id="ch01_p001", chapter_id="ch01", page_summary="batch_p1", panels=[])]
             )
-        return PageAnalysis(page_id="ch01_p002", chapter_id="ch01", page_summary="single_p2", panels=[])
+        return PageBatchAnalysis(
+            pages=[PageAnalysis(page_id="ch01_p002", chapter_id="ch01", page_summary="single_p2", panels=[])]
+        )
 
-    llm.complete_json = fake_complete  # type: ignore
+    llm.complete_xml = fake_complete_xml  # type: ignore
     agent = PageAnalyzerAgent(llm)
     out = agent.run_all(manifest, tmp_path / "job", max_workers=1, batch_size=2)
     assert [p.page_summary for p in out] == ["batch_p1", "single_p2"]
@@ -157,17 +159,19 @@ def test_scriptwriter_3_tier_routing_and_critic_scoped_fallback(tmp_path: Path) 
     llm = LLMClient(LLMConfig(api_key="dummy"))
     calls: list[str] = []
 
-    def fake_complete(agent_name, system_prompt, user_prompt, schema_cls, image_paths=None, **kw):
+    def fake_complete_json(agent_name, system_prompt, user_prompt, schema_cls, image_paths=None, **kw):
         calls.append(agent_name)
-        if schema_cls is ScriptOutline:
-            return ScriptOutline(
-                title_vi="Test Vol",
-                hook_summary="Hook",
-                parts=[
-                    OutlinePart(part_id="part_01", title="P1", scene_ids=["scene_001"]),
-                    OutlinePart(part_id="part_02", title="P2", scene_ids=["scene_002"]),
-                ],
-            )
+        return ScriptOutline(
+            title_vi="Test Vol",
+            hook_summary="Hook",
+            parts=[
+                OutlinePart(part_id="part_01", title="P1", scene_ids=["scene_001"]),
+                OutlinePart(part_id="part_02", title="P2", scene_ids=["scene_002"]),
+            ],
+        )
+
+    def fake_complete_xml(agent_name, system_prompt, user_prompt, xml_template, parse_fn, image_paths=None, **kw):
+        calls.append(agent_name)
         return PartScriptResponse(
             beats=[
                 ScriptBeat(
@@ -178,7 +182,8 @@ def test_scriptwriter_3_tier_routing_and_critic_scoped_fallback(tmp_path: Path) 
             ]
         )
 
-    llm.complete_json = fake_complete  # type: ignore
+    llm.complete_json = fake_complete_json  # type: ignore
+    llm.complete_xml = fake_complete_xml  # type: ignore
     writer = ScriptwriterAgent(llm, ScriptConfig(fast_path_max_pages=10, full_context_max_tokens=100000))
     script = writer.write_script(bible, analyses, "kich_tinh", tmp_path / "j", tree=tree)
     assert "OutlinePlannerAgent" in calls
@@ -521,12 +526,12 @@ def test_full_alias_resolution_compact_md_and_closed_loop_critic(tmp_path: Path)
 
     llm_c = LLMClient(LLMConfig(api_key="dummy"))
 
-    def fake_polish(agent_name, system_prompt, user_prompt, schema_cls, **kw):
+    def fake_polish(agent_name, system_prompt, user_prompt, xml_template, parse_fn, **kw):
         return _SeamPolishResponse(
             rewrites=[_SeamRewrite(beat_id="b003", narration_vi="Arthur lập tức lao lên phá vỡ vòng vây.")]
         )
 
-    llm_c.complete_json = fake_polish  # type: ignore
+    llm_c.complete_xml = fake_polish  # type: ignore
     critic = CriticAgent(llm_c, polish_seams=True)
     final_s, rep = critic.review(RecapScript(title_vi="T", beats=beats), manifest, bible, tmp_path / "j_cr")
     assert rep.passed is True
@@ -598,7 +603,7 @@ def test_critic_round2_budget_targets_longest_beats_and_product_evaluator(tmp_pa
     captured_flagged: list[str] = []
     llm_budget = LLMClient(LLMConfig(api_key="dummy"))
 
-    def fake_budget_polish(agent_name, system_prompt, user_prompt, schema_cls, **kw):
+    def fake_budget_polish(agent_name, system_prompt, user_prompt, xml_template, parse_fn, **kw):
         captured_flagged.append(user_prompt)
         return _SeamPolishResponse(
             rewrites=[
@@ -607,7 +612,7 @@ def test_critic_round2_budget_targets_longest_beats_and_product_evaluator(tmp_pa
             ]
         )
 
-    llm_budget.complete_json = fake_budget_polish  # type: ignore
+    llm_budget.complete_xml = fake_budget_polish  # type: ignore
     sc_cfg = ScriptConfig(target_duration_min=1.0, words_per_minute=400)  # target = 400 words
     final_s, rep = CriticAgent(llm_budget, polish_seams=True).review(
         RecapScript(title_vi="Budget", beats=beats),
@@ -637,3 +642,108 @@ def test_critic_round2_budget_targets_longest_beats_and_product_evaluator(tmp_pa
     assert (job_dir / "07_visual_contact_sheet.jpg").exists()
     assert "ch01_p008_P1" in ev.visual_metrics.leaked_skipped_panels
     assert any(f.category == "front_backmatter_leak" for f in ev.findings)
+
+
+def test_xml_parser_verify_code_reveal_spoiler_and_sanitize_retry(tmp_path: Path) -> None:
+    import cv2
+    import numpy as np
+    from src.agents.page_analyzer import _parse_pages_xml, _stamp_verify_banner_data_url
+    from src.agents.page_index import _compute_character_reveal_pages
+    from src.agents.scriptwriter import _parse_part_script_xml
+    from src.schemas.analysis import CharacterProfile
+
+    # 1) Resilient XML parsing handles unescaped quotes, colons & ampersands
+    raw_xml = """```xml
+<pages>
+  <page id="ch01_p001" chapter="ch01" verify_code="K7M4">
+    <summary>Elena bước vào phòng & đối thoại căng thẳng.</summary>
+    <verbatim_quote>Ta sẽ không lùi bước đâu!</verbatim_quote>
+    <visual_punch>Ánh mắt sắc bén</visual_punch>
+    <panels>
+      <panel id="ch01_p001_P1" emotion="tense" importance="4">
+        <characters>Elena | [Chưa rõ tên: người áo đen]</characters>
+        <action>Elena giơ tay: "Dừng lại!"</action>
+        <dialogue>Elena hét: "Đừng tiến lại gần!"</dialogue>
+      </panel>
+    </panels>
+  </page>
+</pages>
+```"""
+    parsed_pages = _parse_pages_xml(raw_xml.replace("```xml", "").replace("```", "").strip())
+    assert len(parsed_pages.pages) == 1
+    assert parsed_pages.pages[0].visual_verify_code == "K7M4"
+    assert parsed_pages.pages[0].panels[0].characters_present == ["Elena", "[Chưa rõ tên: người áo đen]"]
+
+    # 2) Visual verify code rejects dropped/corrupted batch page and retries individually
+    manifest, _ = _make_dummy_manifest(2)
+    for pg in manifest.chapters[0].pages:
+        img_p = tmp_path / pg.source_path
+        arr = np.full((200, 140, 3), 235, dtype=np.uint8)
+        arr[20:170, 20:120] = 35
+        cv2.imwrite(str(img_p), arr)
+        pg.source_path = str(img_p)
+
+    stamped, ok = _stamp_verify_banner_data_url(Path(manifest.chapters[0].pages[0].source_path), "ch01_p001", "K7M4")
+    assert ok and isinstance(stamped, str) and stamped.startswith("data:image/jpeg;base64,")
+
+    llm = LLMClient(LLMConfig(api_key="dummy", vision_api_key="dummy"))
+    call_log: list[int] = []
+
+    def fake_verify_xml(agent_name, system_prompt, user_prompt, xml_template, parse_fn, image_paths=None, **kw):
+        call_log.append(len(image_paths or []))
+        return PageBatchAnalysis(
+            pages=[
+                PageAnalysis(page_id="ch01_p001", chapter_id="ch01", visual_verify_code="BAD1", page_summary="hallucinated"),
+            ]
+        )
+
+    llm.complete_xml = fake_verify_xml  # type: ignore
+    try:
+        PageAnalyzerAgent(llm).run_all(manifest, tmp_path / "j_ver", max_workers=1, batch_size=2)
+        assert False, "Expected RuntimeError when verify code keeps failing"
+    except RuntimeError as exc:
+        assert "failed visual verification" in str(exc)
+    assert len(call_log) == 3  # 1 batch + 2 single-page retries before aborting
+
+    # 3) first_named_page_id ignores '<Speaker> nói:' prefix and catches spoiler_name before reveal
+    manifest_r, analyses_r = _make_dummy_manifest(6)
+    analyses_r[1].panels[0].dialogue_summary = "Elena thì thầm rằng trời sắp mưa."  # no quote -> narration prefix
+    analyses_r[4].panels[0].dialogue_summary = 'Elena mỉm cười: "Tên tôi là Elena."'  # actual reveal at p005
+    bible = StoryBible(
+        series_title_guess="Test",
+        characters=[CharacterProfile(canonical_name="Elena", aliases=["Tiểu thư E"])],
+        pronunciation_map={},
+    )
+    _compute_character_reveal_pages(analyses_r, bible)
+    assert bible.characters[0].first_named_page_id == "ch01_p005"
+
+    critic = CriticAgent(LLMClient(LLMConfig(offline_fallback=True)), polish_seams=False)
+    spoiler_beats = [
+        ScriptBeat(beat_id="b001", narration_vi="Elena bước vào sảnh tối.", panel_ids=["ch01_p002_P1"]),
+        ScriptBeat(beat_id="b002", narration_vi="Cô gái cười tự xưng là Elena.", panel_ids=["ch01_p005_P1"]),
+    ]
+    j_sp = tmp_path / "j_sp"
+    j_sp.mkdir(parents=True, exist_ok=True)
+    _, rep = critic.review(RecapScript(title_vi="S", beats=spoiler_beats), manifest_r, bible, j_sp)
+    assert any(i.category == "spoiler_name" and i.beat_id == "b001" for i in rep.issues)
+
+    # 4) _sanitize_part_beats normalizes short suffix and retries on empty fallback_count > 0
+    part_xml = """<part_script><beats>
+      <beat id="b1" section="rising" mood="tense"><panels>p001_P1, [ch01_p001_P2]</panels><narration>Test ngắn gọn.</narration></beat>
+    </beats></part_script>"""
+    parsed_part = _parse_part_script_xml(part_xml)
+    allowed = ["ch01_p001_P1", "ch01_p001_P2", "ch01_p002_P1"]
+    sanitized, fb_cnt = ScriptwriterAgent._sanitize_part_beats(parsed_part.beats, allowed, set(allowed))
+    assert fb_cnt == 0
+    assert sanitized[0].panel_ids == ["ch01_p001_P1", "ch01_p001_P2"]
+
+    _, fb_bad = ScriptwriterAgent._sanitize_part_beats(
+        [
+            ScriptBeat(beat_id="b1", narration_vi="a", panel_ids=["INVALID"]),
+            ScriptBeat(beat_id="b2", narration_vi="b", panel_ids=["ch01_p001_P1"]),
+            ScriptBeat(beat_id="b3", narration_vi="c", panel_ids=["ch01_p002_P1"]),
+        ],
+        allowed,
+        set(allowed),
+    )
+    assert fb_bad == 1

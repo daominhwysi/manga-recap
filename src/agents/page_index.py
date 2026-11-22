@@ -11,7 +11,13 @@ import cv2
 import numpy as np
 from pydantic import BaseModel, Field
 
-from src.llm.client import LLMClient
+from src.llm.client import (
+    LLMClient,
+    extract_xml_attr,
+    extract_xml_list,
+    extract_xml_tag,
+    iter_xml_blocks,
+)
 from src.schemas.analysis import (
     ChapterSummary,
     CharacterProfile,
@@ -358,6 +364,134 @@ class _BatchSceneSummaryResponse(BaseModel):
     scenes: list[_SceneSummaryLLM] = Field(default_factory=list)
 
 
+_SCENE_SUMMARIES_XML_TEMPLATE = """<scenes>
+  <scene id="scene_001" weight="3" transition="continuous">
+    <title>Tiêu đề ngắn gọn của phân đoạn</title>
+    <summary>Tóm tắt 1-2 câu (40-70 từ) phủ trọn từ trang đầu đến trang cuối</summary>
+    <characters>Tên 1 | Tên 2</characters>
+    <timeline_beats>
+      <beat>[ch01_p001-ch01_p005] Sự kiện đầu phân đoạn</beat>
+      <beat>[ch01_p015-ch01_p020] Sự kiện cuối phân đoạn</beat>
+    </timeline_beats>
+  </scene>
+</scenes>"""
+
+
+def _parse_scenes_xml(xml_text: str) -> _BatchSceneSummaryResponse:
+    scenes: list[_SceneSummaryLLM] = []
+    for attrs, body in iter_xml_blocks(xml_text, "scene"):
+        nid = extract_xml_attr(attrs, "id") or extract_xml_tag(body, "node_id")
+        w_raw = extract_xml_attr(attrs, "weight") or extract_xml_tag(body, "narrative_weight") or "3"
+        try:
+            weight = max(1, min(5, int(re.findall(r"\d+", w_raw)[0])))
+        except Exception:
+            weight = 3
+        trans = extract_xml_attr(attrs, "transition") or extract_xml_tag(body, "transition_type") or "continuous"
+        title = extract_xml_tag(body, "title")
+        summary = extract_xml_tag(body, "summary")
+        chars_raw = extract_xml_tag(body, "characters")
+        chars = [c.strip() for c in re.split(r"\s*\|\s*|,\s*", chars_raw) if c.strip()] if chars_raw else []
+        beats = extract_xml_list(body, "beat")
+        if title or summary:
+            scenes.append(
+                _SceneSummaryLLM(
+                    node_id=nid,
+                    title=title or nid,
+                    summary=summary,
+                    narrative_weight=weight,
+                    transition_type=trans,
+                    timeline_beats=beats,
+                    characters=chars,
+                )
+            )
+    return _BatchSceneSummaryResponse(scenes=scenes)
+
+
+_GENERIC_NAME_TOKENS = {
+    "chú",
+    "bác",
+    "cô",
+    "bà",
+    "ông",
+    "anh",
+    "em",
+    "tiểu",
+    "thư",
+    "thiếu",
+    "gia",
+    "ngài",
+    "cậu",
+    "nhà",
+    "tộc",
+    "lady",
+    "lord",
+    "master",
+    "mister",
+    "miss",
+    "young",
+    "family",
+}
+
+
+def _extract_spoken_dialogue_for_reveal(pa: PageAnalysis) -> str:
+    """Collect text spoken on the page while ignoring Vision's '<Speaker> nói:' narration prefixes."""
+    chunks: list[str] = []
+    if pa.verbatim_quote_vi.strip():
+        chunks.append(pa.verbatim_quote_vi.strip())
+    for pnl in pa.panels:
+        dlg = pnl.dialogue_summary.strip()
+        if not dlg:
+            continue
+        quoted = re.findall(r'["\'“”]([^"\'“”]{2,})["\'“”]', dlg)
+        if quoted:
+            chunks.extend(quoted)
+        elif ":" in dlg:
+            chunks.append(dlg.split(":", 1)[1].strip())
+        elif " - " in dlg:
+            chunks.append(dlg.split(" - ", 1)[1].strip())
+    return " ".join(chunks)
+
+
+def extract_distinctive_char_patterns(
+    ch: CharacterProfile,
+    canonical_set: set[str],
+) -> list[re.Pattern[str]]:
+    """Build word-boundary regexes for distinctive name tokens of a character."""
+    cname = ch.canonical_name.strip()
+    if not cname:
+        return []
+    tokens: list[str] = [cname]
+    words = [w for w in re.split(r"[\s\-]+", cname) if len(w) >= 3 and w.lower() not in _GENERIC_NAME_TOKENS]
+    if len(words) > 1:
+        tokens.extend(words)
+    for al in ch.aliases:
+        al_c = al.strip()
+        if len(al_c) >= 3 and al_c.lower() not in canonical_set:
+            tokens.append(al_c)
+    return [
+        re.compile(rf"(?<!\w){re.escape(tok)}(?!\w)", flags=re.IGNORECASE | re.UNICODE)
+        for tok in dict.fromkeys(tokens)
+    ]
+
+
+def _compute_character_reveal_pages(page_analyses: list[PageAnalysis], bible: StoryBible) -> None:
+    """Populate first_named_page_id from the earliest page where a character's name is actually spoken."""
+    canonical_set = {c.canonical_name.strip().lower() for c in bible.characters if c.canonical_name.strip()}
+    for ch in bible.characters:
+        pats = extract_distinctive_char_patterns(ch, canonical_set)
+        if not pats:
+            continue
+        found_pg = ""
+        for pa in page_analyses:
+            spoken = _extract_spoken_dialogue_for_reveal(pa)
+            if not spoken:
+                continue
+            if any(p.search(spoken) for p in pats):
+                found_pg = pa.page_id
+                break
+        ch.first_named_page_id = found_pg
+
+
 class _SemanticSegmentSpec(BaseModel):
     start_page_id: str
     end_page_id: str
@@ -432,9 +566,10 @@ def format_pages_compact_md(
 def _format_character_line(ch: CharacterProfile, char_origin: dict[str, str]) -> str:
     aliases = f" (bí danh: {', '.join(ch.aliases)})" if ch.aliases else ""
     origin = char_origin.get(ch.canonical_name.lower(), ch.first_seen_chapter)
+    reveal = f", lộ tên từ: {ch.first_named_page_id}" if ch.first_named_page_id else ""
     rels = f" | Quan hệ: {'; '.join(ch.relationships)}" if ch.relationships else ""
     return (
-        f"- **{ch.canonical_name}**{aliases} [{ch.role}, gốc: {origin}]: "
+        f"- **{ch.canonical_name}**{aliases} [{ch.role}, gốc: {origin}{reveal}]: "
         f"{ch.appearance} {ch.personality_notes}{rels}"
     )
 
@@ -851,21 +986,24 @@ class PageIndexBuilder:
             if not (self.llm.has_text_credentials and len(page_analyses) > 30):
                 return None
             try:
-                sc_sum = self.llm.complete_json(
+                parsed = self.llm.complete_xml(
                     agent_name="PageIndexSceneSummarizer",
                     system_prompt=(
                         "Bạn lập mục lục phân đoạn manga đầy đủ từ đầu đến cuối phân đoạn.\n"
                         "BẮT BUỘC:\n"
-                        "1) `node_id`: giữ đúng mã phân đoạn.\n"
-                        "2) `summary`: tóm tắt tổng quan 1-2 câu (40-70 từ) phủ trọn từ trang đầu tới trang cuối.\n"
-                        "3) `timeline_beats`: danh sách 4-5 gạch đầu dòng theo đúng thứ tự thời gian kèm mốc trang "
-                        "(ví dụ: '[p101-p105] ...', '[p106-p110] ...'), TUYỆT ĐỐI KHÔNG bỏ sót nửa cuối và trang cuối.\n"
-                        "4) `narrative_weight`: số nguyên 1..5 (1=lướt nhanh, 3=chuẩn, 5=cao trào/twist); "
-                        "`transition_type`: 'continuous' | 'pov_switch' | 'flashback' | 'time_skip'."
+                        "1) Giữ đúng `id` của phân đoạn trong `<scene id=...>`.\n"
+                        "2) `<summary>`: tóm tắt tổng quan 1-2 câu (40-70 từ) phủ trọn từ trang đầu tới trang cuối.\n"
+                        "3) `<timeline_beats>`: 4-5 thẻ `<beat>` theo thứ tự thời gian kèm mốc trang "
+                        "(ví dụ: '[p101-p105] ...'), TUYỆT ĐỐI KHÔNG bỏ sót nửa cuối và trang cuối.\n"
+                        "4) Thuộc tính `weight` (1..5) và `transition` ('continuous'|'pov_switch'|'flashback'|'time_skip')."
                     ),
                     user_prompt=f"Đoạn {nid} ({job['page_range']}):\n{job['md_body'][:48000]}",
-                    schema_cls=_SceneSummaryLLM,
+                    xml_template=_SCENE_SUMMARIES_XML_TEMPLATE,
+                    parse_fn=_parse_scenes_xml,
                 )
+                if not parsed.scenes:
+                    return None
+                sc_sum = parsed.scenes[0]
                 sc_sum.node_id = nid
                 (notes_dir / f"{nid}.summary.json").write_text(
                     sc_sum.model_dump_json(indent=2), encoding="utf-8"
@@ -886,17 +1024,17 @@ class PageIndexBuilder:
             )
             expected_ids = [j["node_id"] for j in batch_jobs]
             try:
-                res = self.llm.complete_json(
+                res = self.llm.complete_xml(
                     agent_name="PageIndexSceneSummarizer",
                     system_prompt=(
                         "Bạn lập mục lục đầy đủ cho từng phân đoạn manga trong batch.\n"
-                        "BẮT BUỘC trả về đúng 1 mục trong `scenes` cho mỗi `node_id` được giao, giữ chính xác `node_id`.\n"
-                        "Mỗi mục gồm: `node_id`, `title`, `summary` (40-70 từ phủ trọn đầu đến cuối), "
-                        "`timeline_beats` (4-5 mốc kèm `[trang]`, KHÔNG sót trang cuối), `characters`, "
-                        "`narrative_weight` (1-5), `transition_type` ('continuous'|'pov_switch'|'flashback'|'time_skip')."
+                        "BẮT BUỘC trả về đúng 1 thẻ `<scene id='...'>` cho mỗi `node_id` được giao, giữ chính xác `id`.\n"
+                        "Mỗi `<scene>` có `weight` (1-5), `transition` ('continuous'|'pov_switch'|'flashback'|'time_skip'), "
+                        "`<title>`, `<summary>` (40-70 từ phủ trọn đầu đến cuối), `<characters>`, và `<timeline_beats>` gồm 4-5 `<beat>`."
                     ),
                     user_prompt=f"Hãy tóm tắt đầy đủ các scene sau ({expected_ids}):\n\n{joined}",
-                    schema_cls=_BatchSceneSummaryResponse,
+                    xml_template=_SCENE_SUMMARIES_XML_TEMPLATE,
+                    parse_fn=_parse_scenes_xml,
                 )
                 by_id = {s.node_id: s for s in res.scenes if s.node_id in expected_ids}
                 for j in batch_jobs:
@@ -1040,14 +1178,14 @@ class PageIndexBuilder:
             else ""
         )
 
-        # Build StoryBible + TTS Pronunciation Glossary
+        # Build StoryBible (keep pronunciation_map empty by default unless user provides custom glossary)
         if self.llm.has_text_credentials:
             bible = self.llm.complete_json(
                 agent_name="StoryBibleAgent",
                 system_prompt=(
                     "Bạn là StoryBibleAgent quản lý hồ sơ nhân vật chuẩn (canonical_name, aliases, role, "
-                    "appearance, personality_notes, relationships), mạch cốt truyện và bảng phiên âm `pronunciation_map` "
-                    "cho TTS tiếng Việt (ánh xạ các tên riêng/thuật ngữ tiếng Anh/Nhật khó đọc sang cách đọc tiếng Việt tự nhiên, dễ nghe, không dấu gạch nối thừa)."
+                    "appearance, personality_notes, relationships) và mạch cốt truyện. "
+                    "Để trống `pronunciation_map` ({})."
                 ),
                 user_prompt=(
                     f"Series: {manifest.job_id}\n"
@@ -1055,14 +1193,11 @@ class PageIndexBuilder:
                     f"{prev_bible_note}\n"
                     f"Mục lục chi tiết từng phân đoạn:\n{tree.compact_outline_view()}\n\n"
                     "Hãy tổng hợp StoryBible hoàn chỉnh dạng JSON (series_title_guess, genre_guess, tone_summary, "
-                    "characters, chapter_summaries, ongoing_plot_threads, pronunciation_map)."
+                    "characters, chapter_summaries, ongoing_plot_threads)."
                 ),
                 schema_cls=StoryBible,
             )
-            if prev_bible and prev_bible.pronunciation_map:
-                merged_pron = dict(prev_bible.pronunciation_map)
-                merged_pron.update(bible.pronunciation_map)
-                bible.pronunciation_map = merged_pron
+            bible.pronunciation_map = {}
         else:
             all_chars: list[CharacterProfile] = []
             seen_names: set[str] = set()
@@ -1104,13 +1239,20 @@ class PageIndexBuilder:
                     )
                     for ch in manifest.chapters
                 ],
-                pronunciation_map=dict(prev_bible.pronunciation_map) if prev_bible else {},
+                pronunciation_map={},
             )
 
-        pron_path.write_text(
-            json.dumps(bible.pronunciation_map, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        if pron_path.exists():
+            try:
+                custom_pron = json.loads(pron_path.read_text(encoding="utf-8"))
+                if isinstance(custom_pron, dict):
+                    bible.pronunciation_map = {str(k): str(v) for k, v in custom_pron.items() if str(k).strip() and str(v).strip()}
+            except Exception:
+                pass
+        else:
+            pron_path.write_text("{}", encoding="utf-8")
+
+        _compute_character_reveal_pages(resolved_analyses, bible)
         tree_path.write_text(tree.model_dump_json(indent=2), encoding="utf-8")
         memory_path.write_text(render_memory_md(bible, tree), encoding="utf-8")
         bible_path.write_text(bible.model_dump_json(indent=2), encoding="utf-8")

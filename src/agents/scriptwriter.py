@@ -16,7 +16,13 @@ from src.agents.page_index import (
     render_scoped_memory_md,
 )
 from src.config import ScriptConfig, load_personas
-from src.llm.client import LLMClient
+from src.llm.client import (
+    LLMClient,
+    extract_xml_attr,
+    extract_xml_list,
+    extract_xml_tag,
+    iter_xml_blocks,
+)
 from src.schemas.analysis import PageAnalysis, StoryBible
 from src.schemas.script import VALID_MOODS, RecapScript, ScriptBeat
 
@@ -70,6 +76,90 @@ class PartScriptResponse(BaseModel):
     need_nodes: list[str] = Field(default_factory=list)
     need_panels: list[str] = Field(default_factory=list)
     beats: list[ScriptBeat] = Field(default_factory=list)
+
+
+_PART_SCRIPT_XML_TEMPLATE = """<part_script>
+  <need_nodes></need_nodes>
+  <need_panels></need_panels>
+  <beats>
+    <beat id="b01" section="rising" beat_type="narrative" mood="tense" pause_ms="240">
+      <panels>ch01_p001_P1, ch01_p001_P2</panels>
+      <narration>Câu kể văn nói tự nhiên bằng tiếng Việt...</narration>
+    </beat>
+  </beats>
+</part_script>"""
+
+_FULL_SCRIPT_XML_TEMPLATE = """<script>
+  <title_vi>Tiêu đề tóm tắt hấp dẫn</title_vi>
+  <hook_strategy>in_medias_res</hook_strategy>
+  <hook_summary>Tóm tắt hook mở đầu</hook_summary>
+  <beats>
+    <beat id="b001" section="hook" beat_type="narrative" mood="tense" pause_ms="240">
+      <panels>ch01_p001_P1, ch01_p001_P2</panels>
+      <narration>Câu kể văn nói tự nhiên bằng tiếng Việt...</narration>
+    </beat>
+  </beats>
+</script>"""
+
+
+def _parse_panel_list(body: str) -> list[str]:
+    panel_tags = extract_xml_list(body, "panel")
+    if panel_tags:
+        return [p.strip("[]() \"',.") for p in panel_tags if p.strip()]
+    raw = extract_xml_tag(body, "panels") or extract_xml_tag(body, "panel_ids")
+    return [tok.strip("[]() \"',.") for tok in re.split(r"[\s,|;]+", raw) if tok.strip("[]() \"',.")]
+
+
+def _parse_beats_xml(xml_text: str) -> list[ScriptBeat]:
+    beats: list[ScriptBeat] = []
+    for idx, (attrs, body) in enumerate(iter_xml_blocks(xml_text, "beat"), start=1):
+        bid = extract_xml_attr(attrs, "id") or extract_xml_tag(body, "beat_id") or f"b{idx:03d}"
+        sec = extract_xml_attr(attrs, "section") or extract_xml_tag(body, "section") or "rising"
+        btype = extract_xml_attr(attrs, "beat_type") or extract_xml_tag(body, "beat_type") or "narrative"
+        mood = extract_xml_attr(attrs, "mood") or extract_xml_tag(body, "mood") or "tense"
+        pause_raw = extract_xml_attr(attrs, "pause_ms") or extract_xml_tag(body, "pause_after_ms") or "240"
+        try:
+            pause_ms = max(0, min(1500, int(re.findall(r"\d+", pause_raw)[0])))
+        except Exception:
+            pause_ms = 240
+        nar = extract_xml_tag(body, "narration") or extract_xml_tag(body, "narration_vi")
+        pids = _parse_panel_list(body)
+        if nar:
+            beats.append(
+                ScriptBeat(
+                    beat_id=bid,
+                    section=sec,
+                    beat_type=btype,
+                    narration_vi=nar,
+                    panel_ids=pids,
+                    mood=mood,
+                    pause_after_ms=pause_ms,
+                )
+            )
+    return beats
+
+
+def _parse_part_script_xml(xml_text: str) -> PartScriptResponse:
+    nn_raw = extract_xml_tag(xml_text, "need_nodes")
+    np_raw = extract_xml_tag(xml_text, "need_panels")
+    need_nodes = [t.strip() for t in re.split(r"[\s,|;]+", nn_raw) if t.strip()]
+    need_panels = [t.strip() for t in re.split(r"[\s,|;]+", np_raw) if t.strip()]
+    beats = _parse_beats_xml(xml_text)
+    return PartScriptResponse(need_nodes=need_nodes, need_panels=need_panels, beats=beats)
+
+
+def _parse_full_script_xml(xml_text: str, default_persona: str = "kich_tinh") -> RecapScript:
+    title = extract_xml_tag(xml_text, "title_vi") or "Manga Recap"
+    hook_st = extract_xml_tag(xml_text, "hook_strategy") or "in_medias_res"
+    hook_sm = extract_xml_tag(xml_text, "hook_summary")
+    beats = _parse_beats_xml(xml_text)
+    return RecapScript(
+        title_vi=title,
+        persona=default_persona,
+        hook_strategy=hook_st,
+        hook_summary=hook_sm,
+        beats=beats,
+    )
 
 
 class ScriptwriterAgent:
@@ -307,6 +397,25 @@ class ScriptwriterAgent:
                 for pg_id in sc.page_ids:
                     if pg_id not in part_pages:
                         part_pages.append(pg_id)
+
+        # Inform writer which characters are NOT YET named in dialogue up to last_pg
+        all_tree_pages = [pg for sc in tree.scenes for pg in sc.page_ids]
+        page_idx_map = {pg: i for i, pg in enumerate(all_tree_pages)}
+        part_end_idx = page_idx_map.get(last_pg, len(all_tree_pages) - 1)
+        unrevealed_chars = [
+            ch.canonical_name
+            for ch in bible.characters
+            if ch.first_named_page_id
+            and ch.first_named_page_id in page_idx_map
+            and page_idx_map[ch.first_named_page_id] > part_end_idx
+        ]
+        unrevealed_rule = (
+            f"\n5) CHỐNG SPOIL TÊN NHÂN VẬT: Các nhân vật sau CHƯA ĐƯỢC XƯNG TÊN trong truyện tính đến hết trang {last_pg}: "
+            f"{unrevealed_chars} -> TUYỆT ĐỐI KHÔNG gọi tên thật của họ trong hồi này; chỉ gọi theo ngoại hình/vai trò."
+            if unrevealed_chars
+            else ""
+        )
+
         n_buckets = max(1, part.target_beats)
         pacing_lines: list[str] = []
         for k in range(n_buckets):
@@ -329,6 +438,7 @@ class ScriptwriterAgent:
             )
         affordance_txt = "\n".join(part_affordance_notes)
         moods_txt = ", ".join(VALID_MOODS)
+        sample_panels_hint = ", ".join(allowed_panels[:8])
 
         for turn in range(3):
             user_prompt = (
@@ -347,20 +457,29 @@ class ScriptwriterAgent:
                 "RÀNG BUỘC & BỘ CÔNG CỤ KỂ CHUYỆN:\n"
                 "1) VĂN NÓI 100% ĐỌC THÀNH TIẾNG: tự nhiên như YouTuber kể chuyện, tận dụng thoại đắt trong `⚡Thoại` (ngoặc kép \"...\") và chi tiết thị giác `👁️Hình`. Được phép xen 1-2 beat `beat_type='commentary'` (câu nhận định/giải thích cơ chế ngắn neo hoàn toàn vào cảnh đang chiếu, không bịa thêm sự kiện). Chuyển tuyến POV/Flashback bằng mốc không gian/thời gian tự nhiên; CẤM sáo rỗng AI và câu chuyển đoạn bình luận viên.\n"
                 "2) KHÔNG KỂ TRƯỚC / KHÔNG DỒN CỤC: mỗi beat CHỈ kể đúng hành động/thoại trong 2-4 `panel_id` của chính beat đó.\n"
-                f"3) ĐỒNG BỘ HÌNH-TIẾNG ({first_pg} -> {last_pg}): đi tuần tự từ Beat 1 tới Beat {part.target_beats}; mỗi beat gắn 2-4 `panel_id` khác nhau, tiến đơn điệu theo trình tự; ưu tiên `[face]`/`[text]`, tránh `[bg]` trừ khi cảnh toàn trang quan trọng.\n"
-                f"4) `mood` CHỈ được chọn đúng 1 trong 7 giá trị chuẩn: `{moods_txt}`. Mỗi beat gồm: beat_id, section, beat_type ('narrative'|'commentary'|'hook_montage'|'outro'), narration_vi, panel_ids, mood, pause_after_ms."
+                f"3) ĐỒNG BỘ HÌNH-TIẾNG ({first_pg} -> {last_pg}): đi tuần tự từ Beat 1 tới Beat {part.target_beats}; mỗi beat gắn 2-4 `panel_id` đầy đủ chính xác (dạng như `{sample_panels_hint}`), tiến đơn điệu; ưu tiên `[face]`/`[text]`, tránh `[bg]` trừ khi cảnh toàn trang quan trọng.\n"
+                f"4) `mood` CHỈ được chọn đúng 1 trong 7 giá trị chuẩn: `{moods_txt}`. Trả về XML `<part_script>` gồm `<beats>` với các `<beat id=... section=... beat_type=... mood=... pause_ms=...>` chứa `<panels>` và `<narration>`."
+                + unrevealed_rule
             )
 
-            resp = self.llm.complete_json(
+            resp = self.llm.complete_xml(
                 agent_name="ScriptwriterAgent",
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                schema_cls=PartScriptResponse,
+                xml_template=_PART_SCRIPT_XML_TEMPLATE,
+                parse_fn=_parse_part_script_xml,
                 image_paths=extra_images or None,
             )
 
-            if resp.beats or turn == 2:
-                return self._sanitize_part_beats(resp.beats, allowed_panels, allowed_set)
+            if resp.beats:
+                sanitized, fallback_count = self._sanitize_part_beats(resp.beats, allowed_panels, allowed_set)
+                if fallback_count == 0 or turn == 2:
+                    return sanitized
+                extra_nodes_text += (
+                    f"\n\n### SỬA LỖI PANEL_ID (LẦN {turn + 1}): {fallback_count} beat bị thiếu/sai mã `panel_id` hợp lệ. "
+                    f"Hãy ghi CHÍNH XÁC từng `panel_id` nằm trong phạm vi hồi (ví dụ: `{', '.join(allowed_panels[:12])}` ... `{allowed_panels[-1]}`).\n"
+                )
+                continue
 
             added = False
             if resp.need_nodes:
@@ -378,7 +497,8 @@ class ScriptwriterAgent:
                     extra_images = imgs
                     added = True
             if not added:
-                return self._sanitize_part_beats(resp.beats, allowed_panels, allowed_set)
+                sanitized, _ = self._sanitize_part_beats(resp.beats, allowed_panels, allowed_set)
+                return sanitized
 
         return []
 
@@ -387,15 +507,33 @@ class ScriptwriterAgent:
         beats: list[ScriptBeat],
         allowed_panels: list[str],
         allowed_set: set[str],
-    ) -> list[ScriptBeat]:
-        """Keep panel_ids anchored monotonically inside the part's valid range."""
+    ) -> tuple[list[ScriptBeat], int]:
+        """Normalize & anchor panel_ids monotonically inside the part's valid range, reporting fallback count."""
         if not beats or not allowed_panels:
-            return beats
+            return beats, 0
+
+        # Build unique short-suffix lookup (e.g. p046_P1 -> ch01_p046_P1) without masking ambiguity
+        suffix_counts: dict[str, list[str]] = {}
+        for ap in allowed_panels:
+            m = re.search(r"(p\d+_P\d+)$", ap, flags=re.IGNORECASE)
+            if m:
+                suffix_counts.setdefault(m.group(1).lower(), []).append(ap)
+        unique_suffix = {k: v[0] for k, v in suffix_counts.items() if len(v) == 1}
+
+        def _norm_pid(raw: str) -> str:
+            tok = raw.strip("[]() \"',.")
+            if tok in allowed_set:
+                return tok
+            m = re.search(r"(p\d+_P\d+)$", tok, flags=re.IGNORECASE)
+            if m and m.group(1).lower() in unique_suffix:
+                return unique_suffix[m.group(1).lower()]
+            return tok
 
         # Preserve minimal unit-test outputs where mock doesn't inspect scene panel IDs
-        has_any_in_range = any(pid in allowed_set for b in beats for pid in b.panel_ids)
+        normalized_all = [[_norm_pid(pid) for pid in b.panel_ids] for b in beats]
+        has_any_in_range = any(pid in allowed_set for pids in normalized_all for pid in pids)
         if not has_any_in_range and len(beats) < 3:
-            return beats
+            return beats, 0
 
         panel_rank = {pid: i for i, pid in enumerate(allowed_panels)}
         ordered_pages = list(dict.fromkeys(_panel_to_page_id(pid) for pid in allowed_panels))
@@ -404,9 +542,10 @@ class ScriptwriterAgent:
         avg_pages_per_beat = len(ordered_pages) / max(1, total)
         max_beat_page_span = max(2, math.ceil(avg_pages_per_beat * 1.25))
         cursor_rank = 0
+        fallback_count = 0
 
         for idx, b in enumerate(beats):
-            kept = [pid for pid in b.panel_ids if pid in allowed_set]
+            kept = [pid for pid in normalized_all[idx] if pid in allowed_set]
             kept = list(dict.fromkeys(sorted(kept, key=lambda pid: panel_rank[pid])))
             forward = [pid for pid in kept if panel_rank[pid] >= cursor_rank]
             if forward:
@@ -423,10 +562,11 @@ class ScriptwriterAgent:
                 b.panel_ids = kept
                 cursor_rank = max(cursor_rank, panel_rank[kept[-1]])
             elif allowed_panels:
+                fallback_count += 1
                 pos = max(cursor_rank, min(len(allowed_panels) - 1, int(idx / max(1, total) * len(allowed_panels))))
                 b.panel_ids = [allowed_panels[pos]]
                 cursor_rank = pos
-        return beats
+        return beats, fallback_count
 
     def write_script(
         self,
@@ -462,16 +602,15 @@ class ScriptwriterAgent:
                 f"Persona: {persona}\n"
                 f"StoryBible:\n{bible.model_dump_json(indent=2)}\n\n"
                 f"Nội dung chi tiết ({len(page_analyses)} trang):\n{compact_md}\n\n"
-                "Viết kịch bản RecapScript dạng JSON bằng VĂN NÓI 100% (tránh văn viết sáo rỗng), "
-                f"mỗi beat gắn 2-4 panel_id liên tiếp đúng diễn biến, mood thuộc [{moods_txt}], "
-                "gồm title_vi, persona, hook_strategy, hook_summary, và beats "
-                "(beat_id b001.., section, beat_type, narration_vi, panel_ids, mood, pause_after_ms)."
+                "Viết kịch bản `<script>` dạng XML bằng VĂN NÓI 100% (tránh văn viết sáo rỗng), "
+                f"mỗi `<beat>` gắn 2-4 `panel_id` liên tiếp đúng diễn biến, `mood` thuộc [{moods_txt}]."
             )
-            script = self.llm.complete_json(
+            script = self.llm.complete_xml(
                 agent_name="ScriptwriterAgent",
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                schema_cls=RecapScript,
+                xml_template=_FULL_SCRIPT_XML_TEMPLATE,
+                parse_fn=lambda txt: _parse_full_script_xml(txt, default_persona=persona),
             )
             draft_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
             return script

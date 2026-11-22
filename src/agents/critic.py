@@ -10,8 +10,14 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from src.agents.page_index import extract_distinctive_char_patterns
 from src.audio.base import apply_pronunciation_glossary
-from src.llm.client import LLMClient
+from src.llm.client import (
+    LLMClient,
+    extract_xml_attr,
+    extract_xml_tag,
+    iter_xml_blocks,
+)
 from src.schemas.analysis import PageAnalysis, StoryBible
 from src.schemas.ingestion import JobManifest
 from src.schemas.script import CriticIssue, CriticReport, RecapScript, ScriptBeat
@@ -60,6 +66,21 @@ class _SeamPolishResponse(BaseModel):
     rewrites: list[_SeamRewrite] = Field(default_factory=list)
 
 
+_SEAM_POLISH_XML_TEMPLATE = """<rewrites>
+  <rewrite beat_id="b001">Câu kể văn nói tiếng Việt đã được chuốt lại mượt mà...</rewrite>
+</rewrites>"""
+
+
+def _parse_seam_polish_xml(xml_text: str) -> _SeamPolishResponse:
+    rewrites: list[_SeamRewrite] = []
+    for attrs, body in iter_xml_blocks(xml_text, "rewrite"):
+        bid = extract_xml_attr(attrs, "beat_id") or extract_xml_attr(attrs, "id") or extract_xml_tag(body, "beat_id")
+        txt = extract_xml_tag(body, "narration") or re.sub(r"<[^>]+>", "", body).strip()
+        if bid and txt:
+            rewrites.append(_SeamRewrite(beat_id=bid, narration_vi=txt))
+    return _SeamPolishResponse(rewrites=rewrites)
+
+
 class CriticAgent:
     """Validates hard invariants, macro rhythm distribution, and runs Closed-Loop Showrunner Auto-Repair."""
 
@@ -89,6 +110,7 @@ class CriticAgent:
         page_order: dict[str, int],
         beat_to_allowed: dict[int, set[str]],
         target_total_words: int | None = None,
+        bible: StoryBible | None = None,
     ) -> tuple[list[CriticIssue], set[int], list[str]]:
         """Evaluate hard invariants (error) & macro rhythm/span warnings without mutating panel_ids."""
         issues: list[CriticIssue] = []
@@ -98,6 +120,17 @@ class CriticAgent:
         avg_pages_per_beat = (len(all_pages) / max(1, total_beats)) if total_beats >= 6 else 2.5
         max_single_beat_span = max(3, math.ceil(avg_pages_per_beat * 1.5))
         max_coverage_gap = max(8, math.ceil(avg_pages_per_beat * 3.5))
+
+        reveal_checks: list[tuple[str, str, int, list[re.Pattern[str]]]] = []
+        if bible and bible.characters:
+            canon_set = {c.canonical_name.strip().lower() for c in bible.characters if c.canonical_name.strip()}
+            for ch in bible.characters:
+                if ch.first_named_page_id and ch.first_named_page_id in page_order:
+                    pats = extract_distinctive_char_patterns(ch, canon_set)
+                    if pats:
+                        reveal_checks.append(
+                            (ch.canonical_name, ch.first_named_page_id, page_order[ch.first_named_page_id], pats)
+                        )
 
         prev_page_pos: int | None = None
         beat_ngrams: list[tuple[str, set[str]]] = []
@@ -148,6 +181,18 @@ class CriticAgent:
                     )
                     flagged_notes.append(gap_msg)
                 prev_page_pos = max(prev_page_pos or 0, cur_max)
+
+                for cname, rev_pg, rev_pos, pats in reveal_checks:
+                    if rev_pos > cur_max and any(p.search(beat.narration_vi) for p in pats):
+                        sp_msg = (
+                            f"{beat.beat_id} gọi tên '{cname}' trước khi nhân vật lộ tên trong thoại (tại {rev_pg}) "
+                            f"— hãy đổi sang mô tả ngoại hình/vai trò."
+                        )
+                        issues.append(
+                            CriticIssue(beat_id=beat.beat_id, severity="error", category="spoiler_name", message=sp_msg)
+                        )
+                        flagged_indices.add(idx)
+                        flagged_notes.append(sp_msg)
 
             cur_ng = _content_ngrams(beat.narration_vi)
             if len(cur_ng) >= 8:
@@ -256,23 +301,26 @@ class CriticAgent:
             return beats
 
         seam_beat_ids = [beats[i].beat_id for i in sorted(seam_set)]
-        payload = []
+        payload_lines = ["<beats>"]
         for i in target_indices:
             b = beats[i]
-            item: dict = {
-                "beat_id": b.beat_id,
-                "section": b.section,
-                "beat_type": b.beat_type,
-                "mood": b.mood,
-                "narration_vi": b.narration_vi,
-            }
+            facts_attr = ""
             if i in flagged_indices and panel_text_lookup:
                 facts = [panel_text_lookup[pid] for pid in b.panel_ids if pid in panel_text_lookup]
                 if facts:
-                    item["grounded_panel_facts"] = " | ".join(facts)[:380]
-            payload.append(item)
+                    facts_txt = " | ".join(facts)[:360].replace('"', "'")
+                    facts_attr = f"\n    <grounded_facts>{facts_txt}</grounded_facts>"
+            payload_lines.append(
+                f'  <beat id="{b.beat_id}" section="{b.section}" beat_type="{b.beat_type}" mood="{b.mood}">\n'
+                f"    <narration>{b.narration_vi}</narration>{facts_attr}\n"
+                "  </beat>"
+            )
+        payload_lines.append("</beats>")
 
-        cast_names = [c.canonical_name for c in bible.characters]
+        cast_names = [
+            f"{c.canonical_name} (lộ từ {c.first_named_page_id})" if c.first_named_page_id else c.canonical_name
+            for c in bible.characters
+        ]
         notes_txt = "\n".join(f"- {n}" for n in flagged_notes[:12]) or "Không có lỗi nghiêm trọng — hãy chuốt văn nói mượt mà."
         budget_hint = (
             f"Tổng ngân sách mục tiêu toàn tập: ~{target_total_words} từ (cắt gọn câu thừa nếu vượt quá nhiều)."
@@ -280,22 +328,24 @@ class CriticAgent:
             else ""
         )
         try:
-            res = self.llm.complete_json(
+            res = self.llm.complete_xml(
                 agent_name="CriticSeamPolisher",
                 system_prompt=(
-                    "Bạn là Tổng Biên Tập Kịch Bản Voiceover (Read-Aloud Showrunner). CHỈ trả về trong `rewrites` những `beat_id` thực sự cần sửa để:\n"
+                    "Bạn là Tổng Biên Tập Kịch Bản Voiceover (Read-Aloud Showrunner). CHỈ trả về các thẻ `<rewrite beat_id='...'>` cho những beat thực sự cần sửa để:\n"
                     "1) Nối mượt chuyển hồi tại `seam_beat_ids` bằng hành động/không gian tự nhiên, xóa giới thiệu lặp nhân vật. CẤM câu chuyển đoạn bình luận viên.\n"
-                    "2) Khử sạch cliché AI, lặp từ nối ('ai ngờ', 'cứ tưởng', 'tới lúc này', 'thế nhưng') và sửa trùng lặp dựa ĐÚNG trên `grounded_panel_facts` (KHÔNG bịa thêm sự kiện).\n"
-                    "3) Tạo nhịp đọc tai nghe tự nhiên (xen câu ngắn dồn dập và câu kể trôi chảy), giữ đúng tên nhân vật chuẩn và KHÔNG cắt cụt chữ đầu câu."
+                    "2) Khử sạch cliché AI, lặp từ nối ('ai ngờ', 'cứ tưởng', 'tới lúc này', 'thế nhưng'), bỏ tên nhân vật bị gọi sớm trước `lộ từ ...`, và sửa trùng lặp dựa ĐÚNG trên `grounded_facts`.\n"
+                    "3) Tạo nhịp đọc tai nghe tự nhiên (xen câu ngắn dồn dập và câu kể trôi chảy), giữ đúng tên nhân vật đã lộ và KHÔNG cắt cụt chữ đầu câu."
                 ),
                 user_prompt=(
                     f"Nhân vật chuẩn: {cast_names}\n"
                     f"Các điểm nối hồi (seam): {seam_beat_ids}\n"
                     f"{budget_hint}\n"
                     f"Lỗi phát hiện tự động:\n{notes_txt}\n\n"
-                    f"Kịch bản cần rà soát ({len(payload)} beats):\n{json.dumps(payload, ensure_ascii=False)}"
+                    f"Kịch bản cần rà soát ({len(target_indices)} beats):\n"
+                    + "\n".join(payload_lines)
                 ),
-                schema_cls=_SeamPolishResponse,
+                xml_template=_SEAM_POLISH_XML_TEMPLATE,
+                parse_fn=_parse_seam_polish_xml,
             )
             rewrite_map: dict[str, str] = {}
             for r in res.rewrites:
@@ -403,6 +453,7 @@ class CriticAgent:
             page_order=page_order,
             beat_to_allowed=beat_to_allowed,
             target_total_words=target_total_words,
+            bible=bible,
         )
 
         # Step 2: Closed-Loop Showrunner Pass + Auto-Repair (up to 2 passes if errors persist)
@@ -425,6 +476,7 @@ class CriticAgent:
                 page_order=page_order,
                 beat_to_allowed=beat_to_allowed,
                 target_total_words=target_total_words,
+                bible=bible,
             )
             remaining_errors = {i.beat_id for i in issues_eval if i.severity == "error"}
             if remaining_errors:
@@ -447,6 +499,7 @@ class CriticAgent:
                     page_order=page_order,
                     beat_to_allowed=beat_to_allowed,
                     target_total_words=target_total_words,
+                    bible=bible,
                 )
 
         # Step 3: Populate TTS pronunciation-normalized strings without mutating display subtitles

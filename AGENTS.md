@@ -85,20 +85,20 @@ manga_recap_generator/
 │   │   └── telemetry.py             # Theo dõi thời gian chạy từng stage, lượng token, fallback và cảnh báo
 │   ├── schemas/
 │   │   ├── ingestion.py             # Schemas Stage 1: BBox, FocalPoint, PanelInfo, PageInfo, ChapterInfo, JobManifest
-│   │   ├── analysis.py              # Schemas Stage 2: PanelAnalysis, PageAnalysis (+`verbatim_quote_vi`, `visual_punch`), CharacterProfile, StoryBible (+`pronunciation_map`)
+│   │   ├── analysis.py              # Schemas Stage 2: PanelAnalysis, PageAnalysis (+`visual_verify_code`, `verbatim_quote_vi`, `visual_punch`), CharacterProfile (+`first_named_page_id`), StoryBible
 │   │   ├── script.py                # Schemas Stage 3: `VALID_MOODS`, `normalize_mood`, ScriptBeat (+`beat_type`, `tts_text`), RecapScript (+`hook_strategy`), CriticIssue, CriticReport
 │   │   └── timeline.py              # Schemas Stage 4-5: WordTimestamp, AudioBeatInfo, AudioManifest, TimelineShot, SubtitleCue, VideoTimeline (+`reading_order`)
-│   ├── llm/client.py                # LLMClient chuẩn OpenAI API: tách provider text/vision (`extra_body`), circuit breaker, Pydantic JSON
+│   ├── llm/client.py                # LLMClient chuẩn OpenAI API: `complete_json` & `complete_xml` chống vỡ ngoặc kép, data-URL ảnh, circuit breaker (ngưỡng 2 lần lỗi)
 │   ├── cv/
 │   │   ├── registry.py / loader.py  # DETECTOR_REGISTRY; giải nén .cbz/.zip hoặc đọc thư mục theo `natural_sort_key`
 │   │   ├── manga_detector.py        # MangaYoloDetector (ONNX): Recursive XY-Cut RTL/LTR (chuẩn L-shape), cắt viền trắng inset đồng bộ `focal_points` ngay Stage 1
 │   │   ├── manhwa_slicer.py         # ManhwaStripSlicer: cắt dải ảnh dọc webtoon theo ngưỡng tỷ lệ chiều rộng + hậu kiểm YOLO `face/body/text`
 │   │   ├── som.py / stage.py        # Vẽ nhãn Set-of-Mark ([P1]..[Pn]) và điều phối Stage 1 (`run_stage1_ingest`)
 │   ├── agents/
-│   │   ├── page_analyzer.py         # Stage 1.5 & 2a: Pre-Pass cast sheet UTF-8 Pillow; khử spread trùng sớm bằng CV; Adaptive Panel Batching (~16-18 panels/call); trích `verbatim_quote_vi` & `visual_punch`
-│   │   ├── page_index.py            # Stage 2b: Chuẩn hóa bí danh toàn văn bản (`scoped_map` chống spoiler); lọc spread 2 chiều; Semantic Scene Segmentation + `narrative_weight`; `PageIndexSceneSummarizer` gộp batch + cache; `StoryBible` (+`seed_cast`, `pronunciation.json`) & `scoped_outline_view` O(N)
-│   │   ├── scriptwriter.py          # Stage 3a: Phân hoạch `1 Scene = 1 Part`, O(N) Scoped Memory/Tree Index + cầu nối 2 trang cuối, ngân sách theo `narrative_weight`, Storytelling Affordances
-│   │   ├── critic.py                # Stage 3b: Closed-Loop Critic (`error` vs `warning`, Macro Rhythm Critique), Read-Aloud Showrunner Pass (khóa cứng `panel_ids`) & chuẩn bị `tts_text`
+│   │   ├── page_analyzer.py         # Stage 1.5 & 2a (XML): Pre-Pass cast sheet UTF-8; đóng dấu Visual Verify Code (RAM) chống rơi ảnh/lệch trang; khử spread trùng CV; Adaptive Batching; `verbatim_quote_vi` & `visual_punch`
+│   │   ├── page_index.py            # Stage 2b (Summarizer XML): Chuẩn hóa bí danh (`scoped_map`); tính `first_named_page_id` chống spoil tên; lọc spread 2 chiều; Semantic Scene Segmentation; StoryBible (`pronunciation_map` mặc định trống); `scoped_outline_view` O(N)
+│   │   ├── scriptwriter.py          # Stage 3a (XML): Phân hoạch `1 Scene = 1 Part`, O(N) Scoped Memory + cầu nối 2 trang, chuẩn hóa + retry khi lệch `panel_id`, cấm gọi tên nhân vật trước `first_named_page_id`
+│   │   ├── critic.py                # Stage 3b (Showrunner XML): Closed-Loop Critic (chốt chặn `spoiler_name`, ngân sách từ, nhịp toàn tập), Auto-Repair khóa cứng `panel_ids` & giữ nguyên văn bản TTS gốc (trừ glossary thủ công)
 │   │   ├── choreographer.py         # Stage 5: Đạo diễn hình ảnh — word-timestamp sync, tách 2 nhịp sub-shot (`Wide -> Focus Face`), LTR/RTL & 9:16 vertical, đồng bộ 7 `mood`
 │   │   └── product_evaluator.py     # Stage 7 (`evaluate`): Đánh giá Kịch bản + Hình ảnh tổng thể, dựng `07_visual_contact_sheet.jpg` & xuất `07_EVAL_REPORT.md` cho coding agent
 │   ├── audio/

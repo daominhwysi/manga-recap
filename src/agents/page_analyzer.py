@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import re
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
@@ -14,9 +16,21 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 
-from src.llm.client import LLMClient
+from src.llm.client import (
+    LLMClient,
+    extract_xml_attr,
+    extract_xml_tag,
+    iter_xml_blocks,
+)
 from src.schemas.analysis import PageAnalysis, PanelAnalysis
 from src.schemas.ingestion import JobManifest, PageInfo, PanelInfo
+
+_VERIFY_ALPHABET = "ACDEFGHJKMNPQRTUVWXY34679"
+
+
+def _generate_verify_code(length: int = 4) -> str:
+    """Generate a high-contrast OCR-unambiguous verification token."""
+    return "".join(secrets.choice(_VERIFY_ALPHABET) for _ in range(length))
 
 SYSTEM_PROMPT = """Bạn là PageAnalyzerAgent chuyên đọc trang manga/manhwa đã đánh dấu Set-of-Mark ([P1], [P2]...).
 Quy tắc bắt buộc:
@@ -221,6 +235,135 @@ def _draw_utf8_label(
     return cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
 
 
+_CAST_XML_TEMPLATE = """<cast>
+  <character name="Tên chuẩn" best_panel_id="ch01_p001_P1">
+    <aliases>Bí danh 1 | Bí danh 2</aliases>
+    <evidence_quote>Câu thoại/chữ gốc gọi tên nhân vật</evidence_quote>
+    <appearance>Mô tả ngắn ngoại hình</appearance>
+  </character>
+</cast>"""
+
+_PAGE_XML_TEMPLATE = """<pages>
+  <page id="ch01_p001" chapter="ch01" verify_code="XXXX">
+    <summary>Tóm tắt diễn biến toàn trang bằng tiếng Việt (hoặc [PHỤ LỤC] ...)</summary>
+    <verbatim_quote>Câu thoại/dẫn đắt giá nhất dịch sang tiếng Việt (để trống nếu không có)</verbatim_quote>
+    <visual_punch>1 chi tiết thị giác/biểu cảm đắt nhất (để trống nếu bình thường)</visual_punch>
+    <panels>
+      <panel id="ch01_p001_P1" emotion="tense" importance="3">
+        <characters>Tên 1 | Tên 2</characters>
+        <action>Mô tả hành động/bố cục trong khung</action>
+        <dialogue>Tóm tắt hoặc trích dịch lời thoại trong khung</dialogue>
+      </panel>
+    </panels>
+  </page>
+</pages>"""
+
+
+def _split_char_field(raw: str) -> list[str]:
+    if not raw.strip():
+        return []
+    parts = re.split(r"\s*\|\s*|,\s*(?![^\[]*\])", raw.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _parse_cast_xml(xml_text: str) -> PrePassCastResult:
+    chars: list[SeedCharacter] = []
+    for attrs, body in iter_xml_blocks(xml_text, "character"):
+        name = extract_xml_attr(attrs, "name") or extract_xml_tag(body, "canonical_name")
+        best_pid = extract_xml_attr(attrs, "best_panel_id") or extract_xml_tag(body, "best_panel_id")
+        aliases = _split_char_field(extract_xml_tag(body, "aliases"))
+        ev = extract_xml_tag(body, "evidence_quote")
+        app = extract_xml_tag(body, "appearance") or extract_xml_tag(body, "appearance_vi")
+        if name:
+            chars.append(
+                SeedCharacter(
+                    canonical_name=name,
+                    aliases=aliases,
+                    evidence_quote=ev,
+                    appearance_vi=app,
+                    best_panel_id=best_pid,
+                )
+            )
+    return PrePassCastResult(characters=chars)
+
+
+def _parse_pages_xml(
+    xml_text: str,
+    default_page_id: str = "",
+    default_chapter_id: str = "",
+) -> PageBatchAnalysis:
+    pages: list[PageAnalysis] = []
+    blocks = iter_xml_blocks(xml_text, "page")
+    if not blocks and default_page_id and "<panels" in xml_text.lower():
+        blocks = [(f'id="{default_page_id}" chapter="{default_chapter_id}"', xml_text)]
+    for attrs, body in blocks:
+        pid = extract_xml_attr(attrs, "id") or extract_xml_tag(body, "page_id") or default_page_id
+        cid = extract_xml_attr(attrs, "chapter") or extract_xml_tag(body, "chapter_id") or default_chapter_id
+        if not cid and "_" in pid:
+            cid = pid.split("_", 1)[0]
+        vcode = extract_xml_attr(attrs, "verify_code") or extract_xml_tag(body, "verify_code")
+        summary = extract_xml_tag(body, "summary") or extract_xml_tag(body, "page_summary")
+        vquote = extract_xml_tag(body, "verbatim_quote") or extract_xml_tag(body, "verbatim_quote_vi")
+        vpunch = extract_xml_tag(body, "visual_punch")
+        pnls: list[PanelAnalysis] = []
+        for p_attrs, p_body in iter_xml_blocks(body, "panel"):
+            pnl_id = extract_xml_attr(p_attrs, "id") or extract_xml_tag(p_body, "panel_id")
+            if not pnl_id:
+                continue
+            emo = extract_xml_attr(p_attrs, "emotion") or extract_xml_tag(p_body, "emotion") or "neutral"
+            imp_raw = extract_xml_attr(p_attrs, "importance") or extract_xml_tag(p_body, "importance") or "3"
+            try:
+                imp = max(1, min(5, int(re.findall(r"\d+", imp_raw)[0])))
+            except Exception:
+                imp = 3
+            chars = _split_char_field(extract_xml_tag(p_body, "characters"))
+            act = extract_xml_tag(p_body, "action") or extract_xml_tag(p_body, "action_summary") or ""
+            dlg = extract_xml_tag(p_body, "dialogue") or extract_xml_tag(p_body, "dialogue_summary") or ""
+            pnls.append(
+                PanelAnalysis(
+                    panel_id=pnl_id,
+                    action_summary=act,
+                    dialogue_summary=dlg,
+                    characters_present=chars,
+                    emotion=emo,
+                    importance=imp,
+                )
+            )
+        if pid:
+            pages.append(
+                PageAnalysis(
+                    page_id=pid,
+                    chapter_id=cid or "ch01",
+                    visual_verify_code=vcode.strip().upper(),
+                    page_summary=summary,
+                    verbatim_quote_vi=vquote,
+                    visual_punch=vpunch,
+                    panels=pnls,
+                )
+            )
+    return PageBatchAnalysis(pages=pages)
+
+
+def _stamp_verify_banner_data_url(
+    image_path: Path,
+    page_id: str,
+    code: str,
+) -> tuple[Path | str, bool]:
+    """Prepend a 40px high-contrast header banner with random OCR code in RAM (never modifies disk)."""
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return image_path, False
+    banner_h = 40
+    bordered = cv2.copyMakeBorder(img, banner_h, 0, 0, 0, cv2.BORDER_CONSTANT, value=(16, 16, 20))
+    label = f"[ PAGE: {page_id}  |  CODE: {code} ]"
+    bordered = _draw_utf8_label(bordered, label, (12, 8), font_size=22, color_rgb=(255, 232, 80))
+    ok, buf = cv2.imencode(".jpg", bordered, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    if not ok:
+        return image_path, False
+    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}", True
+
+
 def _build_cast_sheet(
     seed_cast: list[SeedCharacter],
     manifest: JobManifest,
@@ -348,17 +491,18 @@ class PageAnalyzerAgent:
                 "2) Bắt buộc điền `evidence_quote` là câu thoại/chữ gốc trên trang nhắc tới tên đó; TUYỆT ĐỐI KHÔNG tự bịa tên từ kiến thức ngoài truyện.\n"
                 "3) `best_panel_id`: chọn đúng 1 panel_id nơi nhân vật lộ mặt to, rõ nhất (ưu tiên panel chỉ có 1 người).\n\n"
                 f"Các trang đính kèm:\n{specs}\n"
-                "Trả về JSON PrePassCastResult gồm `characters` (canonical_name, aliases, evidence_quote, appearance_vi, best_panel_id)."
+                "Trả về XML `<cast>` chứa các thẻ `<character>` (name, best_panel_id, aliases, evidence_quote, appearance)."
             )
             try:
-                res = self.llm.complete_json(
+                res = self.llm.complete_xml(
                     agent_name="PrePassCastScanner",
                     system_prompt=(
                         "Bạn là chuyên gia nhận diện nhân vật manga đen trắng. "
                         "Chỉ trích xuất tên nhân vật thực sự xuất hiện trên trang kèm bằng chứng lời thoại."
                     ),
                     user_prompt=prompt,
-                    schema_cls=PrePassCastResult,
+                    xml_template=_CAST_XML_TEMPLATE,
+                    parse_fn=_parse_cast_xml,
                     image_paths=imgs,
                 )
                 return res.characters
@@ -386,16 +530,17 @@ class PageAnalyzerAgent:
         merged: list[SeedCharacter] = []
         if grounded and self.llm.has_text_credentials:
             try:
-                merge_res = self.llm.complete_json(
+                merge_res = self.llm.complete_xml(
                     agent_name="PrePassCastMerger",
                     system_prompt=(
                         "Hãy gộp các mục trùng tên (ví dụ tên gọi tắt và họ tên đầy đủ của cùng một nhân vật) "
                         "thành danh sách nhân vật chuẩn duy nhất (tối đa 12 nhân vật). "
                         "Lưu ý: giữ phân biệt giữa dạng người trẻ tuổi vs trưởng thành nếu ngoại hình khác hẳn "
-                        "(hoặc ghi rõ trong appearance_vi). Giữ nguyên `best_panel_id` rõ mặt nhất và `evidence_quote` có thật."
+                        "(hoặc ghi rõ trong appearance). Giữ nguyên `best_panel_id` rõ mặt nhất và `evidence_quote` có thật."
                     ),
                     user_prompt=json.dumps([c.model_dump() for c in grounded], ensure_ascii=False),
-                    schema_cls=PrePassCastResult,
+                    xml_template=_CAST_XML_TEMPLATE,
+                    parse_fn=_parse_cast_xml,
                 )
                 merged = merge_res.characters
             except Exception:
@@ -472,28 +617,47 @@ class PageAnalyzerAgent:
             if not hint and known_cast:
                 hint = f"Nhân vật đã xuất hiện: {', '.join(known_cast[:12])}.\n\n"
 
-            imgs: list[Path] = []
+            imgs: list[Path | str] = []
             sheet_note = ""
             if cast_sheet_path and cast_sheet_path.exists():
                 imgs.append(cast_sheet_path)
                 sheet_note = "Ảnh ĐẦU TIÊN là BẢNG CHÂN DUNG `cast_sheet.jpg` để soi mặt/kiểu tóc.\n"
-            imgs.append(som_path)
+            expected_code = _generate_verify_code()
+            stamped_img, was_stamped = _stamp_verify_banner_data_url(som_path, page.page_id, expected_code)
+            imgs.append(stamped_img)
 
             user_prompt = (
                 f"{sheet_note}"
                 f"{hint}"
                 f"Phân tích trang {page.page_id} (chương {page.chapter_id}, format={page.format}).\n"
                 f"Các panel_id cần phân tích theo thứ tự: {panel_list}.\n"
-                "Trả về JSON gồm page_id, chapter_id, page_summary (tiếng Việt), verbatim_quote_vi, visual_punch, và danh sách panels "
-                "(panel_id, action_summary, dialogue_summary, characters_present, emotion, importance 1-5)."
+                "BẮT BUỘC đọc đúng mã 4 ký tự in trên thanh tiêu đề vàng trên cùng của ảnh (`CODE: XXXX`) và điền vào `verify_code`.\n"
+                "Trả về XML `<pages>` chứa 1 thẻ `<page>` với đầy đủ `verify_code`, `<summary>`, `<verbatim_quote>`, `<visual_punch>`, và các `<panel>`."
             )
-            return self.llm.complete_json(
+            batch_res = self.llm.complete_xml(
                 agent_name="PageAnalyzerAgent",
                 system_prompt=SYSTEM_PROMPT,
                 user_prompt=user_prompt,
-                schema_cls=PageAnalysis,
+                xml_template=_PAGE_XML_TEMPLATE,
+                parse_fn=lambda txt: _parse_pages_xml(
+                    txt, default_page_id=page.page_id, default_chapter_id=page.chapter_id
+                ),
                 image_paths=imgs,
             )
+            pa = next((x for x in batch_res.pages if x.page_id == page.page_id), None)
+            if pa is None and batch_res.pages:
+                pa = batch_res.pages[0]
+            if pa is None:
+                raise RuntimeError(f"Empty XML <page> response for {page.page_id}")
+            if was_stamped and pa.visual_verify_code.strip().upper() != expected_code:
+                msg = (
+                    f"Visual verify code mismatch on {page.page_id}: "
+                    f"got {pa.visual_verify_code!r}, expected {expected_code!r} (image may have been dropped)."
+                )
+                if self.llm.telemetry:
+                    self.llm.telemetry.warn(msg)
+                raise RuntimeError(msg)
+            return pa
 
         if not self.llm.config.offline_fallback:
             raise RuntimeError("No vision API credentials available for PageAnalyzerAgent.")
@@ -552,7 +716,7 @@ class PageAnalyzerAgent:
                 )
             return blank_results
 
-        image_paths: list[Path] = []
+        image_paths: list[Path | str] = []
         preamble_parts: list[str] = []
         img_cursor = 1
 
@@ -570,12 +734,19 @@ class PageAnalyzerAgent:
                 ov_ids.append(f"Ảnh #{img_cursor}={op.page_id}")
                 img_cursor += 1
             preamble_parts.append(
-                f"Các trang gối đầu chỉ để hiểu mạch cảnh trước (KHÔNG xuất JSON cho các trang này): {', '.join(ov_ids)}."
+                f"Các trang gối đầu chỉ để hiểu mạch cảnh trước (KHÔNG xuất XML cho các trang này): {', '.join(ov_ids)}."
             )
 
         page_specs = []
+        expected_codes: dict[str, str] = {}
+        stamped_flags: dict[str, bool] = {}
         for p in active_pages:
-            image_paths.append(Path(p.som_paths[0]) if p.som_paths else Path(p.source_path))
+            src_img = Path(p.som_paths[0]) if p.som_paths else Path(p.source_path)
+            code = _generate_verify_code()
+            expected_codes[p.page_id] = code
+            stamped_img, was_stamped = _stamp_verify_banner_data_url(src_img, p.page_id, code)
+            stamped_flags[p.page_id] = was_stamped
+            image_paths.append(stamped_img)
             plist = ", ".join(pnl.panel_id for pnl in p.panels)
             page_specs.append(
                 f"- Ảnh #{img_cursor}: page_id={p.page_id}, chapter_id={p.chapter_id}, panels=[{plist}]"
@@ -590,22 +761,32 @@ class PageAnalyzerAgent:
         user_prompt = (
             preamble
             + hint
-            + "Phân tích lần lượt từng trang manga cần xuất kết quả dưới đây bằng TIẾNG VIỆT:\n"
+            + "Phân tích lần lượt từng trang manga cần xuất kết quả dưới đây bằng TIẾNG VIỆT.\n"
+            + "BẮT BUỘC với MỖI ảnh trang truyện, đọc mã 4 ký tự in trên thanh tiêu đề vàng trên cùng (`CODE: XXXX`) và ghi đúng vào `verify_code`:\n"
             + "\n".join(page_specs)
-            + "\nTrả về JSON dạng PageBatchAnalysis gồm danh sách `pages`, mỗi phần tử có đúng `page_id`, `chapter_id`, `page_summary`, `verbatim_quote_vi`, `visual_punch`, `panels`."
+            + "\nTrả về XML dạng `<pages>` chứa danh sách `<page id=... chapter=... verify_code=...>` với đầy đủ `<summary>`, `<verbatim_quote>`, `<visual_punch>`, và các `<panel>`."
         )
         try:
-            batch_res = self.llm.complete_json(
+            batch_res = self.llm.complete_xml(
                 agent_name="PageAnalyzerAgent",
                 system_prompt=SYSTEM_PROMPT,
                 user_prompt=user_prompt,
-                schema_cls=PageBatchAnalysis,
+                xml_template=_PAGE_XML_TEMPLATE,
+                parse_fn=_parse_pages_xml,
                 image_paths=image_paths,
             )
             valid_ids = {p.page_id for p in active_pages}
             for pa in batch_res.pages:
-                if pa.page_id in valid_ids:
-                    blank_results[pa.page_id] = pa
+                if pa.page_id not in valid_ids:
+                    continue
+                if stamped_flags.get(pa.page_id) and pa.visual_verify_code.strip().upper() != expected_codes[pa.page_id]:
+                    if self.llm.telemetry:
+                        self.llm.telemetry.warn(
+                            f"PageAnalyzerAgent: batch verify_code mismatch on {pa.page_id} "
+                            f"(got {pa.visual_verify_code!r}, expected {expected_codes[pa.page_id]!r}); forcing single-page retry."
+                        )
+                    continue
+                blank_results[pa.page_id] = pa
             return blank_results
         except Exception:
             return blank_results
@@ -738,13 +919,23 @@ class PageAnalyzerAgent:
                     for pg in batch:
                         pa = got.get(pg.page_id)
                         if pa is None:
-                            pa = self.analyze_page(
-                                pg,
-                                known_cast=known_cast_seed or state["active_characters"] or None,
-                                seed_cast=seed_cast,
-                                scene_state=state,
-                                cast_sheet_path=cast_sheet_path,
-                            )
+                            last_exc: Exception | None = None
+                            for _ in range(2):
+                                try:
+                                    pa = self.analyze_page(
+                                        pg,
+                                        known_cast=known_cast_seed or state["active_characters"] or None,
+                                        seed_cast=seed_cast,
+                                        scene_state=state,
+                                        cast_sheet_path=cast_sheet_path,
+                                    )
+                                    break
+                                except Exception as exc:
+                                    last_exc = exc
+                            if pa is None:
+                                raise RuntimeError(
+                                    f"PageAnalyzerAgent failed visual verification after retries on {pg.page_id}: {last_exc}"
+                                )
                         # Only persist genuine Vision results (never poison disk cache with dummy placeholders)
                         if not _is_dummy_page_analysis(pa) or not self.llm.has_vision_credentials:
                             (pages_dir / f"{pg.page_id}.json").write_text(

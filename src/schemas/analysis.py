@@ -19,6 +19,7 @@ class PanelAnalysis(BaseModel):
 class PageAnalysis(BaseModel):
     page_id: str
     chapter_id: str
+    visual_verify_code: str = ""
     page_summary: str
     verbatim_quote_vi: str = ""
     visual_punch: str = ""
@@ -33,6 +34,7 @@ class CharacterProfile(BaseModel):
     personality_notes: str = ""
     relationships: list[str] = Field(default_factory=list)
     first_seen_chapter: str = "ch01"
+    first_named_page_id: str = ""
 
     @model_validator(mode="before")
     @classmethod

@@ -1,12 +1,14 @@
-"""Unified OpenAI-compatible LLM/VLM client with structured Pydantic parsing."""
+"""Unified OpenAI-compatible LLM/VLM client with JSON & XML structured parsing."""
 
 from __future__ import annotations
 
 import base64
+import html
 import json
 import re
 import threading
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -17,6 +19,68 @@ from src.config import LLMConfig
 from src.core.telemetry import TelemetryTracker
 
 T = TypeVar("T", bound=BaseModel)
+R = TypeVar("R")
+
+
+def _strip_code_fence(text: str) -> str:
+    cleaned = text.strip()
+    fence = re.search(r"```(?:[a-zA-Z0-9_-]+)?\s*(.*?)\s*```", cleaned, flags=re.DOTALL)
+    return fence.group(1).strip() if fence else cleaned
+
+
+def _clean_xml_text(raw: str) -> str:
+    txt = raw.strip()
+    cdata = re.match(r"^<!\[CDATA\[(.*?)\]\]>$", txt, flags=re.DOTALL)
+    if cdata:
+        return cdata.group(1).strip()
+    return html.unescape(txt).strip()
+
+
+def extract_xml_tag(text: str, tag: str, default: str = "") -> str:
+    """Extract inner text of the first <tag>...</tag> occurrence, tolerating unescaped quotes."""
+    m = re.search(
+        rf"<{re.escape(tag)}(?:\s[^>]*)?>(.*?)</{re.escape(tag)}>",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if not m:
+        return default
+    return _clean_xml_text(m.group(1))
+
+
+def iter_xml_blocks(text: str, tag: str) -> list[tuple[str, str]]:
+    """Return [(attrs_str, inner_xml), ...] for all <tag ...>...</tag> blocks."""
+    out: list[tuple[str, str]] = []
+    for m in re.finditer(
+        rf"<{re.escape(tag)}(\s[^>]*)?>(.*?)</{re.escape(tag)}>",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    ):
+        out.append(((m.group(1) or "").strip(), m.group(2)))
+    return out
+
+
+def extract_xml_attr(attrs_str: str, attr: str, default: str = "") -> str:
+    """Extract attribute value from an XML opening-tag attribute string."""
+    m = re.search(
+        rf"""\b{re.escape(attr)}\s*=\s*(?:"([^"]*)"|'([^']*)')""",
+        attrs_str,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return default
+    val = m.group(1) if m.group(1) is not None else (m.group(2) or "")
+    return html.unescape(val).strip()
+
+
+def extract_xml_list(text: str, item_tag: str) -> list[str]:
+    """Extract list of non-empty text elements for repeated <item_tag>...</item_tag>."""
+    items: list[str] = []
+    for _, body in iter_xml_blocks(text, item_tag):
+        cleaned = _clean_xml_text(body)
+        if cleaned:
+            items.append(cleaned)
+    return items
 
 
 class LLMClient:
@@ -33,6 +97,7 @@ class LLMClient:
         self._text_client: OpenAI | None = None
         self._vision_client: OpenAI | None = None
         self._tripped_models: set[str] = set()
+        self._fail_counts: dict[str, int] = {}
 
     @property
     def has_text_credentials(self) -> bool:
@@ -76,10 +141,13 @@ class LLMClient:
             return client
 
     @staticmethod
-    def _encode_image(image_path: Path) -> str:
-        raw = image_path.read_bytes()
+    def _encode_image(image_item: Path | str) -> str:
+        if isinstance(image_item, str) and image_item.startswith("data:"):
+            return image_item
+        p = Path(image_item)
+        raw = p.read_bytes()
         b64 = base64.b64encode(raw).decode("ascii")
-        ext = image_path.suffix.lower().lstrip(".")
+        ext = p.suffix.lower().lstrip(".")
         mime = "image/png" if ext == "png" else "image/jpeg"
         return f"data:{mime};base64,{b64}"
 
@@ -91,16 +159,15 @@ class LLMClient:
             cleaned = fence.group(1)
         return json.loads(cleaned)
 
-    def complete_json(
+    def _run_completion(
         self,
         agent_name: str,
-        system_prompt: str,
+        full_system_prompt: str,
         user_prompt: str,
-        schema_cls: type[T],
-        image_paths: list[Path] | None = None,
+        parse_raw: Callable[[str], R],
+        image_paths: Sequence[Path | str] | None = None,
         model_override: str | None = None,
-    ) -> T:
-        """Invoke text or vision model and validate response against schema_cls."""
+    ) -> R:
         is_vision = bool(image_paths)
         model = model_override or (
             self.config.vision_model if is_vision else self.config.default_model
@@ -112,24 +179,10 @@ class LLMClient:
         if image_paths:
             parts: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
             for p in image_paths:
-                parts.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": self._encode_image(p)},
-                    }
-                )
+                parts.append({"type": "image_url", "image_url": {"url": self._encode_image(p)}})
             user_content = parts
         else:
             user_content = user_prompt
-
-        schema_hint = json.dumps(
-            schema_cls.model_json_schema(), ensure_ascii=False, separators=(",", ":")
-        )
-        full_system_prompt = (
-            f"{system_prompt}\n\n"
-            "BẮT BUỘC trả về JSON hợp lệ khớp chính xác JSON Schema sau (chỉ trả về JSON, không thêm giải thích):\n"
-            f"{schema_hint}"
-        )
 
         candidates = [model]
         if not is_vision and self.config.fallback_model and self.config.fallback_model != model:
@@ -140,6 +193,7 @@ class LLMClient:
         if not models_to_try:
             models_to_try = candidates[-1:]
 
+        trip_threshold = 1 if self.config.max_retries == 0 else 2
         last_err: Exception | None = None
         for active_model in models_to_try:
             model_failed_all = True
@@ -161,7 +215,7 @@ class LLMClient:
                     dt = time.perf_counter() - t0
                     choice = resp.choices[0]
                     finish_reason = getattr(choice, "finish_reason", None)
-                    content = choice.message.content or "{}"
+                    content = choice.message.content or ""
                     usage = getattr(resp, "usage", None)
                     if self.telemetry:
                         if active_model != model:
@@ -184,17 +238,74 @@ class LLMClient:
                         if self.telemetry:
                             self.telemetry.warn(msg)
                         raise RuntimeError(msg)
-                    data = self._extract_json(content)
+                    parsed = parse_raw(content)
                     model_failed_all = False
-                    return schema_cls.model_validate(data)
+                    with self._lock:
+                        self._fail_counts[active_model] = 0
+                    return parsed
                 except Exception as exc:
                     last_err = exc
                     if attempt < self.config.max_retries:
                         time.sleep(0.5 * (attempt + 1))
 
-            # Trip circuit breaker if primary model failed all retries and a fallback exists
             if model_failed_all and active_model == model and len(candidates) > 1:
                 with self._lock:
-                    self._tripped_models.add(active_model)
+                    fails = self._fail_counts.get(active_model, 0) + 1
+                    self._fail_counts[active_model] = fails
+                    if fails >= trip_threshold:
+                        self._tripped_models.add(active_model)
 
         raise RuntimeError(f"LLM call failed for {agent_name} ({models_to_try}): {last_err}")
+
+    def complete_json(
+        self,
+        agent_name: str,
+        system_prompt: str,
+        user_prompt: str,
+        schema_cls: type[T],
+        image_paths: Sequence[Path | str] | None = None,
+        model_override: str | None = None,
+    ) -> T:
+        """Invoke text or vision model and validate response against schema_cls."""
+        schema_hint = json.dumps(
+            schema_cls.model_json_schema(), ensure_ascii=False, separators=(",", ":")
+        )
+        full_system_prompt = (
+            f"{system_prompt}\n\n"
+            "BẮT BUỘC trả về JSON hợp lệ khớp chính xác JSON Schema sau (chỉ trả về JSON, không thêm giải thích):\n"
+            f"{schema_hint}"
+        )
+        return self._run_completion(
+            agent_name=agent_name,
+            full_system_prompt=full_system_prompt,
+            user_prompt=user_prompt,
+            parse_raw=lambda content: schema_cls.model_validate(self._extract_json(content or "{}")),
+            image_paths=image_paths,
+            model_override=model_override,
+        )
+
+    def complete_xml(
+        self,
+        agent_name: str,
+        system_prompt: str,
+        user_prompt: str,
+        xml_template: str,
+        parse_fn: Callable[[str], R],
+        image_paths: Sequence[Path | str] | None = None,
+        model_override: str | None = None,
+    ) -> R:
+        """Invoke text or vision model with resilient XML output parsing (immune to quote/colon escaping issues)."""
+        full_system_prompt = (
+            f"{system_prompt}\n\n"
+            "BẮT BUỘC trả về đúng cấu trúc XML sau (CHỈ xuất XML, không thêm văn bản giải thích ngoài thẻ; "
+            'lời thoại tiếng Việt giữ nguyên dấu ngoặc kép "..." và dấu hai chấm bên trong thẻ):\n'
+            f"{xml_template}"
+        )
+        return self._run_completion(
+            agent_name=agent_name,
+            full_system_prompt=full_system_prompt,
+            user_prompt=user_prompt,
+            parse_raw=lambda content: parse_fn(_strip_code_fence(content)),
+            image_paths=image_paths,
+            model_override=model_override,
+        )
