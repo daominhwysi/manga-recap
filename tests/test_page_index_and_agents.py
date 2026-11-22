@@ -816,3 +816,82 @@ def test_scriptwriter_retries_empty_xml_and_coerces_middle_outro(tmp_path: Path)
     assert len(script.beats) == 2
     assert script.beats[0].beat_type == "narrative"  # middle outro coerced
     assert script.beats[1].beat_type == "outro"      # final part outro preserved
+
+
+def test_critic_v3_opener_seam_allowlist_rollback_and_auditor(tmp_path: Path) -> None:
+    from src.agents.critic import (
+        _SeamPolishResponse,
+        _SeamRewrite,
+        _SemanticAuditFlag,
+        _SemanticAuditResponse,
+    )
+    from src.schemas.analysis import CharacterProfile
+
+    manifest, analyses = _make_dummy_manifest(12, panels_per_page=2)
+    bible = StoryBible(
+        series_title_guess="Test",
+        characters=[CharacterProfile(canonical_name="Elena", first_named_page_id="ch01_p008")],
+        pronunciation_map={},
+    )
+    beats = [
+        ScriptBeat(beat_id="b001", narration_vi="Để ý nha, cậu mở cửa sảnh lớn.", panel_ids=["ch01_p001_P1"]),
+        ScriptBeat(beat_id="b002", narration_vi="Để ý nha, chiếc chìa khóa bạc rơi xuống sàn.", panel_ids=["ch01_p002_P1"]),
+        ScriptBeat(beat_id="b003", narration_vi="Để ý nha, bóng người mặc áo choàng lướt qua hành lang.", panel_ids=["ch01_p003_P1"]),
+        ScriptBeat(beat_id="b004", narration_vi="Cậu vội vã gập nắp đồng hồ.", panel_ids=["ch01_p004_P1"]),
+        ScriptBeat(beat_id="b005", narration_vi="Vừa gập nắp đồng hồ thì cánh cửa sắt bật mở.", panel_ids=["ch01_p005_P1"]),
+        ScriptBeat(beat_id="b006", narration_vi='Anh em nghe câu này: "Đừng quay lại phía sau!"', panel_ids=["ch01_p006_P1"]),
+        ScriptBeat(beat_id="b007", narration_vi="Ngọn đèn dầu vụt tắt giữa hầm đá tối om.", panel_ids=["ch01_p007_P1"]),
+        ScriptBeat(beat_id="b008", narration_vi="Cô gái sau rèm cười nhẹ rồi tự xưng tên Elena.", panel_ids=["ch01_p008_P1"]),
+        ScriptBeat(beat_id="b009", narration_vi="Đội lính gác lập tức vây kín lối ra phía đông.", panel_ids=["ch01_p009_P1"]),
+        ScriptBeat(beat_id="b010", narration_vi="Elena tung móc sắt bám lên ban công tầng hai.", panel_ids=["ch01_p010_P1"]),
+        ScriptBeat(beat_id="b011", narration_vi="Mặt trời bắt đầu ló dạng sau đỉnh tháp cũ.", panel_ids=["ch01_p011_P1"]),
+        ScriptBeat(beat_id="b012", narration_vi="Liệu còn bí mật nào chờ cả nhóm phía trước?", beat_type="outro", panel_ids=["ch01_p012_P1"]),
+    ]
+
+    all_pages = [p.page_id for p in manifest.chapters[0].pages]
+    page_order = {pg: i for i, pg in enumerate(all_pages)}
+    issues, flagged, _ = CriticAgent._evaluate_issues(
+        beats, all_pages=all_pages, page_order=page_order, beat_to_allowed={}, bible=bible
+    )
+    cats = {(i.beat_id, i.category) for i in issues}
+    # 3rd 'để ý nha' (b003) flagged, 1st & 2nd untouched; seam echo on b005 flagged
+    assert ("b003", "opener_repeat") in cats
+    assert ("b001", "opener_repeat") not in cats
+    assert ("b005", "seam_echo") in cats
+    assert 2 in flagged and 4 in flagged
+
+    # Mock LLM: Auditor flags b007; Repairer tries to tamper with clean b006, spoils Elena in b003 (rollback!), and fixes b005 & b007
+    llm = LLMClient(LLMConfig(api_key="dummy"))
+    seen_agents: list[str] = []
+
+    def fake_v3_xml(agent_name, system_prompt, user_prompt, xml_template, parse_fn, **kw):
+        seen_agents.append(agent_name)
+        if agent_name == "CriticSemanticAuditor":
+            return _SemanticAuditResponse(flags=[_SemanticAuditFlag(beat_id="b007", reason="Lặp cảm giác tối")])
+        return _SeamPolishResponse(
+            rewrites=[
+                _SeamRewrite(beat_id="b006", narration_vi="Cửa đóng lại."),  # Clean beat -> MUST be blocked by allowlist!
+                _SeamRewrite(beat_id="b003", narration_vi="Elena mặc áo choàng lướt qua hành lang."),  # Introduces spoiler -> MUST be rolled back!
+                _SeamRewrite(beat_id="b005", narration_vi="Cánh cửa sắt bật mở ngay trước mắt cậu."),  # Valid fix
+                _SeamRewrite(beat_id="b007", narration_vi="Ngọn đèn dầu chập chờn rồi tắt hẳn trong hầm đá."),  # Valid audit fix
+            ]
+        )
+
+    llm.complete_xml = fake_v3_xml  # type: ignore
+    final_s, rep = CriticAgent(llm, polish_seams=True).review(
+        RecapScript(title_vi="V3", persona="phan_tich", beats=beats),
+        manifest,
+        bible,
+        tmp_path / "j_v3",
+        page_analyses=analyses,
+    )
+    assert "CriticSemanticAuditor" in seen_agents
+    assert "CriticSeamPolisher" in seen_agents
+    # Clean beat b006 preserved verbatim despite unsolicited rewrite
+    assert final_s.beats[5].narration_vi == beats[5].narration_vi
+    # Unsafe spoiler rewrite on b003 rolled back safely
+    assert "Elena" not in final_s.beats[2].narration_vi
+    # Safe fixes on b005 (seam echo) and b007 (auditor flag) applied
+    assert final_s.beats[4].narration_vi == "Cánh cửa sắt bật mở ngay trước mắt cậu."
+    assert final_s.beats[6].narration_vi == "Ngọn đèn dầu chập chờn rồi tắt hẳn trong hầm đá."
+    assert not any(i.beat_id == "b005" and i.category == "seam_echo" for i in rep.issues)

@@ -194,15 +194,13 @@ flowchart TD
 
 ---
 
-### 4.5. Stage 3b — Kiểm Định Viên Kịch Bản (`src/agents/critic.py`)
-- **Mục đích**: Đóng vai trò chốt chặn kiểm định chất lượng tự động trước khi đem kịch bản đi thu âm.
-- **6 Chốt chặn của `CriticAgent`**:
-  1. **Grounding**: Kiểm tra mọi `panel_id` trong kịch bản có tồn tại thật trong `01_manifest.json` không; nếu LLM viết sai mã panel thì tự động nội suy về panel hợp lệ kế tiếp.
-  2. **Biên giới Part**: Kiểm tra từng beat có lấy nhầm panel nằm ngoài phạm vi `allowed_panels` của Part đó không.
-  3. **Độ rộng trang 1 Beat**: Cảnh báo nếu 1 beat ôm số trang vượt quá ngưỡng mật độ động `max_single_beat_span`.
-  4. **Chiều tiến trang đơn điệu**: Cảnh báo ngay nếu beat sau có trang nhỏ hơn trang của beat trước (`cur_min < prev_page_pos`).
-  5. **Khoảng trống bỏ sót trang**: Cảnh báo nếu hai beat liên tiếp nhảy cóc bỏ qua quá nhiều trang truyện (`max_coverage_gap`).
-  6. **Chống lặp nội dung (N-gram Overlap) & Từ sáo rỗng AI**: Tách lời thoại thành tập hợp các cụm 2 từ và 3 từ liên tiếp (`_content_ngrams`). Nếu hai beat bất kỳ trùng lặp nội dung đáng kể hoặc chứa các cụm từ văn mẫu AI (`_BANNED_CLICHES`), Critic sẽ gắn cờ cảnh báo trong báo cáo.
+### 4.5. Stage 3b — Kiểm Định Viên Kịch Bản Critic V3 (`src/agents/critic.py`)
+- **Mục đích**: Kiểm định 4 tầng đảm bảo sạch lỗi sự thật, sạch lặp cụm/lặp ý mà **tuyệt đối không làm phẳng cá tính giọng kể của persona**.
+- **4 Tầng xử lý của `CriticAgent` V3**:
+  1. **Tầng 1 — Deterministic Gate & Repetition Scanner (Python thuần)**: Kiểm định `grounding`, biên giới Part, độ rộng trang 1 beat, chiều tiến đơn điệu, `coverage_gap`, `spoiler_name` (theo `first_named_page_id`), N-gram `duplication`, cliché AI, `budget` (`> +30%`), cộng thêm 2 bộ quét lặp thống kê **`opener_repeat`** (cụm mở đầu/cửa miệng lặp từ lần thứ 3 trở đi) và **`seam_echo`** (lặp từ/ý giữa đuôi beat `k-1` và đầu beat `k`).
+  2. **Tầng 2 — Read-Only Semantic Auditor (`CriticSemanticAuditor`)**: Đọc toàn bộ kịch bản trong 1 context duy nhất để chỉ điểm tối đa 8 beat bị lặp ý diễn đạt khác chữ (paraphrase) hoặc sượng điểm chuyển hồi; không tự ý gắn cờ câu hỏi giao lưu hay beat ngắn.
+  3. **Tầng 3 — Allowlisted Surgical Repairer (`CriticSeamPolisher`)**: Chỉ cho phép sửa các `beat_id` thuộc **allowlist `editable_ids`** (beat kề trước/sau gắn `readonly="true"` chỉ để giữ mạch), luôn gửi kèm `<grounded_facts>` và giọng của đúng `persona` đang chạy, và chặn bằng **Per-Beat Rollback Guard** (tự động giữ nguyên bản `03a` nếu rewrite làm phát sinh spoiler, cliché, lặp mới hoặc xóa trích dẫn thoại gốc).
+  4. **Tầng 4 — Re-Validate & Pronunciation Prep**: Chấm lại `CriticReport` và điền `tts_text` từ `pronunciation_map`.
 - **Đầu ra**: `03b_script_final.json` và `03b_critic_report.json`.
 
 ---

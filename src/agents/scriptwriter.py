@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 import math
 import re
@@ -9,6 +10,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from src.agents.critic import _extract_bible_name_tokens, extract_beat_openers
 from src.agents.page_index import (
     PageIndexTree,
     format_pages_compact_md,
@@ -419,6 +421,7 @@ class ScriptwriterAgent:
         prev_scene_id: str | None = None,
         hook_strategy: str = "in_medias_res",
         hook_summary: str = "",
+        avoid_phrases: list[str] | None = None,
     ) -> list[ScriptBeat]:
         tail_txt = (
             json.dumps(
@@ -548,6 +551,13 @@ class ScriptwriterAgent:
                         b.beat_type = "narrative"
             return raw_beats
 
+        avoid_rule = (
+            f"\n6) TRÁNH LẶP CỤM MỞ CÂU / CỬA MIỆNG: Các cụm sau đã xuất hiện từ 2 lần trở lên ở các hồi trước: "
+            f"{avoid_phrases} -> TUYỆT ĐỐI KHÔNG lặp lại chúng trong hồi này, hãy đổi sang cách dẫn chuyện đa dạng hơn."
+            if avoid_phrases
+            else ""
+        )
+
         for turn in range(3):
             user_prompt = (
                 f"{context_block}\n\n"
@@ -558,16 +568,17 @@ class ScriptwriterAgent:
                 f"Dải dung lượng gợi ý: khoảng {part.target_words} từ (dải linh hoạt {min_words}–{max_words} từ; gợi ý quanh ~{part.target_beats} beats nhưng KHÔNG ép cứng số beat).\n"
                 f"Ghi chú đạo diễn: {part.focus_notes}\n"
                 + (f"{affordance_txt}\n" if affordance_txt else "")
-                + f"\n### 2 BEAT CUỐI HỒI TRƯỚC (chỉ để nối nhịp giọng, TUYỆT ĐỐI KHÔNG lặp lại sự kiện đã kể):\n{tail_txt}\n\n"
+                + f"\n### 2 BEAT CUỐI HỒI TRƯỚC (chỉ để nối nhịp giọng — TUYỆT ĐỐI KHÔNG nhắc lại hay diễn giải lại hành động vừa kết ở đây):\n{tail_txt}\n\n"
                 f"{extra_nodes_text}"
                 f"{lookup_hint}\n\n"
                 "RÀNG BUỘC & BỘ CÔNG CỤ KỂ CHUYỆN:\n"
-                "1) GIỌNG KỂ YOUTUBER GẦN GŨI & PHÂN TÍCH (VĂN NÓI 100%): Nói chuyện như đang kể cho anh em bạn bè nghe (không viết văn xuôi tóm tắt!). Tận dụng thoại đắt trong `⚡Thoại` (ngoặc kép \"...\") và chi tiết `👁️Hình`. Khuyến khích tách riêng 15-30% số beat ở dạng `beat_type='commentary'` để nhận định tâm lý, chỉ ra manh mối, hoặc giải thích luật chơi ('để ý kỹ nha', 'nói nôm na là...') neo 100% vào sự kiện đang có trên trang.\n"
+                "1) GIỌNG KỂ YOUTUBER GẦN GŨI & PHÂN TÍCH (VĂN NÓI 100%): Nói chuyện như đang kể cho anh em bạn bè nghe (không viết văn xuôi tóm tắt!). Tận dụng thoại đắt trong `⚡Thoại` (ngoặc kép \"...\") và chi tiết `👁️Hình`. Khuyến khích tách riêng 15-30% số beat ở dạng `beat_type='commentary'` để nhận định tâm lý, chỉ ra manh mối, hoặc giải thích luật chơi bằng nhiều cách mở câu đa dạng, neo 100% vào sự kiện đang có trên trang.\n"
                 "2) NHỊP NGỮ NGHĨA LINH HOẠT (KHÔNG CHIA ĐỀU TRANG): Chỗ chạy đuổi/ít chữ thì lướt gọn 1 câu (10-16 từ) cho cả 3-5 trang; chỗ twist/cú đấm thì cắt nhịp gắt (6-14 từ), rồi mới dừng ở cảnh đối thoại đắt giá. Không kể vượt trước hình và không bỏ sót biến cố chính tới hết trang "
                 f"{last_pg}.\n"
                 f"3) ĐỒNG BỘ HÌNH-TIẾNG ({first_pg} -> {last_pg}): đi tuần tự, mỗi beat gắn 1-4 `panel_id` đầy đủ chính xác (dạng `{sample_panels_hint}`), tiến đơn điệu; ưu tiên `[face]`/`[text]`, tránh `[bg]` trừ cảnh toàn trang đắt giá.\n"
                 f"4) `mood` CHỈ chọn đúng 1 trong 7 giá trị: `{moods_txt}`. Cho `pause_ms` lớn hơn (350-550) ở cuối câu twist/commentary lắng đọng, ngắn hơn (120-200) ở pha cắt dồn dập. Trả về XML `<part_script>` gồm `<beats>` với các `<beat id=... section=... beat_type=... mood=... pause_ms=...>` chứa `<panels>` và `<narration>`."
                 + unrevealed_rule
+                + avoid_rule
             )
 
             resp = self.llm.complete_xml(
@@ -785,9 +796,12 @@ class ScriptwriterAgent:
         boundaries: list[dict] = []
         total_parts = len(outline.parts)
         prev_scene_id: str | None = None
+        name_tokens = _extract_bible_name_tokens(bible)
+        opener_counts: Counter[str] = Counter()
 
         for idx, part in enumerate(outline.parts, start=1):
             allowed_panels, first_pg, last_pg = _collect_part_panels(tree, part.scene_ids)
+            overused_phrases = [p for p, c in opener_counts.most_common(12) if c >= 2]
 
             part_file = parts_dir / f"{part.part_id}.json"
             if part_file.exists() and not force:
@@ -812,11 +826,16 @@ class ScriptwriterAgent:
                     prev_scene_id=prev_scene_id,
                     hook_strategy=outline.hook_strategy,
                     hook_summary=outline.hook_summary,
+                    avoid_phrases=overused_phrases,
                 )
                 part_file.write_text(
                     json.dumps([b.model_dump() for b in part_beats], indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
+
+            for pb in part_beats:
+                for op in extract_beat_openers(pb.narration_vi, name_tokens=name_tokens):
+                    opener_counts[op] += 1
 
             start_beat_idx = len(all_beats)
             all_beats.extend(part_beats)

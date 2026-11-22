@@ -1,10 +1,11 @@
-"""Stage 3b Agent: Closed-Loop Critic, Read-Aloud Showrunner Pass & Pronunciation Prep."""
+"""Stage 3b Agent (Critic V3): Deterministic Gate + Repetition Scanner + Read-Only Semantic Auditor + Surgical Repairer."""
 
 from __future__ import annotations
 
 import json
 import math
 import re
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from src.agents.page_index import extract_distinctive_char_patterns
 from src.audio.base import apply_pronunciation_glossary
+from src.config import load_personas
 from src.llm.client import (
     LLMClient,
     extract_xml_attr,
@@ -41,6 +43,82 @@ _BANNED_CLICHES = (
     "sang hồi kết mở",
 )
 
+# Common Vietnamese grammatical tokens that are not meaningful standalone content words
+_VN_STOPWORDS = {
+    "và",
+    "của",
+    "là",
+    "có",
+    "cho",
+    "với",
+    "từ",
+    "trong",
+    "ngoài",
+    "trên",
+    "dưới",
+    "về",
+    "tới",
+    "đến",
+    "vào",
+    "ra",
+    "lên",
+    "xuống",
+    "đi",
+    "lại",
+    "đã",
+    "đang",
+    "sẽ",
+    "vừa",
+    "mới",
+    "còn",
+    "cũng",
+    "chỉ",
+    "thì",
+    "mà",
+    "nhưng",
+    "rồi",
+    "khi",
+    "lúc",
+    "này",
+    "kia",
+    "đó",
+    "ấy",
+    "một",
+    "hai",
+    "các",
+    "những",
+    "cậu",
+    "cô",
+    "anh",
+    "ông",
+    "bà",
+    "chú",
+    "hắn",
+    "họ",
+    "mình",
+    "người",
+    "bị",
+    "được",
+    "không",
+    "chẳng",
+    "chưa",
+    "rất",
+    "quá",
+    "hơn",
+    "nhất",
+}
+
+_TEXT_FIXABLE_CATEGORIES = {
+    "spoiler_name",
+    "duplication",
+    "style",
+    "budget",
+    "pacing",
+    "opener_repeat",
+    "seam_echo",
+    "semantic_repeat",
+}
+
 
 def _page_pos_from_panel(panel_id: str, page_order: dict[str, int]) -> int | None:
     pg = re.sub(r"_P\d+$", "", panel_id)
@@ -57,6 +135,68 @@ def _content_ngrams(text: str) -> set[str]:
     return ngrams
 
 
+def _extract_bible_name_tokens(bible: StoryBible | None) -> set[str]:
+    """Collect lowercase character name tokens so normal subject mentions aren't mistaken for catchphrases."""
+    out: set[str] = set()
+    if not bible or not bible.characters:
+        return out
+    for ch in bible.characters:
+        for raw in [ch.canonical_name, *ch.aliases]:
+            for tok in re.findall(r"[^\W\d_]+", raw.lower(), flags=re.UNICODE):
+                if len(tok) >= 2:
+                    out.add(tok)
+    return out
+
+
+def extract_beat_openers(text: str, name_tokens: set[str] | None = None) -> list[str]:
+    """Extract candidate conversational openers/fillers from sentence starts (0 hardcoding, purely structural)."""
+    names = name_tokens or set()
+    candidates: list[str] = []
+    # Split into sentences to catch mid-beat repeated fillers like 'Nhưng để ý nha,' or 'Khoan,'
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?…])\s+", text.strip()) if s.strip()]
+    for s_idx, sent in enumerate(sentences):
+        # Skip direct quoted dialogue
+        if sent.startswith(('"', "“", "'")):
+            continue
+        # 1) Short clause (1-3 words) right before comma/colon/exclamation/dash at sentence start
+        m_lead = re.match(r"^([^,.:;!?—–\"“”]{3,28})[,:!—–]", sent)
+        if m_lead:
+            lead_words = re.findall(r"[^\W\d_]+", m_lead.group(1).lower(), flags=re.UNICODE)
+            if 1 <= len(lead_words) <= 3:
+                # Strip single leading conjunction like 'nhưng' / 'còn' so 'nhưng khoan' matches 'khoan'
+                trimmed = lead_words[1:] if len(lead_words) >= 2 and lead_words[0] in ("nhưng", "còn", "mà", "và") else lead_words
+                if trimmed and trimmed[0] not in names:
+                    phrase = " ".join(trimmed)
+                    if (len(trimmed) == 1 and len(phrase) >= 5 and phrase not in _VN_STOPWORDS) or (
+                        len(trimmed) >= 2 and any(w not in _VN_STOPWORDS for w in trimmed)
+                    ):
+                        candidates.append(phrase)
+
+        # 2) Leading 2-3 word beat opener on the opening sentence only
+        if s_idx == 0:
+            words = re.findall(r"[^\W\d_]+", sent.lower(), flags=re.UNICODE)
+            if len(words) >= 2 and words[0] not in names and words[1] not in names:
+                for n in (3, 2):
+                    if len(words) >= n:
+                        sub = words[:n]
+                        if any(w not in _VN_STOPWORDS for w in sub):
+                            phrase = " ".join(sub)
+                            if len(phrase) >= 6:
+                                candidates.append(phrase)
+    # Deduplicate preserving order
+    return list(dict.fromkeys(candidates))
+
+
+def _tail_head_content_words(text: str, is_tail: bool, name_tokens: set[str]) -> list[str]:
+    """Return meaningful non-name content words from the last or first sentence of a beat."""
+    sents = [s.strip() for s in re.split(r"(?<=[.!?…])\s+", text.strip()) if s.strip()]
+    if not sents:
+        return []
+    target = sents[-1] if is_tail else sents[0]
+    words = re.findall(r"[^\W\d_]+", target.lower(), flags=re.UNICODE)
+    return [w for w in words if len(w) >= 3 and w not in _VN_STOPWORDS and w not in name_tokens]
+
+
 class _SeamRewrite(BaseModel):
     beat_id: str
     narration_vi: str
@@ -66,9 +206,22 @@ class _SeamPolishResponse(BaseModel):
     rewrites: list[_SeamRewrite] = Field(default_factory=list)
 
 
+class _SemanticAuditFlag(BaseModel):
+    beat_id: str
+    reason: str
+
+
+class _SemanticAuditResponse(BaseModel):
+    flags: list[_SemanticAuditFlag] = Field(default_factory=list)
+
+
 _SEAM_POLISH_XML_TEMPLATE = """<rewrites>
-  <rewrite beat_id="b001">Câu kể văn nói tiếng Việt đã được chuốt lại mượt mà...</rewrite>
+  <rewrite beat_id="b001">Câu kể văn nói tiếng Việt đã được sửa đúng lỗi...</rewrite>
 </rewrites>"""
+
+_SEMANTIC_AUDIT_XML_TEMPLATE = """<audit>
+  <flag beat_id="b021" reason="Lặp lại hành động vừa kết ở b020"/>
+</audit>"""
 
 
 def _parse_seam_polish_xml(xml_text: str) -> _SeamPolishResponse:
@@ -81,8 +234,30 @@ def _parse_seam_polish_xml(xml_text: str) -> _SeamPolishResponse:
     return _SeamPolishResponse(rewrites=rewrites)
 
 
+def _parse_semantic_audit_xml(xml_text: str) -> _SemanticAuditResponse:
+    flags: list[_SemanticAuditFlag] = []
+    # Support both self-closing <flag beat_id="..." reason="..."/> and <flag ...>reason</flag>
+    for m in re.finditer(r"<flag\s+([^>]+?)/?>", xml_text, flags=re.IGNORECASE | re.DOTALL):
+        attrs = m.group(1)
+        bid = extract_xml_attr(attrs, "beat_id") or extract_xml_attr(attrs, "id")
+        reason = extract_xml_attr(attrs, "reason")
+        if bid and reason:
+            flags.append(_SemanticAuditFlag(beat_id=bid, reason=reason))
+    if not flags:
+        for attrs, body in iter_xml_blocks(xml_text, "flag"):
+            bid = extract_xml_attr(attrs, "beat_id") or extract_xml_attr(attrs, "id") or extract_xml_tag(body, "beat_id")
+            reason = extract_xml_attr(attrs, "reason") or extract_xml_tag(body, "reason") or re.sub(r"<[^>]+>", "", body).strip()
+            if bid and reason:
+                flags.append(_SemanticAuditFlag(beat_id=bid, reason=reason))
+    return _SemanticAuditResponse(flags=flags)
+
+
+def _has_dialogue_quote(text: str) -> bool:
+    return bool(re.search(r'["“][^"”]{3,}["”]', text))
+
+
 class CriticAgent:
-    """Validates hard invariants, macro rhythm distribution, and runs Closed-Loop Showrunner Auto-Repair."""
+    """Critic V3: Deterministic Gate + Repetition Scanner + Read-Only Auditor + Allowlisted Surgical Repairer."""
 
     def __init__(self, llm: LLMClient, polish_seams: bool = True) -> None:
         self.llm = llm
@@ -104,23 +279,10 @@ class CriticAgent:
         return valid_ids[min(len(valid_ids) - 1, int(ratio * len(valid_ids)))]
 
     @staticmethod
-    def _evaluate_issues(
-        beats: list[ScriptBeat],
-        all_pages: list[str],
+    def _build_reveal_checks(
+        bible: StoryBible | None,
         page_order: dict[str, int],
-        beat_to_allowed: dict[int, set[str]],
-        target_total_words: int | None = None,
-        bible: StoryBible | None = None,
-    ) -> tuple[list[CriticIssue], set[int], list[str]]:
-        """Evaluate hard invariants (error) & macro rhythm/span warnings without mutating panel_ids."""
-        issues: list[CriticIssue] = []
-        flagged_indices: set[int] = set()
-        flagged_notes: list[str] = []
-        total_beats = len(beats)
-        avg_pages_per_beat = (len(all_pages) / max(1, total_beats)) if total_beats >= 6 else 2.5
-        max_single_beat_span = max(3, math.ceil(avg_pages_per_beat * 1.5))
-        max_coverage_gap = max(8, math.ceil(avg_pages_per_beat * 3.5))
-
+    ) -> list[tuple[str, str, int, list[re.Pattern[str]]]]:
         reveal_checks: list[tuple[str, str, int, list[re.Pattern[str]]]] = []
         if bible and bible.characters:
             canon_set = {c.canonical_name.strip().lower() for c in bible.characters if c.canonical_name.strip()}
@@ -131,10 +293,33 @@ class CriticAgent:
                         reveal_checks.append(
                             (ch.canonical_name, ch.first_named_page_id, page_order[ch.first_named_page_id], pats)
                         )
+        return reveal_checks
+
+    @staticmethod
+    def _evaluate_issues(
+        beats: list[ScriptBeat],
+        all_pages: list[str],
+        page_order: dict[str, int],
+        beat_to_allowed: dict[int, set[str]],
+        target_total_words: int | None = None,
+        bible: StoryBible | None = None,
+    ) -> tuple[list[CriticIssue], set[int], list[str]]:
+        """Layer 1: Evaluate hard invariants + statistical opener/seam repetition without mutating panel_ids."""
+        issues: list[CriticIssue] = []
+        flagged_indices: set[int] = set()
+        flagged_notes: list[str] = []
+        total_beats = len(beats)
+        avg_pages_per_beat = (len(all_pages) / max(1, total_beats)) if total_beats >= 6 else 2.5
+        max_single_beat_span = max(3, math.ceil(avg_pages_per_beat * 1.5))
+        max_coverage_gap = max(8, math.ceil(avg_pages_per_beat * 3.5))
+
+        reveal_checks = CriticAgent._build_reveal_checks(bible, page_order)
+        name_tokens = _extract_bible_name_tokens(bible)
 
         prev_page_pos: int | None = None
         beat_ngrams: list[tuple[str, set[str]]] = []
         word_counts: list[int] = []
+        opener_hits: dict[str, list[int]] = {}
 
         for idx, beat in enumerate(beats):
             kept = beat.panel_ids
@@ -146,7 +331,6 @@ class CriticAgent:
                     issues.append(
                         CriticIssue(beat_id=beat.beat_id, severity="error", category="panel_sync", message=msg)
                     )
-                    flagged_indices.add(idx)
                     flagged_notes.append(msg)
 
             positions = [p for pid in kept if (p := _page_pos_from_panel(pid, page_order)) is not None]
@@ -169,7 +353,6 @@ class CriticAgent:
                     issues.append(
                         CriticIssue(beat_id=beat.beat_id, severity="error", category="panel_sync", message=back_msg)
                     )
-                    flagged_indices.add(idx)
                     flagged_notes.append(back_msg)
                 if prev_page_pos is not None and (cur_min - prev_page_pos) > max_coverage_gap:
                     gap_msg = (
@@ -214,6 +397,30 @@ class CriticAgent:
                         break
                 beat_ngrams.append((beat.beat_id, cur_ng))
 
+            # Adjacent seam echo detector: catches ending of beat i-1 echoed in start of beat i
+            if idx > 0:
+                prev_tail_w = _tail_head_content_words(beats[idx - 1].narration_vi, is_tail=True, name_tokens=name_tokens)
+                cur_head_w = _tail_head_content_words(beat.narration_vi, is_tail=False, name_tokens=name_tokens)
+                prev_bg = {f"{prev_tail_w[k]} {prev_tail_w[k + 1]}" for k in range(max(0, len(prev_tail_w) - 1))}
+                cur_bg = {f"{cur_head_w[k]} {cur_head_w[k + 1]}" for k in range(max(0, len(cur_head_w) - 1))}
+                shared_bg = prev_bg & cur_bg
+                shared_single = set(prev_tail_w) & set(cur_head_w)
+                if shared_bg or len(shared_single) >= 3:
+                    echo_tok = sorted(shared_bg)[0] if shared_bg else ", ".join(sorted(shared_single)[:3])
+                    echo_msg = (
+                        f"{beat.beat_id} lặp lại ý/từ vừa kết ở {beats[idx - 1].beat_id} ('{echo_tok}') "
+                        f"— hãy vào thẳng diễn biến mới, bỏ vế nhắc lại."
+                    )
+                    issues.append(
+                        CriticIssue(beat_id=beat.beat_id, severity="warning", category="seam_echo", message=echo_msg)
+                    )
+                    flagged_indices.add(idx)
+                    flagged_notes.append(echo_msg)
+
+            # Collect openers/catchphrases across the volume
+            for op in extract_beat_openers(beat.narration_vi, name_tokens=name_tokens):
+                opener_hits.setdefault(op, []).append(idx)
+
             words = len(beat.narration_vi.split())
             word_counts.append(words)
             if words > 80:
@@ -233,6 +440,26 @@ class CriticAgent:
                     )
                     flagged_indices.add(idx)
                     flagged_notes.append(c_msg)
+
+        # Opener/Catchphrase Repetition Scanner: keep first 2 occurrences, flag 3rd+ (longest phrase wins per beat)
+        repeated_by_beat: dict[int, tuple[str, int]] = {}
+        for phrase, hit_indices in sorted(opener_hits.items(), key=lambda kv: (-len(kv[0]), kv[0])):
+            uniq_hits = list(dict.fromkeys(hit_indices))
+            if len(uniq_hits) >= 3:
+                for occ_num, b_idx in enumerate(uniq_hits[2:], start=3):
+                    prev_entry = repeated_by_beat.get(b_idx)
+                    if prev_entry is None or len(phrase) > len(prev_entry[0]):
+                        repeated_by_beat[b_idx] = (phrase, occ_num)
+        for b_idx, (phrase, occ_num) in sorted(repeated_by_beat.items()):
+            op_msg = (
+                f"{beats[b_idx].beat_id} lặp cụm mở/cửa miệng '{phrase}' (lần thứ {occ_num} trong tập) "
+                f"— hãy đổi cách dẫn tự nhiên khác (không xóa mất ý phân tích)."
+            )
+            issues.append(
+                CriticIssue(beat_id=beats[b_idx].beat_id, severity="warning", category="opener_repeat", message=op_msg)
+            )
+            flagged_indices.add(b_idx)
+            flagged_notes.append(op_msg)
 
         # Macro Distribution Critique (Rule 5): check volume-level pacing variance & total word budget
         if len(word_counts) >= 12:
@@ -270,6 +497,110 @@ class CriticAgent:
 
         return issues, flagged_indices, flagged_notes
 
+    def _audit_semantic_repetitions(
+        self,
+        beats: list[ScriptBeat],
+        seam_indices: list[int],
+    ) -> tuple[set[int], list[str]]:
+        """Layer 2 (Read-Only): Scan full script in 1 context ONLY for paraphrase repetition & awkward seams."""
+        if not self.polish_seams or not self.llm.has_text_credentials or (len(seam_indices) < 2 and len(beats) < 12):
+            return set(), []
+
+        id_to_idx = {b.beat_id: i for i, b in enumerate(beats)}
+        seam_ids = [beats[i].beat_id for i in sorted(set(seam_indices)) if 0 <= i < len(beats)]
+        script_lines = [
+            f"[{b.beat_id} | {b.section}/{b.beat_type}] {b.narration_vi}"
+            for b in beats
+        ]
+        try:
+            res = self.llm.complete_xml(
+                agent_name="CriticSemanticAuditor",
+                system_prompt=(
+                    "Bạn là kiểm định viên CHỈ ĐỌC (Read-Only Auditor) cho kịch bản recap manga. "
+                    "Nhiệm vụ DUY NHẤT: đọc liền mạch toàn bộ kịch bản và chỉ điểm tối đa 8 beat THỰC SỰ mắc 1 trong 3 lỗi:\n"
+                    "1) Lặp ý diễn đạt khác chữ (nhắc lại một chi tiết/nhận định đã nói ở beat trước mà không thêm thông tin mới).\n"
+                    "2) Lặp đuôi hồi trước ngay đầu hồi sau tại các điểm nối `seam`.\n"
+                    "3) Lặp câu cửa miệng / mẫu câu hỏi quá lộ (ví dụ mở câu giống nhau 3-4 lần).\n"
+                    "TUYỆT ĐỐI KHÔNG gắn cờ câu hỏi giao lưu ('Anh em...', 'Thử nghĩ xem...'), câu bình luận hay, hay beat ngắn dồn dập. "
+                    "Nếu kịch bản đã sạch lặp, trả về `<audit></audit>` rỗng."
+                ),
+                user_prompt=(
+                    f"Các điểm nối hồi (seam): {seam_ids}\n\n"
+                    f"Toàn bộ kịch bản ({len(beats)} beats):\n" + "\n".join(script_lines)
+                ),
+                xml_template=_SEMANTIC_AUDIT_XML_TEMPLATE,
+                parse_fn=_parse_semantic_audit_xml,
+            )
+            if not isinstance(res, _SemanticAuditResponse):
+                return set(), []
+            found_indices: set[int] = set()
+            found_notes: list[str] = []
+            for fl in res.flags[:8]:
+                idx = id_to_idx.get(fl.beat_id)
+                if idx is not None and idx not in found_indices:
+                    found_indices.add(idx)
+                    found_notes.append(f"{fl.beat_id} [audit lặp ý/seam]: {fl.reason}")
+            return found_indices, found_notes
+        except Exception:
+            return set(), []
+
+    @staticmethod
+    def _is_safe_beat_rewrite(
+        beat_idx: int,
+        old_text: str,
+        new_text: str,
+        beats: list[ScriptBeat],
+        page_order: dict[str, int],
+        reveal_checks: list[tuple[str, str, int, list[re.Pattern[str]]]],
+        beat_issue_cats: set[str],
+        repeated_phrases: set[str],
+    ) -> bool:
+        """Per-beat rollback guard: accept rewrite only if clean, spoiler-free, and doesn't worsen duplication."""
+        txt = new_text.strip()
+        if not txt or txt == old_text.strip() or txt[0].islower():
+            return False
+        low = txt.lower()
+        if any(phrase in low for phrase in _BANNED_CLICHES):
+            return False
+
+        # Reject if rewrite still keeps the exact overused opener it was supposed to replace
+        if "opener_repeat" in beat_issue_cats and repeated_phrases:
+            if any(p in low for p in repeated_phrases):
+                return False
+
+        # Reject if rewrite introduces a new character name spoiler before first_named_page_id
+        positions = [p for pid in beats[beat_idx].panel_ids if (p := _page_pos_from_panel(pid, page_order)) is not None]
+        if positions and beats[beat_idx].beat_type != "hook_montage":
+            cur_max = max(positions)
+            for _, _, rev_pos, pats in reveal_checks:
+                if rev_pos > cur_max and any(p.search(txt) for p in pats):
+                    return False
+
+        # Preserve verbatim quoted dialogue unless beat is being trimmed for budget/duplication/spoiler
+        if (
+            not (beat_issue_cats & {"budget", "duplication", "spoiler_name"})
+            and _has_dialogue_quote(old_text)
+            and not _has_dialogue_quote(txt)
+            and len(txt.split()) < len(old_text.split()) * 0.65
+        ):
+            return False
+
+        # Reject if rewrite creates brand-new heavy N-gram duplication with any other beat
+        new_ng = _content_ngrams(txt)
+        if len(new_ng) >= 8:
+            for j, other in enumerate(beats):
+                if j == beat_idx:
+                    continue
+                other_ng = _content_ngrams(other.narration_vi)
+                if len(other_ng) < 8:
+                    continue
+                ov = len(new_ng & other_ng)
+                denom = max(1, min(len(new_ng), len(other_ng)))
+                if ov >= 4 and (ov / denom) >= 0.35:
+                    return False
+
+        return True
+
     def _polish_multi_part_seams(
         self,
         beats: list[ScriptBeat],
@@ -280,39 +611,49 @@ class CriticAgent:
         panel_text_lookup: dict[str, str] | None = None,
         run_global_showrunner: bool = False,
         target_total_words: int | None = None,
+        persona: str = "kich_tinh",
+        page_order: dict[str, int] | None = None,
+        beat_issues_map: dict[int, list[CriticIssue]] | None = None,
     ) -> list[ScriptBeat]:
-        """Read-Aloud Showrunner Pass + Targeted Auto-Repair (panel_ids strictly locked in Python)."""
+        """Layer 3 (Surgical Repairer): Edit ONLY allowlisted flagged beats with read-only neighbor context & rollback."""
         if not self.polish_seams or not self.llm.has_text_credentials or len(beats) < 6:
             return beats
 
-        seam_set = {i for i in seam_indices if 0 <= i < len(beats)}
-        error_neighbors: set[int] = set()
-        for fi in flagged_indices:
-            for d in (fi - 1, fi, fi + 1):
-                if 0 <= d < len(beats):
-                    error_neighbors.add(d)
-
-        target_indices = (
-            list(range(len(beats)))
-            if run_global_showrunner
-            else sorted(flagged_indices | seam_set | error_neighbors)
-        )
-        if not target_indices:
+        editable_indices = sorted(i for i in flagged_indices if 0 <= i < len(beats))
+        if not editable_indices:
             return beats
 
-        seam_beat_ids = [beats[i].beat_id for i in sorted(seam_set)]
+        editable_set = set(editable_indices)
+        editable_beat_ids = {beats[i].beat_id for i in editable_indices}
+
+        # Include immediate neighbor beats strictly as read-only context so tone/flow stay seamless
+        context_indices: set[int] = set(editable_set)
+        for fi in editable_indices:
+            if fi - 1 >= 0:
+                context_indices.add(fi - 1)
+            if fi + 1 < len(beats):
+                context_indices.add(fi + 1)
+        ordered_indices = sorted(context_indices)
+
+        issues_by_idx = beat_issues_map or {}
         payload_lines = ["<beats>"]
-        for i in target_indices:
+        for i in ordered_indices:
             b = beats[i]
-            facts_attr = ""
-            if i in flagged_indices and panel_text_lookup:
-                facts = [panel_text_lookup[pid] for pid in b.panel_ids if pid in panel_text_lookup]
-                if facts:
-                    facts_txt = " | ".join(facts).replace('"', "'")
-                    facts_attr = f"\n    <grounded_facts>{facts_txt}</grounded_facts>"
+            is_ed = i in editable_set
+            mode_attr = 'editable="true"' if is_ed else 'readonly="true"'
+            extra_blocks = ""
+            if is_ed:
+                if panel_text_lookup:
+                    facts = [panel_text_lookup[pid] for pid in b.panel_ids if pid in panel_text_lookup]
+                    if facts:
+                        facts_txt = " | ".join(facts).replace('"', "'")
+                        extra_blocks += f"\n    <grounded_facts>{facts_txt}</grounded_facts>"
+                b_msgs = [iss.message for iss in issues_by_idx.get(i, [])]
+                if b_msgs:
+                    extra_blocks += f"\n    <fix_reason>{' ; '.join(b_msgs)}</fix_reason>"
             payload_lines.append(
-                f'  <beat id="{b.beat_id}" section="{b.section}" beat_type="{b.beat_type}" mood="{b.mood}">\n'
-                f"    <narration>{b.narration_vi}</narration>{facts_attr}\n"
+                f'  <beat id="{b.beat_id}" {mode_attr} section="{b.section}" beat_type="{b.beat_type}" mood="{b.mood}">\n'
+                f"    <narration>{b.narration_vi}</narration>{extra_blocks}\n"
                 "  </beat>"
             )
         payload_lines.append("</beats>")
@@ -321,44 +662,69 @@ class CriticAgent:
             f"{c.canonical_name} (lộ từ {c.first_named_page_id})" if c.first_named_page_id else c.canonical_name
             for c in bible.characters
         ]
-        notes_txt = "\n".join(f"- {n}" for n in flagged_notes) or "Không có lỗi nghiêm trọng — hãy chuốt văn nói mượt mà."
+        notes_txt = "\n".join(f"- {n}" for n in flagged_notes)
         budget_hint = (
-            f"Tổng ngân sách mục tiêu toàn tập: ~{target_total_words} từ (cắt gọn câu thừa nếu vượt quá nhiều)."
-            if target_total_words
+            f"Tổng ngân sách mục tiêu toàn tập: ~{target_total_words} từ (chỉ rút gọn ở các beat editable bị gắn cờ budget)."
+            if target_total_words and any("exceeds target" in n for n in flagged_notes)
             else ""
         )
+        personas_cfg = load_personas()
+        persona_name = personas_cfg.get(persona, {}).get("name", persona)
+        persona_voice = (personas_cfg.get(persona, {}).get("system_prompt", "") or "").splitlines()[0].strip()
+
         try:
             res = self.llm.complete_xml(
                 agent_name="CriticSeamPolisher",
                 system_prompt=(
-                    "Bạn là Tổng Biên Tập Kịch Bản Voiceover YouTube (Read-Aloud Showrunner). CHỈ trả về các thẻ `<rewrite beat_id='...'>` cho những beat thực sự cần sửa để:\n"
-                    "1) Nối mượt chuyển hồi tại `seam_beat_ids` bằng hành động/không gian tự nhiên, xóa giới thiệu lặp nhân vật. CẤM câu chuyển đoạn bình luận viên.\n"
-                    "2) Khử sạch cliché AI, lặp từ nối ('ai ngờ', 'cứ tưởng', 'tới lúc này', 'thế nhưng'), bỏ tên nhân vật bị gọi sớm trước `lộ từ ...`, và sửa trùng lặp dựa ĐÚNG trên `grounded_facts`.\n"
-                    "3) BẢO TOÀN TUYỆT ĐỐI giọng kể YouTuber gần gũi ('mình', 'anh em', 'các bạn'), các câu bình luận/phân tích (`beat_type='commentary'`), và nhịp beat ngắn dồn dập (6-15 từ) — tuyệt đối KHÔNG viết lại thành văn xuôi tóm tắt sách vở."
+                    f"Bạn là Bác Sĩ Phẫu Thuật Kịch Bản Voiceover cho persona '{persona}' ({persona_name}).\n"
+                    f"Giọng chuẩn của persona: {persona_voice}\n"
+                    "QUY TẮC TUYỆT ĐỐI:\n"
+                    "1) CHỈ trả về `<rewrite beat_id='...'>` cho những beat có thuộc tính `editable=\"true\"`. TUYỆT ĐỐI KHÔNG sửa beat `readonly=\"true\"`.\n"
+                    "2) CHỈ sửa đúng lỗi nêu trong `<fix_reason>` / danh sách lỗi (đổi cụm mở đầu bị lặp, bỏ vế lặp đuôi beat trước, bỏ tên gọi sớm trước `lộ từ ...`, khử cliché AI, hoặc cắt ngắn khi vượt budget).\n"
+                    "3) GIỮ NGUYÊN 100% sự thật từ `<grounded_facts>`, câu thoại trích dẫn trong ngoặc kép (\"...\"), giọng kể YouTuber gần gũi ('mình', 'anh em', câu hỏi tương tác) và nhịp ngắn-dài của bản gốc."
                 ),
                 user_prompt=(
                     f"Nhân vật chuẩn: {cast_names}\n"
-                    f"Các điểm nối hồi (seam): {seam_beat_ids}\n"
+                    f"Danh sách beat ĐƯỢC PHÉP SỬA (allowlist): {sorted(editable_beat_ids)}\n"
                     f"{budget_hint}\n"
-                    f"Lỗi phát hiện tự động:\n{notes_txt}\n\n"
-                    f"Kịch bản cần rà soát ({len(target_indices)} beats):\n"
+                    f"Các lỗi cần phẫu thuật:\n{notes_txt}\n\n"
+                    f"Ngữ cảnh kịch bản ({len(editable_indices)} beat editable + beat kề readonly):\n"
                     + "\n".join(payload_lines)
                 ),
                 xml_template=_SEAM_POLISH_XML_TEMPLATE,
                 parse_fn=_parse_seam_polish_xml,
             )
-            rewrite_map: dict[str, str] = {}
+
+            p_order = page_order or {}
+            reveal_checks = self._build_reveal_checks(bible, p_order)
+            id_to_idx = {b.beat_id: idx for idx, b in enumerate(beats)}
+
             for r in res.rewrites:
-                txt = r.narration_vi.strip()
-                if not txt or txt[0].islower():
+                # Strict Python allowlist: ignore any rewrite targeting a clean beat
+                if r.beat_id not in editable_beat_ids:
                     continue
-                low_txt = txt.lower()
-                if any(phrase in low_txt for phrase in _BANNED_CLICHES):
+                b_idx = id_to_idx.get(r.beat_id)
+                if b_idx is None:
                     continue
-                rewrite_map[r.beat_id] = txt
-            for b in beats:
-                if b.beat_id in rewrite_map:
-                    b.narration_vi = rewrite_map[b.beat_id]
+                b_issues = issues_by_idx.get(b_idx, [])
+                cats = {iss.category for iss in b_issues}
+                rep_phrases: set[str] = set()
+                for iss in b_issues:
+                    if iss.category == "opener_repeat":
+                        m = re.search(r"'([^']+)'", iss.message)
+                        if m:
+                            rep_phrases.add(m.group(1).lower())
+                if self._is_safe_beat_rewrite(
+                    beat_idx=b_idx,
+                    old_text=beats[b_idx].narration_vi,
+                    new_text=r.narration_vi,
+                    beats=beats,
+                    page_order=p_order,
+                    reveal_checks=reveal_checks,
+                    beat_issue_cats=cats,
+                    repeated_phrases=rep_phrases,
+                ):
+                    beats[b_idx].narration_vi = r.narration_vi.strip()
         except Exception:
             pass
         return beats
@@ -373,6 +739,7 @@ class CriticAgent:
         script_config: ScriptConfig | None = None,
         page_analyses: list[PageAnalysis] | None = None,
     ) -> tuple[RecapScript, CriticReport]:
+        job_dir.mkdir(parents=True, exist_ok=True)
         final_path = job_dir / "03b_script_final.json"
         report_path = job_dir / "03b_critic_report.json"
         if final_path.exists() and report_path.exists() and not force:
@@ -398,7 +765,6 @@ class CriticAgent:
                     dlg = f' "{pnl.dialogue_summary}"' if pnl.dialogue_summary else ""
                     panel_text_lookup[pnl.panel_id] = f"{pnl.action_summary}{dlg}".strip()
 
-        # Load real part boundaries if written by ScriptwriterAgent
         seam_indices: list[int] = []
         beat_to_allowed: dict[int, set[str]] = {}
         boundaries_path = job_dir / "repo" / "script" / "part_boundaries.json"
@@ -447,6 +813,7 @@ class CriticAgent:
             else None
         )
 
+        # Layer 1: Deterministic Gate + Repetition Scanner
         issues_eval, flagged_indices, flagged_notes = self._evaluate_issues(
             cleaned_beats,
             all_pages=all_pages,
@@ -456,44 +823,42 @@ class CriticAgent:
             bible=bible,
         )
 
-        # Step 2: Closed-Loop Showrunner Pass + Auto-Repair (up to 2 passes if errors persist)
+        # Layer 2 (Read-Only Semantic Auditor) + Layer 3 (Allowlisted Surgical Repairer, up to 2 rounds)
         if self.polish_seams and self.llm.has_text_credentials and len(cleaned_beats) >= 6:
-            has_budget_overrun = any(i.category == "budget" for i in issues_eval)
-            run_global = len(seam_indices) >= 2 or has_budget_overrun
-            cleaned_beats = self._polish_multi_part_seams(
-                cleaned_beats,
-                bible,
-                seam_indices=seam_indices,
-                flagged_indices=flagged_indices,
-                flagged_notes=flagged_notes,
-                panel_text_lookup=panel_text_lookup,
-                run_global_showrunner=run_global,
-                target_total_words=target_total_words,
-            )
-            issues_eval, flagged_indices, flagged_notes = self._evaluate_issues(
-                cleaned_beats,
-                all_pages=all_pages,
-                page_order=page_order,
-                beat_to_allowed=beat_to_allowed,
-                target_total_words=target_total_words,
-                bible=bible,
-            )
-            remaining_errors = {i.beat_id for i in issues_eval if i.severity == "error"}
-            if remaining_errors:
-                retry_indices = {
-                    idx for idx, b in enumerate(cleaned_beats) if b.beat_id in remaining_errors
-                } | flagged_indices
+            id_to_idx = {b.beat_id: i for i, b in enumerate(cleaned_beats)}
+            audit_indices, audit_notes = self._audit_semantic_repetitions(cleaned_beats, seam_indices)
+
+            beat_issues_map: dict[int, list[CriticIssue]] = {}
+            for iss in issues_eval:
+                if iss.category in _TEXT_FIXABLE_CATEGORIES and iss.beat_id in id_to_idx:
+                    beat_issues_map.setdefault(id_to_idx[iss.beat_id], []).append(iss)
+            for anote in audit_notes:
+                abid = anote.split(" ", 1)[0]
+                if abid in id_to_idx:
+                    beat_issues_map.setdefault(id_to_idx[abid], []).append(
+                        CriticIssue(beat_id=abid, severity="warning", category="semantic_repeat", message=anote)
+                    )
+            if any(iss.category == "budget" for iss in issues_eval):
+                b_iss = next(iss for iss in issues_eval if iss.category == "budget")
+                for fi in flagged_indices:
+                    beat_issues_map.setdefault(fi, []).append(b_iss)
+
+            editable_round1 = flagged_indices | audit_indices
+            if editable_round1:
                 cleaned_beats = self._polish_multi_part_seams(
                     cleaned_beats,
                     bible,
-                    seam_indices=[],
-                    flagged_indices=retry_indices,
-                    flagged_notes=[i.message for i in issues_eval if i.severity == "error"],
+                    seam_indices=seam_indices,
+                    flagged_indices=editable_round1,
+                    flagged_notes=flagged_notes + audit_notes,
                     panel_text_lookup=panel_text_lookup,
                     run_global_showrunner=False,
                     target_total_words=target_total_words,
+                    persona=script.persona,
+                    page_order=page_order,
+                    beat_issues_map=beat_issues_map,
                 )
-                issues_eval, _, _ = self._evaluate_issues(
+                issues_eval, flagged_indices, flagged_notes = self._evaluate_issues(
                     cleaned_beats,
                     all_pages=all_pages,
                     page_order=page_order,
@@ -501,6 +866,45 @@ class CriticAgent:
                     target_total_words=target_total_words,
                     bible=bible,
                 )
+
+                # Round 2: ONLY if text-fixable severity="error" remains (never waste LLM calls on structural errors)
+                remaining_text_errors = [
+                    i for i in issues_eval if i.severity == "error" and i.category in _TEXT_FIXABLE_CATEGORIES
+                ]
+                if remaining_text_errors:
+                    retry_map: dict[int, list[CriticIssue]] = {}
+                    retry_indices: set[int] = set()
+                    for iss in remaining_text_errors:
+                        if iss.beat_id in id_to_idx:
+                            bi = id_to_idx[iss.beat_id]
+                            retry_indices.add(bi)
+                            retry_map.setdefault(bi, []).append(iss)
+                        elif iss.category == "budget":
+                            for fi in flagged_indices:
+                                retry_indices.add(fi)
+                                retry_map.setdefault(fi, []).append(iss)
+                    if retry_indices:
+                        cleaned_beats = self._polish_multi_part_seams(
+                            cleaned_beats,
+                            bible,
+                            seam_indices=[],
+                            flagged_indices=retry_indices,
+                            flagged_notes=[i.message for i in remaining_text_errors],
+                            panel_text_lookup=panel_text_lookup,
+                            run_global_showrunner=False,
+                            target_total_words=target_total_words,
+                            persona=script.persona,
+                            page_order=page_order,
+                            beat_issues_map=retry_map,
+                        )
+                        issues_eval, _, _ = self._evaluate_issues(
+                            cleaned_beats,
+                            all_pages=all_pages,
+                            page_order=page_order,
+                            beat_to_allowed=beat_to_allowed,
+                            target_total_words=target_total_words,
+                            bible=bible,
+                        )
 
         # Step 3: Populate TTS pronunciation-normalized strings without mutating display subtitles
         for b in cleaned_beats:
@@ -520,7 +924,7 @@ class CriticAgent:
             passed=(err_count == 0),
             score=max(2.0, round(10.0 - 1.2 * err_count - 0.35 * warn_count, 2)),
             issues=all_issues,
-            notes="Validated hard invariants, macro rhythm distribution, Showrunner flow, and TTS pronunciation.",
+            notes="Validated hard invariants, opener/seam repetition, Read-Only Audit, allowlisted Surgical Repair, and TTS pronunciation.",
         )
         final_path.write_text(final_script.model_dump_json(indent=2), encoding="utf-8")
         report_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
