@@ -767,9 +767,52 @@ def test_water_filling_budget_and_generic_role_alias_filter() -> None:
     assert climax_mode == "spotlight"
     assert climax_words >= 340 and climax_beats >= 10
 
-    # Generic role aliases ('Sứ giả', 'Quản gia') must NOT trigger false-positive spoiler_name regexes
-    ch = CharacterProfile(canonical_name="Vesper", aliases=["Sứ giả", "Quản gia", "Chúa tể V"])
+    # Generic role aliases ('Sứ giả', 'Quản gia') & lowercase Vietnamese descriptive aliases ('con thỏ đen') must NOT trigger false-positive spoiler_name regexes
+    ch = CharacterProfile(canonical_name="Vesper", aliases=["Sứ giả", "Quản gia", "Chúa tể V", "Thỏ Đen"])
     pats = extract_distinctive_char_patterns(ch, {"vesper"})
     assert any(p.search("Vesper xuất hiện") for p in pats)
     assert any(p.search("Chúa tể V lên tiếng") for p in pats)
+    assert any(p.search("Thỏ Đen xuất hiện") for p in pats)
     assert not any(p.search("nghe đồn sứ giả và quản gia tới") for p in pats)
+    assert not any(p.search("con thỏ đen khổng lồ lao tới") for p in pats)
+
+
+def test_scriptwriter_retries_empty_xml_and_coerces_middle_outro(tmp_path: Path) -> None:
+    manifest, analyses = _make_dummy_manifest(10, panels_per_page=2)
+    llm_off = LLMClient(LLMConfig(offline_fallback=True))
+    tree, bible = PageIndexBuilder(llm_off, pages_per_scene=5).build(manifest, analyses, tmp_path / "j_empty")
+
+    llm = LLMClient(LLMConfig(api_key="dummy"))
+    part_calls = {"count": 0}
+
+    def fake_complete_json(agent_name, system_prompt, user_prompt, schema_cls, **kw):
+        return ScriptOutline(
+            title_vi="T",
+            hook_summary="H",
+            parts=[
+                OutlinePart(part_id="part_01", title="P1", scene_ids=["scene_001"]),
+                OutlinePart(part_id="part_02", title="P2", scene_ids=["scene_002"]),
+            ],
+        )
+
+    def fake_complete_xml(agent_name, system_prompt, user_prompt, xml_template, parse_fn, **kw):
+        part_calls["count"] += 1
+        if part_calls["count"] == 1:
+            return PartScriptResponse(beats=[])  # Simulate empty malformed XML on first try
+        if "part_01" in user_prompt:
+            return PartScriptResponse(
+                beats=[ScriptBeat(beat_id="b1", beat_type="outro", narration_vi="P1.", panel_ids=["ch01_p001_P1", "ch01_p005_P1"])]
+            )
+        return PartScriptResponse(
+            beats=[ScriptBeat(beat_id="b2", beat_type="outro", narration_vi="P2.", panel_ids=["ch01_p006_P1", "ch01_p010_P1"])]
+        )
+
+    llm.complete_json = fake_complete_json  # type: ignore
+    llm.complete_xml = fake_complete_xml  # type: ignore
+    script = ScriptwriterAgent(llm, ScriptConfig(fast_path_max_pages=2)).write_script(
+        bible, analyses, "phan_tich", tmp_path / "j_empty", tree=tree
+    )
+    assert part_calls["count"] >= 3  # Retried after empty beats instead of silently dropping part_01
+    assert len(script.beats) == 2
+    assert script.beats[0].beat_type == "narrative"  # middle outro coerced
+    assert script.beats[1].beat_type == "outro"      # final part outro preserved

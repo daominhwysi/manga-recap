@@ -531,9 +531,22 @@ class ScriptwriterAgent:
             part_affordance_notes.append(
                 "- Beat cuối cùng của Hồi cuối đặt `beat_type='outro'`: chốt lại ý nghĩa/nghi vấn còn bỏ ngỏ để gợi mở tập sau."
             )
+        else:
+            part_affordance_notes.append(
+                "- Đây là hồi giữa tập: CHỈ dùng `beat_type='narrative'` hoặc `'commentary'` (KHÔNG dùng `beat_type='outro'`)."
+            )
         affordance_txt = "\n".join(part_affordance_notes)
         moods_txt = ", ".join(VALID_MOODS)
         sample_panels_hint = ", ".join(allowed_panels[:8])
+        part_page_pos = {pg: i for i, pg in enumerate(part_pages)}
+        best_beats: list[ScriptBeat] = []
+
+        def _postprocess(raw_beats: list[ScriptBeat]) -> list[ScriptBeat]:
+            if part_idx < total_parts:
+                for b in raw_beats:
+                    if b.beat_type == "outro":
+                        b.beat_type = "narrative"
+            return raw_beats
 
         for turn in range(3):
             user_prompt = (
@@ -568,13 +581,36 @@ class ScriptwriterAgent:
 
             if resp.beats:
                 sanitized, fallback_count = self._sanitize_part_beats(resp.beats, allowed_panels, allowed_set)
-                if fallback_count == 0 or turn == 2:
-                    return sanitized
-                extra_nodes_text += (
-                    f"\n\n### SỬA LỖI PANEL_ID (LẦN {turn + 1}): {fallback_count} beat bị thiếu/sai mã `panel_id` hợp lệ. "
-                    f"Hãy ghi CHÍNH XÁC từng `panel_id` nằm trong phạm vi hồi (ví dụ: `{', '.join(allowed_panels[:12])}` ... `{allowed_panels[-1]}`).\n"
+                sanitized = _postprocess(sanitized)
+                if len(sanitized) > len(best_beats):
+                    best_beats = sanitized
+
+                # Detect truncated/incomplete part generation (e.g. only 1 beat on a 20-page scene)
+                last_cov_idx = max(
+                    (part_page_pos.get(_panel_to_page_id(pid), -1) for b in sanitized for pid in b.panel_ids),
+                    default=-1,
                 )
-                continue
+                trailing_gap = (len(part_pages) - 1 - last_cov_idx) if last_cov_idx >= 0 else len(part_pages)
+                incomplete_cov = len(part_pages) >= 8 and (
+                    len(sanitized) < 2 or trailing_gap >= max(6, len(part_pages) // 2)
+                )
+
+                if fallback_count == 0 and not incomplete_cov:
+                    return sanitized
+                if turn < 2:
+                    if fallback_count > 0:
+                        extra_nodes_text += (
+                            f"\n\n### SỬA LỖI PANEL_ID (LẦN {turn + 1}): {fallback_count} beat bị thiếu/sai mã `panel_id` hợp lệ. "
+                            f"Hãy ghi CHÍNH XÁC từng `panel_id` nằm trong phạm vi hồi (ví dụ: `{', '.join(allowed_panels[:12])}` ... `{allowed_panels[-1]}`).\n"
+                        )
+                    if incomplete_cov:
+                        cur_end_pg = part_pages[last_cov_idx] if last_cov_idx >= 0 else first_pg
+                        extra_nodes_text += (
+                            f"\n\n### SỬA LỖI THIẾU PHỦ TRANG (LẦN {turn + 1}): Phản hồi trước mới đi tới {cur_end_pg}, "
+                            f"bỏ sót {trailing_gap} trang cuối tới {last_pg}. Hãy viết ĐẦY ĐỦ các thẻ `<beat>` nối tiếp phủ trọn tới hết {last_pg} (đóng đủ `</beat>` và `</narration>`).\n"
+                        )
+                    continue
+                return best_beats or sanitized
 
             added = False
             if resp.need_nodes:
@@ -591,11 +627,32 @@ class ScriptwriterAgent:
                 if imgs:
                     extra_images = imgs
                     added = True
-            if not added:
-                sanitized, _ = self._sanitize_part_beats(resp.beats, allowed_panels, allowed_set)
-                return sanitized
+            if not added and turn < 2:
+                extra_nodes_text += (
+                    f"\n\n### LỖI ĐỊNH DẠNG XML (LẦN {turn + 1}): Phản hồi trước không chứa thẻ `<beat>` hợp lệ nào trong `<beats>`. "
+                    f"Hãy viết thẳng toàn bộ các `<beat>` cho phạm vi {first_pg}..{last_pg} đúng mẫu `<part_script><beats>...</beats></part_script>`.\n"
+                )
 
-        return []
+        # Last-resort rescue with fallback_model if primary failed to emit any valid beats
+        fb_model = getattr(self.llm.config, "fallback_model", "")
+        if not best_beats and fb_model and fb_model != self.llm.config.default_model and self.llm.has_text_credentials:
+            try:
+                fb_resp = self.llm.complete_xml(
+                    agent_name="ScriptwriterAgent",
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    xml_template=_PART_SCRIPT_XML_TEMPLATE,
+                    parse_fn=_parse_part_script_xml,
+                    image_paths=extra_images or None,
+                    model_override=fb_model,
+                )
+                if fb_resp.beats:
+                    sanitized, _ = self._sanitize_part_beats(fb_resp.beats, allowed_panels, allowed_set)
+                    best_beats = _postprocess(sanitized)
+            except Exception:
+                pass
+
+        return best_beats
 
     @staticmethod
     def _sanitize_part_beats(
@@ -738,6 +795,10 @@ class ScriptwriterAgent:
                     ScriptBeat.model_validate(b)
                     for b in json.loads(part_file.read_text(encoding="utf-8"))
                 ]
+                if idx < total_parts:
+                    for b in part_beats:
+                        if b.beat_type == "outro":
+                            b.beat_type = "narrative"
             else:
                 part_beats = self._write_part_with_lookup(
                     part=part,

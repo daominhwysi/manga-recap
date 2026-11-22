@@ -506,10 +506,10 @@ def extract_distinctive_char_patterns(
     low_c = cname.lower()
     if any(m in low_c for m in _DESCRIPTIVE_ANON_MARKERS):
         return []
-    tokens: list[str] = [cname]
+    tokens: list[tuple[str, bool]] = [(cname, True)]
     words = [w for w in re.split(r"[\s\-]+", cname) if len(w) >= 3 and w.lower() not in _GENERIC_NAME_TOKENS]
     if len(words) > 1 and all(w[0].isupper() for w in words):
-        tokens.extend(words)
+        tokens.extend((w, True) for w in words)
     for al in ch.aliases:
         al_c = al.strip()
         al_low = al_c.lower()
@@ -521,11 +521,21 @@ def extract_distinctive_char_patterns(
             and not any(m in al_low for m in _DESCRIPTIVE_ANON_MARKERS)
             and not all(w in _GENERIC_NAME_TOKENS for w in al_words)
         ):
-            tokens.append(al_c)
-    return [
-        re.compile(rf"(?<!\w){re.escape(tok)}(?!\w)", flags=re.IGNORECASE | re.UNICODE)
-        for tok in dict.fromkeys(tokens)
-    ]
+            has_vi_diacritic = any(ord(ch_c) > 127 for ch_c in al_c)
+            has_initial_token = any(len(w) == 1 for w in re.split(r"[\s\-]+", al_c) if w)
+            # Multi-word Vietnamese descriptive aliases (without proper initials) must match exact case
+            case_insensitive = not (has_vi_diacritic and len(al_words) >= 2 and not has_initial_token)
+            tokens.append((al_c, case_insensitive))
+
+    out_pats: list[re.Pattern[str]] = []
+    seen_toks: set[tuple[str, int]] = set()
+    for tok, ci in tokens:
+        flags = (re.IGNORECASE | re.UNICODE) if ci else re.UNICODE
+        if (tok, flags) in seen_toks:
+            continue
+        seen_toks.add((tok, flags))
+        out_pats.append(re.compile(rf"(?<!\w){re.escape(tok)}(?!\w)", flags=flags))
+    return out_pats
 
 
 def _compute_character_reveal_pages(page_analyses: list[PageAnalysis], bible: StoryBible) -> None:
