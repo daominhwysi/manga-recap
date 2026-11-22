@@ -1,0 +1,97 @@
+# ==============================================================================
+# Manga Recap Generator - Cấu hình toàn bộ hệ thống
+# ==============================================================================
+
+project:
+  name: manga_recap_generator
+  jobs_dir: jobs
+  downloads_dir: downloads
+  default_language: vi                  # vi | en
+  default_persona: kich_tinh            # kich_tinh | hai_huoc | phan_tich (xem configs/personas.yaml)
+
+llm:
+  provider: aixingialaire               # Provider cho text LLM qua unified-llm-proxy (hỗ trợ gpt-6-luna, gpt-6.2-sol, claude-haiku-5-5, claude-sonnet-4-6)
+  vision_provider: null                 # null = auto routing trên proxy (agy -> gemini-3.8-flash-medium-vision 200 OK)
+  default_model: gpt-6-luna             # Đã benchmark: gpt-6-luna / gpt-6.2-sol / claude-haiku-5-5 / claude-sonnet-4-6 đều 200 OK qua aixingialaire
+  fallback_model: gpt-6.2-sol           # Chuyển sang GPT 6.2 Sol (văn nói tiếng Việt mượt & nhanh) nếu model chính lỗi
+  vision_model: gemini-3.8-flash-medium-vision  # Model đọc trang manga Set-of-Mark + Cast Sheet
+  temperature: 0.4
+  max_tokens: 32768                     # Thả phanh theo trần model proxy để không cắt cụt JSON
+  timeout_sec: 150
+  max_retries: 1
+  offline_fallback: true                # true: dùng fallback mẫu nếu thiếu API key
+  base_url: http://127.0.0.1:8765/v1    # unified-llm-proxy (hoặc ghi đè bằng OPENAI_BASE_URL)
+  api_key: unified-llm-proxy            # hoặc ghi đè bằng OPENAI_API_KEY trong .env
+
+cv:
+  detector: auto                        # auto | manga_yolo | manhwa_slicer
+  yolo_model_path: models/manga109_yolo/v2023.12.07_m_yv11/model.onnx
+  yolo_labels_path: models/manga109_yolo/v2023.12.07_m_yv11/labels.json
+  confidence_threshold: 0.35
+  iou_threshold: 0.45
+  reading_order: rtl                    # rtl (Manga Nhật) | ltr (Comic) | vertical (Manhwa)
+  max_pages_per_chapter: null           # null = toàn bộ trang; hoặc đặt số nguyên (vd 30)
+
+script:
+  target_duration_min: 9.0              # Thời lượng mục tiêu cho 1 tập/job (phút)
+  pages_per_scene: 20                   # Số trang gom thành 1 Scene node trong PageIndex
+  fast_path_max_pages: 30               # <= 30 trang: chạy 1-pass nhanh không cần chia hồi
+  full_context_max_tokens: 120000       # <= 120K tokens: nạp 100% text cả tập, chỉ chia output từng hồi
+  vision_batch_size: 4                  # Số trang mỗi request Vision (Chunked Rolling 3-4 trang/call)
+  vision_max_workers: 4                 # 4 luồng Chunked Parallel Rolling (+ Pre-Pass cast_sheet)
+  words_per_minute: 225                 # Khớp tốc độ đọc thực tế giọng VieNeu Ngọc Linh (~232 wpm)
+  polish_seams: false                   # false: giữ nguyên văn phong tự nhiên từ Scriptwriter (chỉ chạy Critic kiểm tra panel/gap/cliché bằng Python)
+
+tts:
+  backend: vieneu                       # vieneu (local offline) | edge_tts (cloud)
+  # --- Giọng VieNeu (25 giọng preset tiếng Việt) ---
+  # Nam Bắc : "Thiện Minh" (kể chuyện), "Adam bựa" (tự nhiên), "Hải Đăng", "Thiền Tâm Đức", "Thanh Bình", "Minh Đức", "Phạm Tuyên", "Xuân Vĩnh", "Quốc Tuấn"
+  # Nam Nam : "Thái Sơn" (kể chuyện), "Đức Trí" (đọc truyện), "Adam", "Minh Triết"
+  # Nam Trung: "Quang Sơn"
+  # Nữ Bắc  : "Trúc Ly" (tự nhiên), "Ngọc Linh" (kể chuyện), "Quỳnh Anh" (đọc truyện), "Ngọc Huyền", "Mai Anh", "Đoan Trang"
+  # Nữ Nam  : "Mỹ Duyên" (đọc truyện), "Kim Thanh" (đọc truyện), "Thục Đoan" (kể chuyện), "Thùy Dung"
+  # Nữ Trung: "Ngọc Trân"
+  vieneu_voice: Ngọc Huyền
+  # --- Giọng Edge-TTS ---
+  # Tiếng Việt: vi-VN-NamMinhNeural (Nam) | vi-VN-HoaiMyNeural (Nữ)
+  # Tiếng Anh : en-US-ChristopherNeural | en-US-AriaNeural
+  voice: vi-VN-NamMinhNeural
+  rate: "+5%"                           # Chỉ áp dụng cho edge_tts
+  sample_rate: 48000
+
+render:
+  backend: ffmpeg_opencv
+  aspect_ratio: "16:9"                  # "16:9" (1280x720 / 1920x1080) hoặc "9:16" (720x1280 / 1080x1920)
+  width: 1280
+  height: 720
+  fps: 24
+  crf: 22                               # 18 (rất nét) -> 28 (nhẹ file)
+  preset: veryfast                      # ultrafast | veryfast | fast | medium
+  audio_bitrate: 192k
+  audio_channels: 2                     # 2 = stereo AAC (tương thích mọi trình phát)
+  max_shot_duration_ms: 3500            # Thời lượng tối đa 1 khung hình trước khi chuyển/cắt
+  burn_subtitles: true                  # true: đốt phụ đề vào video; false: chỉ xuất file .srt
+  subtitle_font_ratio: 0.036
+  # --- Điều chỉnh tốc độ & biên độ camera zoom (chuẩn hóa theo thời lượng shot) ---
+  zoom_speed_per_sec: 0.055             # Mức zoom mỗi giây (0.04 = chậm êm, 0.08 = nhanh kịch tính)
+  min_zoom_delta: 0.06                  # Biên độ zoom tối thiểu cho shot ngắn
+  max_zoom_delta: 0.18                  # Biên độ zoom tối đa cho shot dài
+  face_zoom_bonus: 0.04                 # Cộng thêm độ zoom khi focus vào khuôn mặt nhân vật
+  margin_ratio: 0.06                    # Viền nền mờ xung quanh panel (0.06 = 6%)
+  bottom_safe_ratio: 0.14               # Chừa vùng an toàn dưới đáy (14%) để phụ đề không đè lên panel
+  enable_transitions: true              # Bật crossfade / flash_white / fade_black mượt giữa các cảnh
+  enable_diptych: true                  # Ghép đôi 2 panel dọc hẹp cạnh nhau cho cân khung 16:9
+  bgm_path: assets/bgm/default_dark_fantasy.wav  # Nhạc nền ambient D-minor mặc định (tự tạo nếu chưa có; hoặc trỏ tới file .mp3/.wav riêng)
+  bgm_volume: 0.14                      # Âm lượng nhạc nền khi trộn với voiceover
+  bgm_ducking: true                     # Tự động nén nhỏ BGM khi giọng đọc vang lên (sidechain)
+
+exporters:
+  enabled:
+    - srt
+    - capcut_draft
+    - html_preview
+
+downloader:
+  nyaa_base_url: https://nyaa.si
+  timeout_sec: 600
+  seed_after_download: false
