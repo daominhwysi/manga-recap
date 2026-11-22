@@ -4,7 +4,6 @@ from src.agents.choreographer import ChoreographerAgent
 from src.agents.critic import CriticAgent
 from src.agents.page_analyzer import PageAnalyzerAgent
 from src.agents.page_index import PageIndexBuilder, PageIndexTree
-from src.agents.product_evaluator import ProductEvaluatorAgent
 from src.agents.scriptwriter import ScriptwriterAgent
 
 __all__ = [
@@ -13,6 +12,5 @@ __all__ = [
     "PageAnalyzerAgent",
     "PageIndexBuilder",
     "PageIndexTree",
-    "ProductEvaluatorAgent",
     "ScriptwriterAgent",
 ]

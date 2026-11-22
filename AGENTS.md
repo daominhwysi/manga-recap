@@ -76,7 +76,7 @@ manga_recap_generator/
 ├── assets/bgm/default_dark_fantasy.wav # Nhạc nền D-minor stereo tự tổng hợp (loop không bản quyền)
 ├── models/manga109_yolo/            # Model ONNX YOLOv11 nhận diện frame, face, body, text
 ├── src/
-│   ├── cli.py                       # Typer CLI (`run`, `download`, `inspect`, `evaluate`)
+│   ├── cli.py                       # Typer CLI (`run`, `download`, `inspect`)
 │   ├── config.py                    # Pydantic schemas AppConfig; nạp config.yaml + ghi đè từ .env (`default_model=gpt-6.2-sol`)
 │   ├── pipeline.py                  # Bộ điều phối 6 Stage (MangaRecapPipeline) kèm checkpointing, `--prev-job` & telemetry
 │   ├── core/
@@ -98,9 +98,8 @@ manga_recap_generator/
 │   │   ├── page_analyzer.py         # Stage 1.5 & 2a (XML): Pre-Pass cast sheet UTF-8; đóng dấu Visual Verify Code (RAM) chống rơi ảnh/lệch trang; khử spread trùng CV; Adaptive Batching; `verbatim_quote_vi` & `visual_punch`
 │   │   ├── page_index.py            # Stage 2b (Summarizer XML): Chuẩn hóa bí danh (`scoped_map`); tính `first_named_page_id` chống spoil tên; lọc spread 2 chiều; Semantic Scene Segmentation; StoryBible (`pronunciation_map` mặc định trống); `scoped_outline_view` O(N)
 │   │   ├── scriptwriter.py          # Stage 3a (XML): Phân hoạch `1 Scene = 1 Part`, O(N) Scoped Memory + cầu nối 2 trang, chuẩn hóa + retry khi lệch `panel_id`, cấm gọi tên nhân vật trước `first_named_page_id`
-│   │   ├── critic.py                # Stage 3b (Showrunner XML): Closed-Loop Critic (chốt chặn `spoiler_name`, ngân sách từ, nhịp toàn tập), Auto-Repair khóa cứng `panel_ids` & giữ nguyên văn bản TTS gốc (trừ glossary thủ công)
-│   │   ├── choreographer.py         # Stage 5: Đạo diễn hình ảnh — word-timestamp sync, tách 2 nhịp sub-shot (`Wide -> Focus Face`), LTR/RTL & 9:16 vertical, đồng bộ 7 `mood`
-│   │   └── product_evaluator.py     # Stage 7 (`evaluate`): Đánh giá Kịch bản + Hình ảnh tổng thể, dựng `07_visual_contact_sheet.jpg` & xuất `07_EVAL_REPORT.md` cho coding agent
+│   │   ├── critic.py                # Stage 3b: Closed-Loop Critic (chốt chặn `spoiler_name`, ngân sách từ, nhịp toàn tập), Auto-Repair khóa cứng `panel_ids` & giữ nguyên văn bản TTS gốc (trừ glossary thủ công)
+│   │   └── choreographer.py         # Stage 5: Đạo diễn hình ảnh — word-timestamp sync, tách 2 nhịp sub-shot (`Wide -> Focus Face`), LTR/RTL & 9:16 vertical, đồng bộ 7 `mood`
 │   ├── audio/
 │   │   ├── registry.py / base.py    # TTS_REGISTRY, `apply_pronunciation_glossary`, `beat_cache_key` (gồm `rate`), anti-aliased Fourier resampling & word timestamp alignment
 │   │   ├── edge_tts_backend.py      # Microsoft Edge TTS tiếng Việt kèm `WordBoundary` timestamps & tổng hợp song song
@@ -121,7 +120,6 @@ manga_recap_generator/
 - **Stage 2b**: `repo/notes/scene_*.md` (ghi chú Markdown từng scene kèm tỷ lệ `ar` và cờ `face+text`), `repo/tree_index.json` (`PageIndexTree` + `skipped_pages`), `02b_story_bible.json` (`StoryBible`), `repo/MEMORY.md`.
 - **Stage 3a & 3b**: `repo/OUTLINE.json` (`1 Scene = 1 Part`), `repo/script/parts/part_*.json`, `repo/script/part_boundaries.json`, `03a_script_draft.json`, `03b_script_final.json`, `03b_critic_report.json`.
 - **Stage 4, 5 & 6**: `audio/beats/*.wav`, `04_voiceover.wav`, `04_audio_manifest.json`, `05_timeline.json` (`VideoTimeline`), `06_subtitles.srt`, `06_output.mp4`, `exports/`, `telemetry.json`.
-- **Stage 7 (Holistic Eval)**: `07_visual_contact_sheet.jpg`, `07_eval_report.json`, `07_EVAL_REPORT.md` (tạo bởi `uv run manga-recap evaluate jobs/<job_id>`).
 
 ---
 

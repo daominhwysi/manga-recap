@@ -540,29 +540,16 @@ def test_full_alias_resolution_compact_md_and_closed_loop_critic(tmp_path: Path)
     assert "A thơ" in final_s.beats[2].tts_text
 
 
-def test_critic_round2_budget_targets_longest_beats_and_product_evaluator(tmp_path: Path) -> None:
-    import cv2
-    import numpy as np
-    from src.agents.product_evaluator import ProductEvaluatorAgent
+def test_critic_round2_budget_targets_longest_beats(tmp_path: Path) -> None:
     from src.config import ScriptConfig
 
     manifest, analyses = _make_dummy_manifest(8, panels_per_page=2)
     analyses[-1].page_summary = "Translator's Notes 1"
-    for pg in manifest.chapters[0].pages:
-        for pnl in pg.panels:
-            p_img = tmp_path / f"{pnl.panel_id}.jpg"
-            cv2.imwrite(str(p_img), np.full((180, 140, 3), 160, dtype=np.uint8))
-            pnl.crop_path = str(p_img)
-            pnl.width, pnl.height = 140, 180
-
-    analyses[0].verbatim_quote_vi = "Bằng mọi giá phải mở cánh cửa này!"
-    analyses[0].visual_punch = "Bàn tay nắm chặt tay nắm đồng"
-
     job_dir = tmp_path / "j_eval"
     llm_off = LLMClient(LLMConfig(offline_fallback=True))
-    tree, bible = PageIndexBuilder(llm_off, pages_per_scene=10).build(manifest, analyses, job_dir)
+    _, bible = PageIndexBuilder(llm_off, pages_per_scene=10).build(manifest, analyses, job_dir)
 
-    # 1) Critic Round-2 budget overrun must flag longest beats and trim them when Showrunner runs
+    # Critic Round-2 budget overrun must flag longest beats and trim them when Showrunner runs
     distinct_roots = [
         "Nhân vật mở cánh cửa gỗ cũ bước vào sảnh lớn tối om.",
         "Ánh đèn hắt lên chiếc đồng hồ quả quýt đặt trên bệ đá.",
@@ -625,23 +612,6 @@ def test_critic_round2_budget_targets_longest_beats_and_product_evaluator(tmp_pa
     assert rep.passed is True
     assert len(captured_flagged) == 1
     assert sum(len(b.narration_vi.split()) for b in final_s.beats) < 400
-
-    # 2) ProductEvaluatorAgent produces JSON + MD + Contact Sheet + ActionableCodeFinding
-    (job_dir / "01_manifest.json").write_text(manifest.model_dump_json(), encoding="utf-8")
-    (job_dir / "02a_all_pages.json").write_text(
-        json.dumps([a.model_dump() for a in analyses]), encoding="utf-8"
-    )
-    # Inject a skipped backmatter panel to test leak detection + actionable code pointer
-    leaked_script = final_s.model_copy(deep=True)
-    leaked_script.beats[-1].panel_ids = ["ch01_p008_P1"]
-    (job_dir / "03b_script_final.json").write_text(leaked_script.model_dump_json(), encoding="utf-8")
-
-    ev = ProductEvaluatorAgent(llm=None, script_config=sc_cfg).evaluate(job_dir, use_llm=False)
-    assert (job_dir / "07_eval_report.json").exists()
-    assert (job_dir / "07_EVAL_REPORT.md").exists()
-    assert (job_dir / "07_visual_contact_sheet.jpg").exists()
-    assert "ch01_p008_P1" in ev.visual_metrics.leaked_skipped_panels
-    assert any(f.category == "front_backmatter_leak" for f in ev.findings)
 
 
 def test_xml_parser_verify_code_reveal_spoiler_and_sanitize_retry(tmp_path: Path) -> None:
