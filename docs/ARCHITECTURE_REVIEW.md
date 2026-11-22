@@ -9,11 +9,12 @@
 
 1. [Đánh Giá Tổng Quan Kiến Trúc Hiện Tại (Điểm Mạnh vs. Trần Giới Hạn)](#1-đánh-giá-tổng-quan-kiến-trúc-hiện-tại)
 2. [Mổ Xẻ 3 Kịch Bản YouTube Thực Tế & Khoảng Cách Với Kịch Bản Hiện Tại](#2-mổ-xẻ-3-kịch-bản-youtube-thực-tế--khoảng-cách-với-kịch-bản-hiện-tại)
-3. [15 Lỗ Hổng Kiến Trúc, Bug Ẩn & Điểm Nghẽn Thực Tế (Kèm Bằng Chứng Code)](#3-15-lỗ-hổng-kiến-trúc-bug-ẩn--điểm-nghẽn-thực-tế)
+3. [17 Lỗ Hổng Kiến Trúc, Bug Ẩn & Điểm Nghẽn Thực Tế (Kèm Bằng Chứng Code)](#3-17-lỗ-hổng-kiến-trúc-bug-ẩn--điểm-nghẽn-thực-tế)
 4. [Những Thứ Nên LOẠI BỎ (Dead Code, Config Chết & Độ Phức Tạp Thừa)](#4-những-thứ-nên-loại-bỏ)
 5. [Những Thứ Nên THÊM MỚI & NÂNG CẤP (Kiến Trúc V2 Đề Xuất)](#5-những-thứ-nên-thêm-mới--nâng-cấp)
 6. [7 Câu Hỏi Phản Biện Chiến Lược & Câu Trả Lời](#6-7-câu-hỏi-phản-biện-chiến-lược--câu-trả-lời)
 7. [Lộ Trình Đề Xuất Theo Mức Ưu Tiên (P0 / P1 / P2) Để Bạn Phê Duyệt](#7-lộ-trình-đề-xuất-theo-mức-ưu-tiên)
+8. [Phân Tích Token Cho N Trang, Chiến Lược Tối Ưu & Đánh Giá Tác Động Chất Lượng](#8-phân-tích-token-cho-n-trang-chiến-lược-tối-ưu--đánh-giá-tác-động-chất-lượng)
 
 ---
 
@@ -53,9 +54,9 @@ Nhìn từ dữ liệu chạy thật của `jobs/pandora_hearts_vol1`:
 
 ---
 
-## 3. 15 Lỗ Hổng Kiến Trúc, Bug Ẩn & Điểm Nghẽn Thực Tế
+## 3. 17 Lỗ Hổng Kiến Trúc, Bug Ẩn & Điểm Nghẽn Thực Tế
 
-Dưới đây là 15 vấn đề **được xác minh trực tiếp từ mã nguồn và file thực nghiệm**, xếp theo mức độ ảnh hưởng:
+Dưới đây là 17 vấn đề **được xác minh trực tiếp từ mã nguồn và file thực nghiệm**, xếp theo mức độ ảnh hưởng:
 
 ### Nhóm A — Lỗi Kiến Trúc & Logic Ảnh Hưởng Trực Tiếp Chất Lượng Video (Critical / High)
 
@@ -146,6 +147,21 @@ Dưới đây là 15 vấn đề **được xác minh trực tiếp từ mã ngu
 - [capcut_draft.py](file:///home/daominhwysi/project/manga_recap_generator/src/exporters/capcut_draft.py#L26-L79): Bỏ sót `secondary_panel_path` (mất toàn bộ diptych!), bỏ sót track BGM, bỏ sót track phụ đề và bỏ sót hiệu ứng zoom/pan.
 - [preview_html.py](file:///home/daominhwysi/project/manga_recap_generator/src/render/preview_html.py#L11-L41): Chỉ in bảng chữ thuần, **không có ảnh thumbnail `<img src=...>`** của từng panel và **không có thanh phát `<audio>`** để duyệt nhanh kịch bản trước khi render MP4.
 
+#### 16. Bug Cắt Cụt `md_body[:24000]` Làm Mất 2–3 Trang Cuối Của 8/9 Scenes Khi Lập Mục Lục
+- **Bằng chứng**:
+  - [page_index.py](file:///home/daominhwysi/project/manga_recap_generator/src/agents/page_index.py#L574): `PageIndexSceneSummarizer` cắt cứng `md_body[:24000]`.
+  - Đo thực tế trên `jobs/pandora_hearts_vol1/repo/notes/`: `scene_001.md..scene_008.md` dài từ **`24,356` đến `28,664` ký tự** (trung bình `24,815` ký tự/scene) $\Rightarrow$ **8/9 scenes bị cắt mất `356 – 4,664` ký tự (tương đương 2–3 trang cuối mỗi scene)** khi sinh `Tree Index` (cả 8 lời gọi đầu trong [telemetry.json](file:///home/daominhwysi/project/manga_recap_generator/jobs/pandora_hearts_vol1/telemetry.json#L90-L152) đều dừng ở đúng `6,232` prompt tokens).
+- **Hệ quả thực tế**: `OutlinePlannerAgent` thấy hụt dữ liệu ở cuối mỗi scene (`OUTLINE.json` ghi *"giữ khoảng trống dữ liệu"* / *"không vượt qua phần dữ liệu bị thiếu"*).
+
+#### 17. Lãng Phí Token $O(N^2)$ Ở Stage 3a & Đọc Thừa Trang Trùng Ở Stage 2a
+- **Bằng chứng**:
+  - [telemetry.json](file:///home/daominhwysi/project/manga_recap_generator/jobs/pandora_hearts_vol1/telemetry.json#L178-L248): `ScriptwriterAgent` tiêu tốn **`213,542 / 306,216` tokens (`69.7%` tổng text tokens Stage 2b+3a)** với `182,576` prompt tokens cho 9 Parts.
+  - Nguyên nhân tại [scriptwriter.py](file:///home/daominhwysi/project/manga_recap_generator/src/agents/scriptwriter.py#L212-L236):
+    1. `OutlinePlannerAgent` gắn `required_callbacks: ["scene_k-1"]` cho `part_02..part_09`, làm `callback_texts` nhồi lại **nguyên văn markdown chi tiết từng panel (~7,090 tok)** của scene trước vào mỗi Part (`part_01`: `14,865` tok $\rightarrow$ `part_02..08`: `20,862 – 21,953` tok), dù Part đó bị cấm bốc `panel_id` từ callback.
+    2. `tree.compact_outline_view()` (`~4,316` tok ở 192 trang, tăng tuyến tính theo $N$) và toàn bộ `MEMORY.md` (`~2,927` tok) bị gửi lặp lại trong mọi Part $\Rightarrow$ chi phí tăng bậc hai **$O(N^2)$** khi chạy bộ dài 500–1,000 trang.
+    3. `completion_tokens` của `ScriptwriterAgent` lên tới **`30,966` tokens** chỉ để viết `2,695` từ tiếng Việt (do hidden reasoning tokens + gọi `PageIndexSceneSummarizer` 9 lần rời mất `67,135` tok).
+  - Tại [page_index.py](file:///home/daominhwysi/project/manga_recap_generator/src/agents/page_index.py#L496), `_detect_duplicate_spread_pages` chỉ chạy ở Stage 2b, khiến các trang đơn cắt trùng từ trang đôi (12 trang trong `pandora_hearts_vol1`) **vẫn bị gửi lên Vision LLM ở Stage 2a** rồi mới vứt bỏ.
+
 ---
 
 ## 4. Những Thứ Nên LOẠI BỎ
@@ -168,43 +184,48 @@ Dưới đây là 15 vấn đề **được xác minh trực tiếp từ mã ngu
 
 ```mermaid
 flowchart TD
-    S1["STAGE 1 (Nâng cấp)\n- Recursive XY-Cut đọc chuẩn L-shape\n- Manhwa chạy YOLO face/text sau khi cắt\n- Trim viền trắng inset ngay tại Stage 1"] --> S2A
-    S2A["STAGE 1.5 & 2a (Nâng cấp)\n- Cast Sheet dùng Pillow hỗ trợ UTF-8 tiếng Việt\n- Hỗ trợ --prev-bible / --prev-cast liên tập"] --> S2B
-    S2B["STAGE 2b (Nâng cấp)\n- Semantic Scene Segmentation + Narrative Weight (1-5)\n- Khử Spread cả 2 chiều [Spread,P1,P2] & [P1,P2,Spread]\n- StoryBible nạp thêm seed_cast.json + tạo Pronunciation Glossary"] --> S3A
-    S3A["STAGE 3a (Nâng cấp Storytelling)\n- Chọn HookStrategy theo mở đầu truyện (in_medias_res / montage / premise)\n- Ngân sách Beat/Từ phân bổ theo Narrative Weight\n- Affordances: beat_type (hook / narrative / commentary / outro)\n- Chuẩn hóa Contract mood (7 giá trị chuẩn) + xuất thêm tts_text"] --> S3B
-    S3B["STAGE 3b (Nâng cấp Real Quality Gate)\n- Phân tách severity: error vs warning\n- Auto-Repair Loop (tối đa 1-2 vòng) sửa đúng Part bị lỗi\n- Kiểm tra ngân sách từ tổng & phương sai nhịp độ toàn tập (Macro)"] --> S4
+    S1["STAGE 1 (Nâng cấp)\n- Recursive XY-Cut đọc chuẩn L-shape\n- Manhwa chạy YOLO face/text sau khi cắt\n- Trim viền trắng inset ngay tại Stage 1\n- Khử trang đơn cắt trùng từ Spread bằng CV (0 token)"] --> S2A
+    S2A["STAGE 1.5 & 2a (Nâng cấp)\n- Cast Sheet dùng Pillow hỗ trợ UTF-8 tiếng Việt\n- Trích verbatim_quote_vi + visual_punch\n- Adaptive Batch theo số Panel (~16-18 panels/call)\n- Hỗ trợ --prev-bible / --prev-cast liên tập"] --> S2B
+    S2B["STAGE 2b (Nâng cấp)\n- Nén scene_*.md gọn 25-35% (vá lỗi cắt 24k)\n- Semantic Scene Segmentation + Narrative Weight (1-5)\n- Khử Spread cả 2 chiều [Spread,P1,P2] & [P1,P2,Spread]\n- StoryBible nạp thêm seed_cast.json + Pronunciation Glossary"] --> S3A
+    S3A["STAGE 3a (Nâng cấp Storytelling & Token)\n- Scoped Window Tree Index O(N) + Callback tóm tắt/2 trang cuối\n- Chọn HookStrategy theo mở đầu truyện (in_medias_res / montage / premise)\n- Ngân sách Beat/Từ phân bổ theo Narrative Weight\n- Affordances: beat_type (hook / narrative / commentary / outro)\n- Chuẩn hóa Contract mood (7 giá trị) + xuất tts_text"] --> S3B
+    S3B["STAGE 3b (Nâng cấp Quality Gate & Showrunner)\n- Phân tách severity: error vs warning + Auto-Repair 1-2 vòng\n- Read-Aloud Showrunner Pass (khóa cứng panel_ids, ~4k tok)\n- Kiểm tra ngân sách từ tổng & phương sai nhịp độ toàn tập (Macro)"] --> S4
     S4["STAGE 4 (Nâng cấp Audio Engine)\n- Pronunciation Normalizer (narration_vi -> tts_text)\n- Resampling chuẩn scipy/ffmpeg (bỏ np.interp)\n- Parallel TTS + Forced Alignment (Word Timestamps)"] --> S5
     S5["STAGE 5 (Nâng cấp Đạo Diễn & Sound Design)\n- Tách shot dài theo ngữ cảnh (giữ khoảnh khắc nghệ thuật/spread)\n- Khớp phụ đề & điểm cắt câu theo Word Timestamps\n- Multi-Mood BGM Cue Sheet + SFX Layer (whoosh/impact/sting)\n- Hỗ trợ chuẩn RTL/LTR + Vertical 9:16 + Word-wrap phụ đề"] --> S6
     S6["STAGE 6 (Nâng cấp Renderer & Exporters)\n- Mix Multi-BGM crossfade + SFX + Voiceover Sidechain Ducking\n- HTML Preview có ảnh panel + audio player duyệt nhanh\n- CapCut Draft đầy đủ Diptych + BGM + Subtitles"]
 ```
 
-### Tóm tắt 6 Nâng Cấp Giá Trị Nhất (ROI cao nhất)
+### Tóm tắt 7 Nâng Cấp Giá Trị Nhất (ROI cao nhất)
 
-1. **Semantic Scene Segmentation + Narrative Weighting (Stage 2b → 3a)**:
-   - Thay vì cắt cứng 20 trang/scene, dùng 1 lời gọi LLM nhẹ trên danh sách tóm tắt 1 dòng của toàn tập (chỉ ~3–4K tokens!) để gom các trang thành **Scene đúng ranh giới tự nhiên của sự kiện/hồi/địa điểm** (không khóa cứng số trang tối thiểu/tối đa, chỉ bảo toàn phân hoạch tập rời 100% và giới hạn an toàn context window) và chấm `narrative_weight` (`1` = chuyển cảnh nhẹ, `5` = đại cao trào/plot twist).
-   - Stage 3a phân bổ `target_words` và `target_beats` theo trọng số `narrative_weight` của cảnh thay vì chia đều cơ học → cảnh nhẹ lướt gọn, cao trào được phép giãn nhịp sâu sắc hơn.
-2. **Context-Driven Storytelling Affordances (Stage 3a)**:
+1. **Nâng cấp Nguyên liệu từ Stage 2a (`verbatim_quote_vi` + `visual_punch`) & Khử Spread Sớm**:
+   - Bổ sung 2 trường ngắn trong `PageAnalysis` để trích nguyên văn câu thoại đắt nhất trên trang (`verbatim_quote_vi`) và chi tiết thị giác nổi bật (`visual_punch`: nét mặt, ẩn dụ nền) làm nguyên liệu giàu cảm xúc cho biên kịch.
+   - Đưa `_detect_duplicate_spread_pages` (CV thuần, 0 token) lên chạy ngay trước Stage 2a và gom batch thích ứng theo mật độ panel (`~16–18 panels/call`) để không gửi thừa trang trùng hay làm quá tải các trang dày bóng thoại.
+2. **Semantic Scene Segmentation + Nén Notes + Trọng số Cảm xúc (Stage 2b → 3a)**:
+   - Nén cú pháp `scene_*.md` (rút gọn metadata tag & khử lặp nhãn `[Chưa rõ tên: ...]` trên cùng trang) giảm `25–35%` dung lượng text, **vá triệt để bug `md_body[:24000]` làm mất 2–3 trang cuối mỗi scene**.
+   - Thay vì cắt cứng 20 trang/scene, dùng 1 lời gọi LLM nhẹ trên danh sách tóm tắt 1 dòng của toàn tập (~3–4K tokens) để gom các trang thành **Scene đúng ranh giới tự nhiên của sự kiện/hồi/địa điểm** (bảo toàn phân hoạch tập rời 100%, không khóa dải số trang cứng) và chấm `narrative_weight` (`1` = chuyển cảnh nhẹ, `5` = đại cao trào/plot twist).
+   - Stage 3a phân bổ `target_words` và `target_beats` theo trọng số `narrative_weight` của cảnh thay vì chia đều cơ học, đồng thời gom bước tóm tắt scene và sử dụng Scoped Window Context (`O(N)` thay cho `O(N^2)`).
+3. **Context-Driven Storytelling Affordances + Read-Aloud Showrunner Pass (Stage 3a → 3b)**:
    - Cung cấp cho Outline Planner **bộ chiến lược mở đầu (`HookStrategy`)** thay vì ép 1 kiểu duy nhất:
-     - `in_medias_res`: vào thẳng truyện nếu trang đầu vốn đã có cao trào mạnh sẵn (ví dụ mở đầu giữa đại sảnh máu).
+     - `in_medias_res`: vào thẳng truyện nếu trang đầu vốn đã có cao trào mạnh sẵn (kèm 1 câu dẫn đặt câu hỏi trung tâm nếu cần).
      - `montage_tease`: trích 3–5 panel đắt giá làm Cold Open đặt câu hỏi trung tâm khi mở đầu gốc nhập cuộc chậm.
      - `world_premise`: giới thiệu ngắn luật thế giới/bối cảnh nếu truyện có hệ thống lore phức tạp.
    - Mở khóa `beat_type: Literal["hook_montage", "narrative", "commentary", "outro"]`: cho phép người kể **được quyền** lồng giải thích cơ chế, cảm nhận tâm lý, cà khịa duyên dáng hoặc kết mở ở những chỗ hợp tông truyện/persona (`kich_tinh`, `hai_huoc`, `phan_tich`), chứ **không ép KPI** mọi hồi đều phải chèn bình luận hay tuân theo khung từ cứng nhắc.
    - Chuẩn hóa **hợp đồng giao tiếp `mood`** giữa Stage 3a và Stage 5 (`Literal["calm", "warm", "comedic", "mysterious", "tense", "action", "tragic"]`) để hiệu ứng camera & âm thanh không bị lệch pha vì chuỗi tự do.
-3. **Closed-Loop Critic + Macro Distribution Critique (Stage 3b)**:
+   - **Read-Aloud Showrunner Pass**: Sau khi hoàn tất các Part và khóa cứng `panel_ids` trong Python, gửi duy nhất chuỗi `[(beat_id, section, mood, narration_vi)]` toàn tập (~2,500 chữ ≈ 4K tokens) qua 1 lượt tổng biên tập văn nói để chuốt nối mượt giữa các hồi, cắt lặp từ nối toàn tập và tối ưu nhịp tai nghe mà **0% rủi ro lệch hình**.
+4. **Closed-Loop Critic + Macro Distribution Critique (Stage 3b)**:
    - Chia rõ `severity="error"` (chỉ dùng cho **Hard Invariants**: lỗi grounding panel, lùi trang, rò rỉ biên giới Part, lặp N-gram, sai Enum `mood`, vượt quá xa ngân sách thời lượng tổng) vs `warning`.
    - Kiểm tra **triệu chứng phân phối toàn cục (Macro Critique)**: ví dụ cảnh báo nếu phương sai độ dài beat/tốc độ quá phẳng khiến cả tập bị đều tăm tắp một nhịp — **không** phạt vi mô từng beat ngắn hay dài riêng lẻ.
    - Khi có `error`, chỉ chạy lại **đúng Part bị lỗi** (1–2 vòng sửa kèm phản hồi cụ thể của Critic) thay vì bỏ qua hoặc viết lại cả tập.
-4. **Audio Pipeline Chuẩn Phòng Thu (Stage 4 → 5)**:
+5. **Audio Pipeline Chuẩn Phòng Thu (Stage 4 → 5)**:
    - **Pronunciation Glossary**: `StoryBible` tự sinh bảng phiên âm tiếng Việt cho các tên riêng/thuật ngữ nước ngoài khó đọc (hoặc có file `pronunciation.json` trong job để user chỉnh tay). Phụ đề vẫn hiện chữ gốc (`Oz Vessalius`, `Abyss`), còn TTS đọc bản đã chuẩn hóa (`tts_text`).
    - **Anti-aliased Resampling** (`scipy.signal.resample_poly` hoặc FFmpeg `aresample`) thay `np.interp`.
    - **Word-level Timestamps** (tận dụng `WordBoundary` có sẵn của Edge-TTS; với VieNeu dùng nhẹ `faster-whisper`/`stable-ts` hoặc silence-boundary alignment) để phụ đề và điểm cắt shot khớp chính xác từng câu nói.
    - **Multi-Mood BGM + SFX Cue Layer**: Chọn 3–4 track BGM theo `mood` (crossfade 2s tại điểm chuyển section) + âm thanh SFX tinh tế (`whoosh`, `impact`, `flash`, `tension_riser`, `comedy_pop`) dùng có chọn lọc tại điểm chuyển mood/impact, trộn cùng sidechain ducking.
-5. **Visual Polish & True Generalization (Stage 1, 5, 6)**:
+6. **Visual Polish & True Generalization (Stage 1, 5, 6)**:
    - **Recursive XY-Cut** cho thứ tự đọc Manga L-shape.
    - **Manhwa YOLO Post-Pass** để Manhwa có đầy đủ `face/text` focal points.
    - **Context-Aware Shot Pacing**: Với shot dài có nhiều focal points (`face` + `text`/hành động), ưu tiên tách 2 nhịp máy (*Wide → Focus Face*) để tránh đơ hình; ngược lại, cho phép giữ tĩnh/zoom cực chậm với trang đôi nghệ thuật (`spread`) hoặc beat trầm lắng (`calm`/`tragic`) thay vì cắt vụn máy móc theo mốc 3.5s.
    - **Đọc `reading_order` ở Stage 5/6** (hỗ trợ chuẩn cả LTR) và **Word-Wrap phụ đề + `aspect_ratio: 9:16`** cho Shorts/Reels/TikTok.
-6. **Human-in-the-Loop Tooling (CLI + Exporters)**:
+7. **Human-in-the-Loop Tooling (CLI + Exporters)**:
    - Bổ sung lệnh `manga-recap inspect` (hiển thị bảng telemetry, chi phí token, độ lệch budget từ, điểm Critic).
    - Nâng cấp `preview.html` thành **Storyboard Reviewer có ảnh panel + audio player + script text cạnh nhau** để duyệt chất lượng trong 30 giây trước khi tốn thời gian render MP4.
 
@@ -248,17 +269,19 @@ flowchart TD
 
 ## 7. Lộ Trình Đề Xuất Theo Mức Ưu Tiên (Chờ Phê Duyệt)
 
-### 🔴 Đợt P0 — Sửa Bug Ẩn, Dọn Dead Code & Mở Khóa Storytelling Linh Hoạt (Tác động lớn nhất)
-1. **Dọn dẹp & Fix Contract**:
+### 🔴 Đợt P0 — Sửa Bug Ẩn, Tối Ưu Token An Toàn & Mở Khóa Storytelling Linh Hoạt (Tác động lớn nhất)
+1. **Dọn dẹp, Vá Bug Cắt Cụt & Fix Contract**:
    - Chuẩn hóa `ScriptBeat.mood` thành Enum hợp đồng (`Literal["calm", "warm", "comedic", "mysterious", "tense", "action", "tragic"]`) để đồng bộ 100% giữa Stage 3a và Stage 5 (khôi phục lại `shake_impact` & `flash_white`).
    - Dọn dead code (`src/agents/story_bible.py`, tàn dư `handoff_*`, nối dây `subtitle_font_ratio`, `aspect_ratio`, `max_words_per_beat`, thêm lệnh `manga-recap inspect`).
    - Fix lỗi font tiếng Việt trên `cast_sheet.jpg` (chuyển sang Pillow UTF-8), truyền `seed_cast.json` vào `StoryBible`, fix `AliasResolver` cập nhật cả text `page_summary`/`action_summary`, và kiểm tra spread trùng cả 2 chiều `[P1, P2, Spread]`.
-2. **Semantic Scene Segmentation + Narrative Weighting (Stage 2b → 3a)**:
-   - Chia Scene theo ranh giới tự nhiên của mạch truyện kèm trọng số cao trào (1–5) thay vì cắt cứng 20 trang hay ép khung số trang cố định.
-   - Phân bổ ngân sách từ & beat tỷ lệ theo trọng số cao trào, giữ tổng thời lượng khớp mục tiêu sản phẩm (`target_duration_min`).
-3. **Mở Khóa Bộ Công Cụ Kể Chuyện Theo Ngữ Cảnh (Stage 3a & `configs/personas.yaml`)**:
+   - **Vá `md_body[:24000]` + Nén `scene_*.md` + Tối ưu Context $O(N)$**: rút gọn tag/nhãn lặp trong `scene_*.md` (~25–35%), thay `callback_texts` nguyên scene bằng 2 trang cuối + tóm tắt, dùng Scoped Window cho `Tree Index` & `MEMORY.md`, và đưa `_detect_duplicate_spread_pages` lên trước Stage 2a.
+2. **Nâng Nguyên Liệu Vision & Semantic Scene + Narrative Weighting (Stage 2a → 2b → 3a)**:
+   - Thêm `verbatim_quote_vi` + `visual_punch` ở Stage 2a (kèm Adaptive Panel Batching `~16–18 panels/call`).
+   - Chia Scene theo ranh giới tự nhiên của mạch truyện kèm trọng số cao trào (1–5) thay vì cắt cứng 20 trang hay ép khung số trang cố định; phân bổ ngân sách từ & beat tỷ lệ theo trọng số cao trào, giữ tổng thời lượng khớp mục tiêu sản phẩm (`target_duration_min`).
+3. **Mở Khóa Bộ Công Cụ Kể Chuyện Theo Ngữ Cảnh + Read-Aloud Pass (Stage 3a & `configs/personas.yaml`)**:
    - Thêm lựa chọn `HookStrategy` (`in_medias_res` / `montage_tease` / `world_premise`), `outro`, và quyền đan xen `commentary` tùy chất truyện & Persona (`kich_tinh`, `hai_huoc`, `phan_tich`) — không ép công thức cố định.
    - Khuyến khích đa dạng nhịp kể tự nhiên theo cảnh thay vì khóa đều tăm tắp.
+   - Thêm **Read-Aloud Showrunner Pass** (khóa cứng `panel_ids` trong Python, ~4K tokens chuốt văn nói liền mạch toàn tập).
 4. **Closed-Loop Critic (Stage 3b)**:
    - Tách `error` (sự thật/kỹ thuật) vs `warning` (nhịp phân phối toàn cục) và thêm cơ chế tự sửa cục bộ 1–2 vòng cho đúng Part lỗi.
 
@@ -281,3 +304,69 @@ flowchart TD
 9. **Cross-Volume Continuity & Rich Exporters**:
    - Hỗ trợ `--prev-job` / `--prev-bible` kế thừa nhân vật & thuật ngữ giữa các tập liền kề.
    - Nâng cấp `preview.html` (hiển thị ảnh panel + audio player + text cạnh nhau) và hoàn thiện `CapCutDraftExporter` (đủ diptych + BGM + phụ đề).
+
+---
+
+## 8. Phân Tích Token Cho N Trang, Chiến Lược Tối Ưu & Đánh Giá Tác Động Chất Lượng
+
+### 8.1. Số đo thực tế tại `pandora_hearts_vol1` ($N = 192$ trang thô, $168$ trang truyện, $S = 9$ scenes)
+
+Pipeline chỉ tốn token LLM ở **Stage 1.5, 2a, 2b và 3a** (Stage 1 CV, Stage 4 TTS, Stage 5 Choreographer và Stage 6 Renderer dùng **0 token**).
+
+| Stage / Agent | Số lần gọi | Prompt tokens | Completion tokens | Tổng tokens | Tỷ lệ / Trang ($N=192$) |
+|---|---:|---:|---:|---:|---:|
+| **Stage 1.5: Pre-Pass Cast** | 4 Vision + 1 Text | *~6k–18k (ước lượng)* | *~2k–3k* | **~8k–21k** | **$O(1)$ cố định** ($\le 16$ ảnh mẫu) |
+| **Stage 2a: Rolling Vision** (`batch=4`) | ~48 Vision | *~125k–305k (ước lượng)* | *~92k* | **~217k–397k** | **~1,130 – 2,070 tok/trang** *(tùy tile ảnh)* |
+| **Stage 2b: `AliasResolverAgent`** *(đo thật)* | 1 | 3,877 | 3,997 | **7,874** | 41 tok/trang |
+| **Stage 2b: `PageIndexSceneSummarizer`** *(đo thật)* | 9 | 52,857 | 14,278 | **67,135** | 350 tok/trang |
+| **Stage 2b: `StoryBibleAgent`** *(đo thật)* | 1 | 4,355 | 4,079 | **8,434** | 44 tok/trang |
+| **Stage 3a: `OutlinePlannerAgent`** *(đo thật)* | 1 | 6,880 | 2,351 | **9,231** | 48 tok/trang |
+| **Stage 3a: `ScriptwriterAgent`** *(đo thật)* | 9 | **182,576** | **30,966** | **213,542** | **1,112 tok/trang** *(69.7% Stage 2b+3a)* |
+| **Tổng Text (Stage 2b + 3a — ĐO THẬT)** | **21** | **250,545** | **55,671** | **306,216** | **~1,595 tok/trang** |
+| **TỔNG TOÀN BỘ PIPELINE (Stage 1.5 → 3a)** | **~74 calls** | — | — | **~530k – 725k** | **~2,760 – 3,770 tok/trang** |
+
+### 8.2. Công thức dự báo lượng Token cho $N$ trang bất kỳ
+
+Với số scene $S = \lceil 0.88 N / 20 \rceil$:
+- **Fast Path ($N \le 30$ trang)**: Bỏ qua `SceneSummarizer`, `OutlinePlanner`, và Multi-Part $\Rightarrow$
+  $$\text{Tokens}_{\text{fast}}(N) \approx (1,700 \text{ đến } 2,600) \cdot N$$
+- **Multi-Part PageIndex ($N > 30$ trang — Kiến trúc V1 hiện tại)**:
+  $$\text{Tokens}_{\text{V1}}(N) \approx \underbrace{15,000}_{\text{Stage 1.5 } O(1)} + \underbrace{(1,130 \sim 2,070) \cdot N}_{\text{Stage 2a Vision}} + \underbrace{1,380 \cdot N}_{\text{Stage 2b + Scriptwriter } O(N)} + \underbrace{2.1 \cdot N^2}_{\text{Gửi lặp Tree Outline } S \text{ lần}}$$
+
+| Quy mô $N$ trang | Ví dụ | Tổng Token V1 hiện tại | Sau tối ưu V2 (đã gồm tăng chất lượng) |
+|---|---|---:|---:|
+| **$N = 30$** | 1 chapter lẻ (Fast Path) | ~55k – 80k | **~40k – 60k** |
+| **$N = 100$** | ~5 chapters ngắn | ~275k – 370k | **~170k – 245k** |
+| **$N = 192$** | 1 tập manga dày (Tankōbon) | **~530k – 725k** | **~330k – 455k** |
+| **$N = 500$** | 2.5 tập (~22 scenes) | ~1.8M – 2.3M | **~850k – 1.2M** |
+| **$N = 1,000$** | 1 bộ dài (~44 scenes) | **~4.7M – 5.6M** *(bùng nổ $O(N^2)$)* | **~1.7M – 2.4M** *(tuyến tính $O(N)$)* |
+
+### 8.3. Ma trận đánh giá: Tối ưu Token có làm giảm chất lượng không?
+
+Nếu cắt token thô bạo sẽ làm mất ngữ cảnh chuyển cảnh, sót phục bút (foreshadowing) hoặc đọc mờ bóng thoại. Kiến trúc V2 phân tách các biện pháp tối ưu theo **3 nhóm rủi ro**:
+
+#### 🟢 Nhóm A — Giảm Token mà Chất lượng TĂNG hoặc GIỮ NGUYÊN 100% (0% rủi ro)
+1. **Đưa `_detect_duplicate_spread_pages` lên trước Stage 2a Vision** *(tiết kiệm ~15k–30k Vision tok)*: Loại trang đơn cắt trùng bằng CV (0 token) trước khi gọi Vision, giúp `RollingSceneState` không đọc lặp cảnh.
+2. **Nén cú pháp `scene_*.md`** *(tiết kiệm ~45k–60k Text tok)*: Rút gọn metadata (`[P1|tense|ar0.26|ft]`) và khử lặp nhãn `[Chưa rõ tên: ...]` trên cùng trang $\Rightarrow$ giảm ~25–35% dung lượng, **vá dứt điểm bug cắt cụt `md_body[:24000]`** mất 2–3 trang cuối mỗi scene.
+3. **Đưa phần tĩnh lên đầu prompt để ăn Prefix Cache + rút gọn JSON Schema hint** *(tiết kiệm ~8k–15k tok + giảm chi phí cache)*.
+
+#### 🟡 Nhóm B — Tiết kiệm lớn nhưng cần "Cơ chế bù" để 0% giảm chất lượng
+1. **Thay `callback_texts` nguyên scene (~7,090 tok/Part) bằng Cầu nối ranh giới** *(tiết kiệm ~48k tok/tập)*: Chỉ nhồi **2 trang cuối cùng của Scene trước (~600 tok)** + tóm tắt `timeline_beats` (~150 tok) thay vì toàn bộ panel-by-panel scene trước; khi cần tra cứu cảnh xa mới gọi `need_nodes` on-demand.
+2. **Scoped Window cho `compact_outline_view()` & `MEMORY.md`** *(tiết kiệm ~35k tok/tập; ~850k tok ở 1,000 trang)*: Giữ **1 dòng `summary` + `ongoing_plot_threads` toàn tập** để bảo toàn phục bút, chỉ bung chi tiết `timeline_beats` và hồ sơ nhân vật phụ cho cửa sổ 3 scenes `[k-1, k, k+1]` (+ luôn giữ tuyến nhân vật chính).
+3. **Gom batch `PageIndexSceneSummarizer` (3 scenes/call sau khi nén notes) + hạ `reasoning_effort` ở các bước tóm tắt đơn giản** *(tiết kiệm ~30k tok/tập)*: Tránh gộp cả 168 trang vào 1 call duy nhất để không bị hiệu ứng *"Lost in the Middle"*.
+
+#### 🔴 Nhóm C — Tối ưu Vision Stage 2a CÓ RỦI RO — Khóa ngưỡng an toàn bắt buộc
+1. **Độ phân giải ảnh SoM gửi Vision**: Không hạ phân giải ở trang có nhiều bóng thoại ($\ge 3$ text boxes, giữ `1280–1600px`) để tránh đọc nhầm chữ nhỏ; chỉ nén nhẹ ở trang toàn cảnh ít chữ.
+2. **Adaptive Batching theo mật độ Panel (`~16–18 panels/call`)**: Thay vì cố định `batch_size = 4` trang, trang ít khung (1–2 khung) gom 5–6 trang/call (giảm số lần gửi kèm `cast_sheet.jpg`), còn trang thoại dày đặc (6–8 khung) tự hạ xuống 2–3 trang/call để Vision không viết cộc lốc ở các trang cuối batch.
+
+### 8.4. Ma trận Đánh đổi Các Biện Pháp Tăng Chất Lượng Kịch Bản
+
+| Biện pháp nâng chất lượng | Chi phí Token thêm | Rủi ro & Biện pháp kiểm soát |
+|---|---:|---|
+| **`verbatim_quote_vi` + `visual_punch` (Stage 2a)** | +~5k tok/tập | **0% rủi ro** — trích đúng câu/chi tiết có thật trên trang. |
+| **Semantic Scene + `Narrative Weight` (Stage 2b→3a)** | ~0 tok *(thay thế bước cắt 20 trang)* | Python vẫn kiểm tra `Disjoint Sets` (không trùng, không sót trang). |
+| **Storytelling Affordances (`HookStrategy`, `commentary`, Persona)** | +~2k–4k tok | Cấm bịa sự kiện ngoài `scene_*.md`; chỉ nhận xét/giải thích từ dữ liệu đã có. |
+| **Read-Aloud Showrunner Pass (Stage 3b)** | +~9k–12k tok (1 call) | **0% rủi ro lệch hình** nhờ **khóa cứng `panel_ids` trong Python**, chỉ chuốt văn nói liền mạch & khử lặp từ nối toàn tập. |
+| **Closed-Loop Critic Auto-Repair** | 0 tok *(nếu pass)*; +~15k tok *(nếu sửa Part lỗi)* | Bắt buộc sửa dứt điểm lỗi lùi trang, lặp N-gram hoặc vượt ngân sách từ trước TTS. |
+
+> **Kết luận ròng (Net Trade-off)**: Áp dụng đồng thời bộ tối ưu **Nhóm A + B + Adaptive Panel Batching** cùng **5 biện pháp nâng chất lượng kịch bản** giúp giảm Text tokens (Stage 2b+3a) của tập 192 trang từ **`306,216` xuống còn `~165k–185k` tokens** (đã bao gồm Showrunner Pass), giảm **~15–20%** Vision tokens, phá bỏ hoàn toàn độ phức tạp $O(N^2)$ và nâng chất lượng kịch bản cao hơn rõ rệt ở mọi khâu.
