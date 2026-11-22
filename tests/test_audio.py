@@ -57,13 +57,17 @@ def test_pronunciation_cache_rate_antialias_and_dynamic_bgm(tmp_path: Path) -> N
     assert len(up) == 4800
     assert np.isfinite(up).all()
 
-    # 4) Multi-mood dynamic BGM synthesis
+    # 4) Multi-mood dynamic BGM synthesis (chord progressions, fade_black swish, + external mood clip loading)
+    custom_dir = tmp_path / "custom_bgm"
+    custom_dir.mkdir()
+    sf.write(str(custom_dir / "tense.wav"), np.ones((24000, 2), dtype=np.float32) * 0.05, 48000, subtype="PCM_16")
+
     tl = VideoTimeline(
         job_id="bgm_test",
         width=1280,
         height=720,
         fps=24,
-        total_duration_ms=2000,
+        total_duration_ms=2500,
         voiceover_path="vo.wav",
         shots=[
             TimelineShot(
@@ -72,9 +76,13 @@ def test_pronunciation_cache_rate_antialias_and_dynamic_bgm(tmp_path: Path) -> N
             ),
             TimelineShot(
                 shot_id="s2", beat_id="b2", panel_id="p2", panel_path="p2.jpg",
-                start_ms=1000, end_ms=2000, camera_move="shake_impact", transition_in="flash_white", mood="action",
+                start_ms=1000, end_ms=1800, camera_move="shake_impact", transition_in="flash_white", mood="action",
+            ),
+            TimelineShot(
+                shot_id="s3", beat_id="b3", panel_id="p3", panel_path="p3.jpg",
+                start_ms=1800, end_ms=2500, transition_in="fade_black", mood="tense",
             ),
         ],
     )
-    bgm_out = build_dynamic_timeline_bgm(tl, tmp_path / "dyn_bgm.wav")
+    bgm_out = build_dynamic_timeline_bgm(tl, tmp_path / "dyn_bgm.wav", custom_bgm_dir=custom_dir)
     assert bgm_out.exists() and bgm_out.stat().st_size > 10000

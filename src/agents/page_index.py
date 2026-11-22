@@ -455,6 +455,7 @@ def _extract_spoken_dialogue_for_reveal(pa: PageAnalysis) -> str:
 _DESCRIPTIVE_ANON_MARKERS = (
     "người ",
     "kẻ ",
+    "tên ",
     "cô gái",
     "chàng trai",
     "cậu bé",
@@ -469,6 +470,28 @@ _DESCRIPTIVE_ANON_MARKERS = (
     "vô danh",
     "đầu ",
     "hình ",
+    "sứ giả",
+    "quản gia",
+    "hầu gái",
+    "thiếu gia",
+    "tiểu thư",
+    "công tử",
+    "chủ nhân",
+    "thủ lĩnh",
+    "hộ vệ",
+    "vệ sĩ",
+    "lính ",
+    "giáo sư",
+    "bác sĩ",
+    "sát thủ",
+    "kẻ thù",
+    "ác quỷ",
+    "thực thể",
+    "quái thú",
+    "búp bê",
+    "áo choàng",
+    "mặt nạ",
+    "mũ trùm",
 )
 
 
@@ -489,11 +512,14 @@ def extract_distinctive_char_patterns(
         tokens.extend(words)
     for al in ch.aliases:
         al_c = al.strip()
+        al_low = al_c.lower()
+        al_words = [w for w in re.split(r"[\s\-]+", al_low) if w]
         if (
             len(al_c) >= 3
             and not al_c.startswith("[")
-            and al_c.lower() not in canonical_set
-            and not any(m in al_c.lower() for m in _DESCRIPTIVE_ANON_MARKERS)
+            and al_low not in canonical_set
+            and not any(m in al_low for m in _DESCRIPTIVE_ANON_MARKERS)
+            and not all(w in _GENERIC_NAME_TOKENS for w in al_words)
         ):
             tokens.append(al_c)
     return [

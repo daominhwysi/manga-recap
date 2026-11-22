@@ -81,7 +81,7 @@ render:
   enable_transitions: true              # Bật crossfade / flash_white / fade_black mượt giữa các cảnh
   enable_diptych: true                  # Ghép đôi 2 panel dọc hẹp cạnh nhau cho cân khung 16:9
   bgm_path: assets/bgm/default_dark_fantasy.wav  # Nhạc nền ambient D-minor mặc định (tự tạo nếu chưa có; hoặc trỏ tới file .mp3/.wav riêng)
-  bgm_volume: 0.14                      # Âm lượng nhạc nền khi trộn với voiceover
+  bgm_volume: 0.17                      # Âm lượng nhạc nền khi trộn với voiceover (sidechain tự nén nhỏ khi đọc)
   bgm_ducking: true                     # Tự động nén nhỏ BGM khi giọng đọc vang lên (sidechain)
 
 exporters:

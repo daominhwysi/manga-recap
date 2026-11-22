@@ -724,3 +724,52 @@ def test_xml_parser_verify_code_reveal_spoiler_and_sanitize_retry(tmp_path: Path
         set(allowed),
     )
     assert fb_bad == 1
+
+
+def test_water_filling_budget_and_generic_role_alias_filter() -> None:
+    from src.agents.page_index import extract_distinctive_char_patterns
+    from src.agents.scriptwriter import OutlinePart, _allocate_part_budgets
+    from src.schemas.analysis import CharacterProfile
+
+    class _MockScene:
+        def __init__(self, n_pages: int, nw: int) -> None:
+            self.page_ids = [f"p{i:03d}" for i in range(n_pages)]
+            self.narrative_weight = nw
+
+    # Reproduce 6 mini-scenes + one 30-page climax: water-filling must keep exact total without starving climax
+    groups = [
+        [_MockScene(2, 5)],
+        [_MockScene(16, 4)],
+        [_MockScene(20, 5)],
+        [_MockScene(9, 4)],
+        [_MockScene(9, 3)],
+        [_MockScene(30, 5)],  # biggest climax
+        [_MockScene(3, 2)],
+        [_MockScene(13, 4)],
+        [_MockScene(21, 5)],
+        [_MockScene(3, 3)],
+        [_MockScene(21, 5)],
+        [_MockScene(11, 5)],
+        [_MockScene(8, 5)],
+    ]
+    proposals = [
+        OutlinePart(
+            part_id=f"part_{i+1:02d}",
+            title=f"P{i+1}",
+            pacing_mode="spotlight" if len(g[0].page_ids) >= 20 else "steady",
+            target_words=380 if len(g[0].page_ids) >= 30 else max(45, len(g[0].page_ids) * 12),
+        )
+        for i, g in enumerate(groups)
+    ]
+    budgets = _allocate_part_budgets(groups, proposals, total_words=2025, base_wpb=34)
+    assert sum(w for _, w, _ in budgets) == 2025
+    climax_beats, climax_words, climax_mode = budgets[5]
+    assert climax_mode == "spotlight"
+    assert climax_words >= 340 and climax_beats >= 10
+
+    # Generic role aliases ('Sứ giả', 'Quản gia') must NOT trigger false-positive spoiler_name regexes
+    ch = CharacterProfile(canonical_name="Vesper", aliases=["Sứ giả", "Quản gia", "Chúa tể V"])
+    pats = extract_distinctive_char_patterns(ch, {"vesper"})
+    assert any(p.search("Vesper xuất hiện") for p in pats)
+    assert any(p.search("Chúa tể V lên tiếng") for p in pats)
+    assert not any(p.search("nghe đồn sứ giả và quản gia tới") for p in pats)

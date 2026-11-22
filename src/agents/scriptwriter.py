@@ -58,11 +58,120 @@ class OutlinePart(BaseModel):
     part_id: str
     title: str
     section: str = "rising"
+    pacing_mode: str = "steady"  # skim | steady | spotlight
     scene_ids: list[str] = Field(default_factory=list)
     required_callbacks: list[str] = Field(default_factory=list)
     target_beats: int = 10
     target_words: int = 340
     focus_notes: str = ""
+
+
+def _allocate_part_budgets(
+    scene_groups: list[list],
+    src_parts: list[OutlinePart],
+    total_words: int,
+    base_wpb: int = 34,
+) -> list[tuple[int, int, str]]:
+    """Allocate (target_beats, target_words, pacing_mode) via Semantic Blending + Water-filling + Largest Remainder."""
+    n = len(scene_groups)
+    if n == 0:
+        return []
+    if n == 1:
+        mode = src_parts[0].pacing_mode if src_parts and src_parts[0].pacing_mode in ("skim", "steady", "spotlight") else "steady"
+        b = max(2, min(18, round(total_words / max(24, base_wpb))))
+        return [(b, total_words, mode)]
+
+    pages = [max(1, sum(len(sc.page_ids) for sc in grp)) for grp in scene_groups]
+    nws = [
+        sum(getattr(sc, "narrative_weight", 3) for sc in grp) / max(1, len(grp))
+        for grp in scene_groups
+    ]
+    modes: list[str] = []
+    llm_proposals: list[int] = []
+    for idx in range(n):
+        sp = src_parts[idx] if idx < len(src_parts) else None
+        raw_mode = (sp.pacing_mode if sp else "steady").strip().lower()
+        if raw_mode not in ("skim", "steady", "spotlight"):
+            raw_mode = "spotlight" if nws[idx] >= 4.5 else ("skim" if nws[idx] <= 2.0 else "steady")
+        modes.append(raw_mode)
+        llm_proposals.append(int(sp.target_words) if sp and sp.target_words > 0 else 0)
+
+    mode_mult = {"skim": 0.72, "steady": 1.0, "spotlight": 1.38}
+    struct_weights = [
+        p * (0.55 + 0.18 * nw) * mode_mult[m]
+        for p, nw, m in zip(pages, nws, modes)
+    ]
+    sw_sum = sum(struct_weights) or 1.0
+
+    # Blend LLM's semantic proposal (65%) with structural guardrail weight (35%) when available
+    if len(src_parts) == n and sum(llm_proposals) > 0:
+        lp_sum = float(sum(llm_proposals))
+        weights = [
+            0.65 * (lp / lp_sum) + 0.35 * (sw / sw_sum)
+            for lp, sw in zip(llm_proposals, struct_weights)
+        ]
+    else:
+        weights = struct_weights
+
+    # Dynamic floors (part_01 gets slightly higher floor for Cold Open Hook) and single-part cap
+    floors = [
+        min(65, max(45, pages[0] * 20)) if i == 0 else min(55, max(35, pages[i] * 16))
+        for i in range(n)
+    ]
+    max_part_words = max(240, int(round(total_words * 0.34)))
+    ceilings = [max(floors[i] + 20, max_part_words) for i in range(n)]
+
+    if sum(floors) >= total_words:
+        f_sum = sum(floors) or 1
+        words_raw = [total_words * (f / f_sum) for f in floors]
+    else:
+        words_raw = [0.0] * n
+        locked = [False] * n
+        rem = float(total_words)
+        while True:
+            free = [i for i in range(n) if not locked[i]]
+            if not free:
+                break
+            w_sum = sum(weights[i] for i in free) or 1.0
+            newly_locked = False
+            for i in free:
+                share = rem * (weights[i] / w_sum)
+                if share < floors[i]:
+                    words_raw[i] = float(floors[i])
+                    rem -= words_raw[i]
+                    locked[i] = True
+                    newly_locked = True
+                elif share > ceilings[i]:
+                    words_raw[i] = float(ceilings[i])
+                    rem -= words_raw[i]
+                    locked[i] = True
+                    newly_locked = True
+            if not newly_locked:
+                for i in free:
+                    words_raw[i] = rem * (weights[i] / w_sum)
+                break
+
+    # Largest remainder integer rounding so sum(words_list) == total_words strictly
+    words_list = [int(x) for x in words_raw]
+    diff = total_words - sum(words_list)
+    if diff != 0:
+        order = sorted(
+            range(n),
+            key=lambda i: words_raw[i] - words_list[i],
+            reverse=(diff > 0),
+        )
+        for k in range(abs(diff)):
+            idx = order[k % n]
+            words_list[idx] += 1 if diff > 0 else -1
+
+    budgets: list[tuple[int, int, str]] = []
+    for p, m, w in zip(pages, modes, words_list):
+        wpb = max(24, base_wpb - 6) if m == "spotlight" else (base_wpb + 2 if m == "skim" else base_wpb)
+        min_b = 1 if w < 45 else 2
+        max_b = max(4, min(16, max(p, round(w / 22))))
+        beats = max(min_b, min(max_b, round(w / wpb)))
+        budgets.append((beats, w, m))
+    return budgets
 
 
 class ScriptOutline(BaseModel):
@@ -203,64 +312,49 @@ class ScriptwriterAgent:
             scene_groups[-2].extend(scene_groups.pop())
         num_parts = max(1, len(scene_groups))
 
-        # Allocate beats & words by narrative_weight * pages so climaxes breathe and setup stays brisk
-        raw_weights: list[float] = []
-        for grp in scene_groups:
-            grp_pages = max(1, sum(len(sc.page_ids) for sc in grp))
-            avg_nw = sum(getattr(sc, "narrative_weight", 3) for sc in grp) / max(1, len(grp))
-            raw_weights.append(grp_pages * (0.68 + 0.13 * avg_nw))
-        weight_sum = sum(raw_weights) or 1.0
-
-        part_budgets: list[tuple[int, int]] = []
-        if len(scene_groups) == 1:
-            part_budgets.append((total_target_beats, total_words))
-        else:
-            words_list = [max(110, round(total_words * (w / weight_sum))) for w in raw_weights]
-            # Normalize exact total sum so overall duration matches config.yaml target
-            diff_w = total_words - sum(words_list)
-            if diff_w != 0:
-                best_i = max(range(len(raw_weights)), key=lambda i: raw_weights[i])
-                words_list[best_i] = max(110, words_list[best_i] + diff_w)
-            beats_list = [
-                max(3, min(14, round(w_cnt / avg_words_per_beat)))
-                for w_cnt in words_list
-            ]
-            part_budgets = list(zip(beats_list, words_list))
-
         user_prompt = (
             f"Persona: {persona}\n"
-            f"Mục tiêu tổng thời lượng video: ~{self.cfg.target_duration_min:.1f} phút "
+            f"Mục tiêu tổng thời lượng video tham chiếu: ~{self.cfg.target_duration_min:.1f} phút "
             f"(~{total_words} từ tiếng Việt với tốc độ {self.cfg.words_per_minute} wpm, chia thành {num_parts} hồi nối tiếp KHÔNG chồng lặp scene).\n\n"
             f"{memory_md}\n\n"
             f"{tree.compact_outline_view()}\n\n"
-            "QUY TẮC LẬP DÀN Ý & CHỌN HOOK BẮT BUỘC:\n"
-            "1) Chọn `hook_strategy` phù hợp nhất với mở đầu tập truyện:\n"
-            "   - 'in_medias_res': vào thẳng truyện nếu cảnh mở đầu đã kịch tính sẵn.\n"
-            "   - 'world_premise': giải thích ngắn bối cảnh/luật thế giới trước khi vào cảnh đầu.\n"
-            "   - 'montage_tease': dựng 1 câu hỏi trung tâm khơi tò mò từ 3-4 khung đắt giá trước khi quay lại từ đầu.\n"
-            "2) Phân bổ TOÀN BỘ các scene từ đầu đến cuối tập vào `parts` theo đúng danh sách gợi ý, KHÔNG chồng lặp scene.\n"
-            "3) `required_callbacks` CHỈ chứa tối đa 1-2 `scene_id` xa thực sự cần đối chiếu (KHÔNG cần thêm scene ngay liền trước vì hệ thống tự cấp cầu nối 2 trang cuối).\n"
-            "4) Ghi rõ `focus_notes` điểm bắt đầu và điểm kết thúc của scene để giữ mạch truyện mượt.\n"
+            "QUY TẮC LẬP DÀN Ý NGỮ NGHĨA & CHỌN HOOK BẮT BUỘC:\n"
+            "1) Chọn `hook_strategy` phù hợp nhất với mở đầu tập truyện (`in_medias_res` / `world_premise` / `montage_tease`) và viết `hook_summary` thật cuốn theo giọng kể chuyện gần gũi.\n"
+            "2) Phân bổ TOÀN BỘ các scene từ đầu đến cuối tập vào `parts` theo đúng danh sách scene gợi ý, KHÔNG chồng lặp scene.\n"
+            "3) Với mỗi Part, tự đánh giá ĐỘ NẶNG NỘI DUNG / THOẠI / TWIST (không phải số trang thuần!) để chọn `pacing_mode`:\n"
+            "   - 'skim': cảnh chuyển tiếp/rượt đuổi ít thoại -> lướt nhanh gọn.\n"
+            "   - 'steady': diễn biến chuẩn.\n"
+            "   - 'spotlight': cao trào, đối thoại lắt léo, plot twist hoặc cảnh cần phân tích sâu -> ưu tiên thêm ngân sách từ để phân tích & trích thoại.\n"
+            "   Và đề xuất `target_words` hợp lý sao cho tổng cả tập xấp xỉ ~"
+            f"{total_words} từ (nhưng ưu tiên độ sâu cho các hồi `spotlight`).\n"
+            "4) `required_callbacks` CHỈ chứa tối đa 1-2 `scene_id` xa thực sự cần đối chiếu (KHÔNG cần thêm scene ngay liền trước).\n"
+            "5) Ghi rõ `focus_notes`: điểm bắt đầu, trọng tâm phân tích/cảm xúc và điểm dừng của hồi.\n"
             "Hãy lập ScriptOutline dạng JSON: title_vi, hook_strategy, hook_summary, và `parts` "
-            "(part_id='part_01'.., title, section='hook/setup/rising/climax/cliffhanger', "
+            "(part_id='part_01'.., title, section='hook/setup/rising/climax/cliffhanger', pacing_mode='skim/steady/spotlight', "
             "scene_ids, required_callbacks, target_beats, target_words, focus_notes)."
         )
         outline = self.llm.complete_json(
             agent_name="OutlinePlannerAgent",
             system_prompt=(
-                "Bạn là đạo diễn biên kịch YouTube review manga. Hãy phân bổ toàn bộ các scene từ đầu đến cuối tập "
-                "thành mạch truyện liền lạc theo đúng thứ tự thời gian, chọn chiến lược mở đầu (hook_strategy) phù hợp tác phẩm."
+                "Bạn là đạo diễn biên kịch YouTube review & phân tích manga. Hãy phân bổ toàn bộ các scene từ đầu đến cuối tập "
+                "thành mạch truyện liền lạc theo đúng thứ tự thời gian, quyết định hồi nào cần lướt nhanh (`skim`) và hồi nào cần phanh lại phân tích sâu (`spotlight`)."
             ),
             user_prompt=user_prompt,
             schema_cls=ScriptOutline,
         )
 
-        # Normalize parts deterministically to disjoint scene_groups & narrative-weighted budgets
+        # Blend LLM semantic word/mode proposals with water-filling guardrails (no single-scene starvation)
+        part_budgets = _allocate_part_budgets(
+            scene_groups=scene_groups,
+            src_parts=outline.parts,
+            total_words=total_words,
+            base_wpb=min(35, avg_words_per_beat),
+        )
         valid_scene_ids = {sc.node_id for sc in tree.scenes}
         normalized_parts: list[OutlinePart] = []
         for idx, grp in enumerate(scene_groups):
             grp_sids = [sc.node_id for sc in grp]
-            t_beats, t_words = part_budgets[idx]
+            t_beats, t_words, p_mode = part_budgets[idx]
             src_part = outline.parts[idx] if idx < len(outline.parts) else None
             avg_nw = sum(getattr(sc, "narrative_weight", 3) for sc in grp) / max(1, len(grp))
             if idx == 0:
@@ -287,6 +381,7 @@ class ScriptwriterAgent:
                         part_id=f"part_{idx + 1:02d}",
                         title=src_part.title or grp[0].title,
                         section=chosen_sec,
+                        pacing_mode=p_mode,
                         scene_ids=grp_sids,
                         required_callbacks=cb_clean,
                         target_beats=t_beats,
@@ -300,6 +395,7 @@ class ScriptwriterAgent:
                         part_id=f"part_{idx + 1:02d}",
                         title=grp[0].title,
                         section=default_sec,
+                        pacing_mode=p_mode,
                         scene_ids=grp_sids,
                         target_beats=t_beats,
                         target_words=t_words,
@@ -322,6 +418,7 @@ class ScriptwriterAgent:
         panel_images: dict[str, Path],
         prev_scene_id: str | None = None,
         hook_strategy: str = "in_medias_res",
+        hook_summary: str = "",
     ) -> list[ScriptBeat]:
         tail_txt = (
             json.dumps(
@@ -388,7 +485,8 @@ class ScriptwriterAgent:
 
         extra_nodes_text = ""
         extra_images: list[Path] = []
-        max_words = max(130, int(round(part.target_words * 1.12)))
+        min_words = max(30, int(round(part.target_words * 0.78)))
+        max_words = max(85, int(round(part.target_words * 1.25)))
 
         part_pages: list[str] = []
         for sid in part.scene_ids:
@@ -416,25 +514,22 @@ class ScriptwriterAgent:
             else ""
         )
 
-        n_buckets = max(1, part.target_beats)
-        pacing_lines: list[str] = []
-        for k in range(n_buckets):
-            lo = int(k * len(part_pages) / n_buckets)
-            hi = max(lo + 1, int((k + 1) * len(part_pages) / n_buckets))
-            sub = part_pages[lo:hi]
-            if sub:
-                span = sub[0] if len(sub) == 1 else f"{sub[0]} .. {sub[-1]}"
-                pacing_lines.append(f"- Beat {k + 1}: khoảng trang {span}")
-        pacing_guide = "\n".join(pacing_lines)
+        pacing_mode = getattr(part, "pacing_mode", "steady") or "steady"
+        pacing_mode_desc = {
+            "skim": "LƯỚT NHANH (`skim`): gom gọn các khung di chuyển/ít thông tin, chỉ giữ đúng móc nhân-quả chính.",
+            "steady": "NHỊP CHUẨN (`steady`): cân bằng giữa kể diễn biến, trích thoại đắt và bình luận ngắn.",
+            "spotlight": "TRỌNG TÂM PHÂN TÍCH (`spotlight`): ưu tiên mổ xẻ tâm lý, luật thế giới, tách beat ngắn gắt cho twist và xen nhận định gần gũi với người xem.",
+        }.get(pacing_mode, "NHỊP CHUẨN")
 
         part_affordance_notes: list[str] = []
         if part_idx == 1:
+            hook_line = f" Ý tưởng hook: {hook_summary}" if hook_summary else ""
             part_affordance_notes.append(
-                f"- Chiến lược mở đầu gợi ý (`hook_strategy={hook_strategy}`): đặt 1 câu mở thật cuốn neo đúng vào cảnh mở đầu (có thể đặt câu hỏi trung tâm ngay ở Beat 1)."
+                f"- MỞ ĐẦU (`hook_strategy={hook_strategy}`): Beat 1 (`section='hook'`) hãy nói trực tiếp với người xem bằng câu hỏi/nghịch lý kéo tò mò ngay 10 giây đầu (vẫn gắn đúng `panel_id` mở đầu hồi), TUYỆT ĐỐI không mở bằng câu tả cảnh thời tiết.{hook_line}"
             )
         if part_idx == total_parts:
             part_affordance_notes.append(
-                "- Beat cuối cùng của Hồi cuối đặt `beat_type='outro'`: chốt ngắn 1 câu đúc kết chủ đề/tò mò cho tập sau dựa trên biến cố vừa diễn ra."
+                "- Beat cuối cùng của Hồi cuối đặt `beat_type='outro'`: chốt lại ý nghĩa/nghi vấn còn bỏ ngỏ để gợi mở tập sau."
             )
         affordance_txt = "\n".join(part_affordance_notes)
         moods_txt = ", ".join(VALID_MOODS)
@@ -444,21 +539,21 @@ class ScriptwriterAgent:
             user_prompt = (
                 f"{context_block}\n\n"
                 f"---\n"
-                f"Đang viết Hồi {part_idx}/{total_parts}: {part.part_id} — {part.title} (section={part.section})\n"
-                f"Các scene của hồi này: {part.scene_ids} | Phạm vi trang hợp lệ: {first_pg} .. {last_pg}\n"
-                f"Ngân sách CHẶT: đúng {part.target_beats} beats, tổng ~{part.target_words} từ tiếng Việt (TRẦN TỐI ĐA {max_words} từ; "
-                "chủ động đan xen beat ngắn 12-22 từ ở pha gắt/twist với beat 26-44 từ ở pha đối thoại).\n"
+                f"Đang viết Hồi {part_idx}/{total_parts}: {part.part_id} — {part.title} (section={part.section}, mode={pacing_mode})\n"
+                f"Các scene của hồi này: {part.scene_ids} | Phạm vi trang hợp lệ: {first_pg} .. {last_pg} ({len(part_pages)} trang)\n"
+                f"Chế độ nhịp: {pacing_mode_desc}\n"
+                f"Dải dung lượng gợi ý: khoảng {part.target_words} từ (dải linh hoạt {min_words}–{max_words} từ; gợi ý quanh ~{part.target_beats} beats nhưng KHÔNG ép cứng số beat).\n"
                 f"Ghi chú đạo diễn: {part.focus_notes}\n"
                 + (f"{affordance_txt}\n" if affordance_txt else "")
-                + f"\n### PHÂN BỔ TRANG THEO TỪNG BEAT (BÁM SÁT ĐỂ PHỦ ĐỀU TỚI {last_pg}):\n{pacing_guide}\n\n"
-                f"### 2 BEAT CUỐI HỒI TRƯỚC (chỉ để nối nhịp giọng, TUYỆT ĐỐI KHÔNG lặp lại sự kiện đã kể):\n{tail_txt}\n\n"
+                + f"\n### 2 BEAT CUỐI HỒI TRƯỚC (chỉ để nối nhịp giọng, TUYỆT ĐỐI KHÔNG lặp lại sự kiện đã kể):\n{tail_txt}\n\n"
                 f"{extra_nodes_text}"
                 f"{lookup_hint}\n\n"
                 "RÀNG BUỘC & BỘ CÔNG CỤ KỂ CHUYỆN:\n"
-                "1) VĂN NÓI 100% ĐỌC THÀNH TIẾNG: tự nhiên như YouTuber kể chuyện, tận dụng thoại đắt trong `⚡Thoại` (ngoặc kép \"...\") và chi tiết thị giác `👁️Hình`. Được phép xen 1-2 beat `beat_type='commentary'` (câu nhận định/giải thích cơ chế ngắn neo hoàn toàn vào cảnh đang chiếu, không bịa thêm sự kiện). Chuyển tuyến POV/Flashback bằng mốc không gian/thời gian tự nhiên; CẤM sáo rỗng AI và câu chuyển đoạn bình luận viên.\n"
-                "2) KHÔNG KỂ TRƯỚC / KHÔNG DỒN CỤC: mỗi beat CHỈ kể đúng hành động/thoại trong 2-4 `panel_id` của chính beat đó.\n"
-                f"3) ĐỒNG BỘ HÌNH-TIẾNG ({first_pg} -> {last_pg}): đi tuần tự từ Beat 1 tới Beat {part.target_beats}; mỗi beat gắn 2-4 `panel_id` đầy đủ chính xác (dạng như `{sample_panels_hint}`), tiến đơn điệu; ưu tiên `[face]`/`[text]`, tránh `[bg]` trừ khi cảnh toàn trang quan trọng.\n"
-                f"4) `mood` CHỈ được chọn đúng 1 trong 7 giá trị chuẩn: `{moods_txt}`. Trả về XML `<part_script>` gồm `<beats>` với các `<beat id=... section=... beat_type=... mood=... pause_ms=...>` chứa `<panels>` và `<narration>`."
+                "1) GIỌNG KỂ YOUTUBER GẦN GŨI & PHÂN TÍCH (VĂN NÓI 100%): Nói chuyện như đang kể cho anh em bạn bè nghe (không viết văn xuôi tóm tắt!). Tận dụng thoại đắt trong `⚡Thoại` (ngoặc kép \"...\") và chi tiết `👁️Hình`. Khuyến khích tách riêng 15-30% số beat ở dạng `beat_type='commentary'` để nhận định tâm lý, chỉ ra manh mối, hoặc giải thích luật chơi ('để ý kỹ nha', 'nói nôm na là...') neo 100% vào sự kiện đang có trên trang.\n"
+                "2) NHỊP NGỮ NGHĨA LINH HOẠT (KHÔNG CHIA ĐỀU TRANG): Chỗ chạy đuổi/ít chữ thì lướt gọn 1 câu (10-16 từ) cho cả 3-5 trang; chỗ twist/cú đấm thì cắt nhịp gắt (6-14 từ), rồi mới dừng ở cảnh đối thoại đắt giá. Không kể vượt trước hình và không bỏ sót biến cố chính tới hết trang "
+                f"{last_pg}.\n"
+                f"3) ĐỒNG BỘ HÌNH-TIẾNG ({first_pg} -> {last_pg}): đi tuần tự, mỗi beat gắn 1-4 `panel_id` đầy đủ chính xác (dạng `{sample_panels_hint}`), tiến đơn điệu; ưu tiên `[face]`/`[text]`, tránh `[bg]` trừ cảnh toàn trang đắt giá.\n"
+                f"4) `mood` CHỈ chọn đúng 1 trong 7 giá trị: `{moods_txt}`. Cho `pause_ms` lớn hơn (350-550) ở cuối câu twist/commentary lắng đọng, ngắn hơn (120-200) ở pha cắt dồn dập. Trả về XML `<part_script>` gồm `<beats>` với các `<beat id=... section=... beat_type=... mood=... pause_ms=...>` chứa `<panels>` và `<narration>`."
                 + unrevealed_rule
             )
 
@@ -655,6 +750,7 @@ class ScriptwriterAgent:
                     panel_images=panel_images,
                     prev_scene_id=prev_scene_id,
                     hook_strategy=outline.hook_strategy,
+                    hook_summary=outline.hook_summary,
                 )
                 part_file.write_text(
                     json.dumps([b.model_dump() for b in part_beats], indent=2, ensure_ascii=False),

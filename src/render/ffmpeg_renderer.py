@@ -129,13 +129,11 @@ class FFmpegOpenCVRenderer:
         active_bgm_path: str | None = timeline.bgm_path
         if timeline.bgm_path:
             bgm_file = Path(timeline.bgm_path)
-            unique_moods = {s.mood for s in timeline.shots}
-            has_sfx = any(s.camera_move == "shake_impact" or s.transition_in == "flash_white" for s in timeline.shots)
-            if has_audio and bgm_file.name == "default_dark_fantasy.wav" and (len(unique_moods) > 1 or has_sfx):
+            if has_audio and bgm_file.name == "default_dark_fantasy.wav":
                 from src.audio.bgm_generator import build_dynamic_timeline_bgm
 
                 dyn_bgm = output_path.parent / "audio" / "04b_bgm_dynamic.wav"
-                build_dynamic_timeline_bgm(timeline, dyn_bgm)
+                build_dynamic_timeline_bgm(timeline, dyn_bgm, custom_bgm_dir=bgm_file.parent)
                 active_bgm_path = str(dyn_bgm.resolve())
             elif not bgm_file.exists() and bgm_file.suffix.lower() == ".wav":
                 from src.audio.bgm_generator import ensure_default_bgm

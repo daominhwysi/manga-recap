@@ -250,10 +250,10 @@ class CriticAgent:
 
         if target_total_words and len(beats) >= 6:
             actual_words = sum(word_counts)
-            if actual_words > int(target_total_words * 1.25):
-                excess = actual_words - int(target_total_words * 1.20)
+            if actual_words > int(target_total_words * 1.30):
+                excess = actual_words - int(target_total_words * 1.22)
                 b_msg = (
-                    f"Total script length ({actual_words} từ) exceeds target ({target_total_words} từ) by >25% "
+                    f"Total script length ({actual_words} từ) exceeds target ({target_total_words} từ) by >30% "
                     f"— hãy rút gọn bớt ~{excess} từ ở các beat dài."
                 )
                 issues.append(
@@ -331,10 +331,10 @@ class CriticAgent:
             res = self.llm.complete_xml(
                 agent_name="CriticSeamPolisher",
                 system_prompt=(
-                    "Bạn là Tổng Biên Tập Kịch Bản Voiceover (Read-Aloud Showrunner). CHỈ trả về các thẻ `<rewrite beat_id='...'>` cho những beat thực sự cần sửa để:\n"
+                    "Bạn là Tổng Biên Tập Kịch Bản Voiceover YouTube (Read-Aloud Showrunner). CHỈ trả về các thẻ `<rewrite beat_id='...'>` cho những beat thực sự cần sửa để:\n"
                     "1) Nối mượt chuyển hồi tại `seam_beat_ids` bằng hành động/không gian tự nhiên, xóa giới thiệu lặp nhân vật. CẤM câu chuyển đoạn bình luận viên.\n"
                     "2) Khử sạch cliché AI, lặp từ nối ('ai ngờ', 'cứ tưởng', 'tới lúc này', 'thế nhưng'), bỏ tên nhân vật bị gọi sớm trước `lộ từ ...`, và sửa trùng lặp dựa ĐÚNG trên `grounded_facts`.\n"
-                    "3) Tạo nhịp đọc tai nghe tự nhiên (xen câu ngắn dồn dập và câu kể trôi chảy), giữ đúng tên nhân vật đã lộ và KHÔNG cắt cụt chữ đầu câu."
+                    "3) BẢO TOÀN TUYỆT ĐỐI giọng kể YouTuber gần gũi ('mình', 'anh em', 'các bạn'), các câu bình luận/phân tích (`beat_type='commentary'`), và nhịp beat ngắn dồn dập (6-15 từ) — tuyệt đối KHÔNG viết lại thành văn xuôi tóm tắt sách vở."
                 ),
                 user_prompt=(
                     f"Nhân vật chuẩn: {cast_names}\n"

@@ -185,14 +185,11 @@ flowchart TD
 ---
 
 ### 4.4. Stage 3a — Biên Kịch Phân Đoạn Tách Biệt (`src/agents/scriptwriter.py`)
-- **Mục đích**: Chuyển các ghi chú phân cảnh thành kịch bản thuyết minh tiếng Việt (`03a_script_draft.json`) gồm ~60 nhịp kể (`ScriptBeat`), mỗi nhịp gắn 2–4 khung tranh (`panel_ids`) khớp tuyệt đối với lời nói.
-- **Kiến trúc chống lặp và chống lệch hình từ gốc**:
-  1. **Phân hoạch `1 Scene = 1 Part` tách biệt tuyệt đối**: Mỗi phân cảnh (`SceneNode`) trong cây mục lục tương ứng chính xác với 1 hồi viết kịch bản (`OutlinePart`). Không có bất kỳ trang nào nằm chung ở 2 Part, và không cắt phần đuôi của Part trước chuyển sang Part sau.
-  2. **Bảng Phân Bổ Trang Theo Từng Beat (Per-Beat Page Pacing Guide)**:
-     - Trước đây, khi giao 20 trang cho LLM viết 7 beats mà không chia mốc, LLM thường kể rất chậm ở 6 beats đầu rồi hoảng loạn nhồi 10 trang cuối vào Beat 7.
-     - Hiện tại, hệ thống tự động chia đều danh sách trang của Part đó cho từng Beat (`Beat 1: trang A..B`, `Beat 2: trang C..D`...) và ghim bảng chia nhịp này ngay đầu prompt. LLM đi đều đặn từ trang đầu tới đúng trang cuối của Part.
-  3. **Khóa con trỏ Panel tiến đơn điệu (`_sanitize_part_beats`)**:
-     - Sau khi LLM viết xong mỗi Part, bộ lọc hậu kiểm giữ lại các `panel_id` thuộc phạm vi hợp lệ của Part đó, đồng thời dùng con trỏ `cursor_rank` chỉ cho phép tiến về phía trước theo chiều đọc (cấm nhảy lùi về trang cũ) và giới hạn độ rộng trang của mỗi beat theo mật độ trang/beat của hồi đó.
+- **Mục đích**: Chuyển các ghi chú phân cảnh thành kịch bản thuyết minh tiếng Việt (`03a_script_draft.json`) mang giọng kể YouTuber gần gũi, phân tích, mỗi nhịp (`ScriptBeat`) gắn `panel_ids` khớp tuyệt đối với lời nói.
+- **Kiến trúc chống lặp và bảo toàn nhịp ngữ nghĩa (Semantic Pacing + Guardrails)**:
+  1. **Phân hoạch `1 Scene = 1 Part` tách biệt tuyệt đối**: Mỗi phân cảnh (`SceneNode`) tương ứng chính xác với 1 hồi viết kịch bản (`OutlinePart`). Không có trang nào nằm chung ở 2 Part.
+  2. **Phân bổ ngân sách ngữ nghĩa + Water-filling (`_allocate_part_budgets`)**: `OutlinePlannerAgent` chọn `pacing_mode` (`skim` / `steady` / `spotlight`) và đề xuất từ theo độ nặng nội dung; Python hòa trộn với lan can Water-filling + Largest Remainder để giữ tổng thời lượng mà không bao giờ trừ dồn vào cảnh cao trào. Bỏ chia xô trang đều từng beat để người kể tự do lướt nhanh đoạn ít chữ hoặc phanh lại phân tích ở twist/thoại đắt.
+  3. **Khóa con trỏ Panel tiến đơn điệu (`_sanitize_part_beats`)**: Sau khi LLM viết xong mỗi Part, bộ lọc hậu kiểm chuẩn hóa hậu tố `panel_id`, buộc tiến về phía trước theo chiều đọc (`cursor_rank`) và kích hoạt retry nếu thiếu mã hợp lệ.
 - **Đầu ra**: `repo/OUTLINE.json`, `repo/script/parts/part_*.json`, `repo/script/part_boundaries.json` và `03a_script_draft.json`.
 
 ---
@@ -215,7 +212,7 @@ flowchart TD
 - **Cách hoạt động**:
   1. Mỗi beat được tính một mã băm (`beat_cache_key`) dựa trên nội dung chữ + tên giọng đọc (`vi-VN-NamMinhNeural` của `EdgeTTSBackend` hoặc `VieNeuTTSBackend`). Nếu sửa 1 beat trong kịch bản, chỉ đúng beat đó cần thu âm lại, 59 beats còn lại lấy tức thì từ cache `audio/beats/*.wav`.
   2. Ghép nối tất cả các beat theo thứ tự kèm khoảng nghỉ ngắt nhịp (`pause_after_ms`) thành file `04_voiceover.wav` chuẩn PCM 48kHz và ghi lại mốc thời gian chính xác tới từng mili-giây vào `04_audio_manifest.json`.
-  3. Nếu cấu hình có yêu cầu nhạc nền mà file `.wav` chưa tồn tại, `bgm_generator.py` tự động tổng hợp một bản nhạc nền Dark Fantasy âm giai Rê thứ (D-minor) stereo không bản quyền tại `assets/bgm/default_dark_fantasy.wav`.
+  3. `build_dynamic_timeline_bgm()` hỗ trợ nạp track thật theo từng `mood` trong `assets/bgm/<mood>.*` (nếu có), hoặc tự động tổng hợp nhạc nền động với vòng hòa âm 4 nhịp + nhịp trống/tích tắc theo 7 `mood` (`warm`, `calm`, `comedic`, `mysterious`, `tense`, `action`, `tragic`) kèm 3 lớp SFX (`shake_impact`, `flash_white`, `fade_black`).
 
 ---
 
