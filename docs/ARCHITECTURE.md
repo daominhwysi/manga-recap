@@ -67,6 +67,15 @@ Máy tính nhìn trang truyện ban đầu chỉ là một ma trận hàng tri�
 ### Tầng 3: Thông Số Sản Phẩm Do Người Dùng Chọn (`config.yaml`)
 Các con số như độ phân giải video `1280x720`, tốc độ khung hình `24 fps`, tần số âm thanh `48000 Hz`, tốc độ đọc `225 từ/phút`, thời lượng mong muốn `target_duration_min: 11.0` là **đầu vào thiết kế sản phẩm**, được đặt tập trung tại `config.yaml` để người dùng tùy chỉnh, tuyệt đối không viết chìm trong logic code.
 
+### Nguyên Lý Thiết Kế Cốt Lõi: "Khóa Sự Thật, Thả Lỏng Nghệ Thuật" (Invariants vs. Affordances)
+Một cái bẫy rất dễ mắc phải khi nâng cấp hệ thống AI là **đổi từ cứng nhắc cơ học (V1) sang cứng nhắc công thức sáng tạo (V2)**: ví dụ thấy video YouTube hay thường có Cold Open 30 giây, câu ngắn xen câu dài hay chèn bình luận hài hước $\rightarrow$ biến chính những thói quen bề mặt đó thành khuôn ép bắt buộc cho mọi tập truyện. Làm vậy chỉ biến LLM thành máy điền vào chỗ trống.
+
+Vì vậy, kiến trúc phân tách rạch ròi 2 vùng trách nhiệm:
+1. **Vùng Bất Biến Cứng (Hard Invariants — chỉ dành cho Sự thật & Kỹ thuật)**: Không bịa tên/tình tiết, không lộ spoiler sớm, lời nói khớp đúng vùng hình ảnh, không kể lặp, không lọt phụ lục, âm thanh/phụ đề sạch chuẩn.
+2. **Vùng Tự Do Theo Ngữ Cảnh (Affordances & Context-Driven Policy — dành cho Nghệ thuật kể)**:
+   - Thay vì *bắt buộc* mọi tập phải làm 1 kiểu Hook mở đầu, ranh giới Scene theo dải trang cố định hay công thức đếm từ từng beat, hệ thống **mở khóa bộ công cụ lựa chọn** (ví dụ: mở đầu trực tiếp nếu truyện đã vào thẳng cao trào như *in medias res*, hoặc dùng *montage/framing* nếu mở đầu chậm; giữ khung hình lâu cho trang đôi nghệ thuật thay vì cắt máy móc mỗi vài giây).
+   - **Critic kiểm định ở tầm phân phối (Macro/Distribution Critique)**: Chỉ cảnh báo khi *toàn bộ tập* bị đều tăm tắp một nhịp hoặc dồn trang cuối hồi, không phạt vi mô từng beat chỉ vì độ dài khác khuôn mẫu.
+
 ---
 
 ## 3. Sơ Đồ Luồng Dữ Liệu 6 Trạm (6-Stage Pipeline)

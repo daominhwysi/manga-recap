@@ -34,6 +34,11 @@
 ### Rule 4 — Không nạp `RULES.md` vào Context
 - File `RULES.md` ở thư mục gốc là tài liệu viết báo học thuật ML tiếng Anh (LaTeX, p-value, abstract) ngoài ngữ cảnh dự án này. **Tuyệt đối không đọc/nạp `RULES.md` vào context**. Các nguyên lý hữu ích (chỉ dẫn phủ định kèm ví dụ XẤU/TỐT, cấm cliché AI, giữ nhất quán `canonical_name`) đã tích hợp vào `configs/personas.yaml` và `src/agents/critic.py`.
 
+### Rule 5 — Khóa Sự Thật & Kỹ Thuật, Thả Lỏng Nghệ Thuật Kể (Invariants vs. Affordances)
+- **Chỉ áp luật cứng cho Sự thật & Kỹ thuật**: grounding hình-tiếng, không bịa/spoiler sớm, không lặp nội dung, sạch phụ lục, chuẩn âm thanh/phụ đề.
+- **Cung cấp Bộ công cụ thay vì Công thức ép buộc (Affordances over Mandates)**: Với cấu trúc kể chuyện (kiểu Hook mở đầu, ranh giới Scene, độ dài câu/beat, chèn bình luận/hài, thời lượng đứng hình nghệ thuật), **cấm biến phong cách tham khảo thành khuôn cứng bắt buộc cho mọi tác phẩm**. Pipeline phải cho phép Agent chọn chiến lược phù hợp với chính bộ truyện đang xử lý.
+- **Kiểm định ở tầm Phân phối thay vì Vi mô**: Critic bắt lỗi sự thật và triệu chứng toàn cục (ví dụ: cả tập đều tăm tắp một nhịp, bỏ sót/dồn trang), không ép từng beat/shot phải khớp một khuôn mẫu số học cố định.
+
 ---
 
 ## 3. Lệnh Vận Hành, Kiểm Thử & Quản Lý Cache

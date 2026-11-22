@@ -164,41 +164,45 @@ Dưới đây là 15 vấn đề **được xác minh trực tiếp từ mã ngu
 
 ## 5. Những Thứ Nên THÊM MỚI & NÂNG CẤP (Kiến Trúc V2 Đề Xuất)
 
+> **Nguyên tắc thiết kế (Rule 5 — `AGENTS.md`)**: **Invariants vs. Affordances** — Chỉ khóa cứng **Sự thật & Kỹ thuật** (grounding, không lặp, sạch âm/hình), còn mọi yếu tố **Nghệ thuật kể** (chiến lược mở đầu, ranh giới hồi, nhịp độ câu/shot, bình luận) đều là **bộ công cụ tùy chọn theo ngữ cảnh tác phẩm**, tuyệt đối không ép mọi bộ truyện vào một công thức YouTube cố định.
+
 ```mermaid
 flowchart TD
     S1["STAGE 1 (Nâng cấp)\n- Recursive XY-Cut đọc chuẩn L-shape\n- Manhwa chạy YOLO face/text sau khi cắt\n- Trim viền trắng inset ngay tại Stage 1"] --> S2A
     S2A["STAGE 1.5 & 2a (Nâng cấp)\n- Cast Sheet dùng Pillow hỗ trợ UTF-8 tiếng Việt\n- Hỗ trợ --prev-bible / --prev-cast liên tập"] --> S2B
     S2B["STAGE 2b (Nâng cấp)\n- Semantic Scene Segmentation + Narrative Weight (1-5)\n- Khử Spread cả 2 chiều [Spread,P1,P2] & [P1,P2,Spread]\n- StoryBible nạp thêm seed_cast.json + tạo Pronunciation Glossary"] --> S3A
-    S3A["STAGE 3a (Nâng cấp Storytelling)\n- Cold Open Hook Montage (25-40s) + Outro Wrap-up\n- Ngân sách Beat/Từ phân bổ theo Narrative Weight\n- Cho phép beat_type: hook / narrative / commentary / outro\n- Khóa Enum mood (7 giá trị chuẩn) + xuất thêm tts_text"] --> S3B
-    S3B["STAGE 3b (Nâng cấp Real Quality Gate)\n- Phân tách severity: error vs warning\n- Auto-Repair Loop (tối đa 1-2 vòng) sửa đúng Part bị lỗi\n- Kiểm tra ngân sách từ, đa dạng độ dài beat & tỷ lệ commentary"] --> S4
+    S3A["STAGE 3a (Nâng cấp Storytelling)\n- Chọn HookStrategy theo mở đầu truyện (in_medias_res / montage / premise)\n- Ngân sách Beat/Từ phân bổ theo Narrative Weight\n- Affordances: beat_type (hook / narrative / commentary / outro)\n- Chuẩn hóa Contract mood (7 giá trị chuẩn) + xuất thêm tts_text"] --> S3B
+    S3B["STAGE 3b (Nâng cấp Real Quality Gate)\n- Phân tách severity: error vs warning\n- Auto-Repair Loop (tối đa 1-2 vòng) sửa đúng Part bị lỗi\n- Kiểm tra ngân sách từ tổng & phương sai nhịp độ toàn tập (Macro)"] --> S4
     S4["STAGE 4 (Nâng cấp Audio Engine)\n- Pronunciation Normalizer (narration_vi -> tts_text)\n- Resampling chuẩn scipy/ffmpeg (bỏ np.interp)\n- Parallel TTS + Forced Alignment (Word Timestamps)"] --> S5
-    S5["STAGE 5 (Nâng cấp Đạo Diễn & Sound Design)\n- Tách shot dài >4s thành 2 nhịp máy (Wide -> Focus Face)\n- Khớp phụ đề & điểm cắt câu theo Word Timestamps\n- Multi-Mood BGM Cue Sheet + SFX Layer (whoosh/impact/sting)\n- Hỗ trợ chuẩn RTL/LTR + Vertical 9:16 + Word-wrap phụ đề"] --> S6
+    S5["STAGE 5 (Nâng cấp Đạo Diễn & Sound Design)\n- Tách shot dài theo ngữ cảnh (giữ khoảnh khắc nghệ thuật/spread)\n- Khớp phụ đề & điểm cắt câu theo Word Timestamps\n- Multi-Mood BGM Cue Sheet + SFX Layer (whoosh/impact/sting)\n- Hỗ trợ chuẩn RTL/LTR + Vertical 9:16 + Word-wrap phụ đề"] --> S6
     S6["STAGE 6 (Nâng cấp Renderer & Exporters)\n- Mix Multi-BGM crossfade + SFX + Voiceover Sidechain Ducking\n- HTML Preview có ảnh panel + audio player duyệt nhanh\n- CapCut Draft đầy đủ Diptych + BGM + Subtitles"]
 ```
 
 ### Tóm tắt 6 Nâng Cấp Giá Trị Nhất (ROI cao nhất)
 
 1. **Semantic Scene Segmentation + Narrative Weighting (Stage 2b → 3a)**:
-   - Thay vì cắt cứng 20 trang/scene, dùng 1 lời gọi LLM nhẹ trên danh sách tóm tắt 1 dòng của toàn tập (chỉ ~3–4K tokens!) để gom các trang thành **Scene đúng ranh giới hồi/chương/địa điểm** (ví dụ 10–28 trang) và chấm `narrative_weight` (`1` = chuyển cảnh nhẹ, `5` = đại cao trào/plot twist).
-   - Stage 3a phân bổ `target_words` và `target_beats` theo `narrative_weight * sqrt(num_pages)` thay vì chia đều cơ học → cảnh nhẹ lướt nhanh, cao trào giãn nhịp cực cuốn như Phê Phim / Anime Rewind!
-2. **YouTube Retention Arc & Storytelling Layer (Stage 3a)**:
-   - Bổ sung 3 loại beat có cấu trúc (`beat_type: Literal["hook_montage", "narrative", "commentary", "outro"]`):
-     - **Cold Open Hook (2–3 beats đầu, ~25–35s)**: Lấy 4–6 panel đắt giá nhất cả tập (nhưng không spoil kết cục) kèm câu hỏi trung tâm dẫn dắt người xem.
-     - **Narrative + Commentary đan xen**: Cho phép lồng ghép giải thích cơ chế sức mạnh/luật thế giới (kiểu Anime Rewind) và nhận định tâm lý/châm biếm sắc bén (kiểu Phê Phim / AL Anime) mà vẫn neo chặt vào panel của cảnh hiện tại.
-     - **Outro Wrap-up (1–2 beats cuối)**: Tổng kết cảm xúc + gợi mở bí ẩn tập sau.
-   - Bắt buộc **đa dạng nhịp độ câu/beat** (beat hành động ngắn 15–22 từ xen beat giải thích/cảm xúc 35–50 từ) và **khóa cứng Enum `mood`** (`Literal["calm", "warm", "comedic", "mysterious", "tense", "action", "tragic"]`) để Stage 5 & Audio đồng bộ 100%.
-3. **Closed-Loop Critic + Targeted Repair (Stage 3b)**:
-   - Chia rõ `severity="error"` (vượt budget từ >20%, lặp N-gram, lùi trang, rò rỉ biên giới Part, cliché AI) vs `warning`.
-   - Khi có `error`, chỉ chạy lại **đúng Part bị lỗi** (1 vòng sửa kèm phản hồi cụ thể của Critic) thay vì bỏ qua hoặc viết lại cả tập.
+   - Thay vì cắt cứng 20 trang/scene, dùng 1 lời gọi LLM nhẹ trên danh sách tóm tắt 1 dòng của toàn tập (chỉ ~3–4K tokens!) để gom các trang thành **Scene đúng ranh giới tự nhiên của sự kiện/hồi/địa điểm** (không khóa cứng số trang tối thiểu/tối đa, chỉ bảo toàn phân hoạch tập rời 100% và giới hạn an toàn context window) và chấm `narrative_weight` (`1` = chuyển cảnh nhẹ, `5` = đại cao trào/plot twist).
+   - Stage 3a phân bổ `target_words` và `target_beats` theo trọng số `narrative_weight` của cảnh thay vì chia đều cơ học → cảnh nhẹ lướt gọn, cao trào được phép giãn nhịp sâu sắc hơn.
+2. **Context-Driven Storytelling Affordances (Stage 3a)**:
+   - Cung cấp cho Outline Planner **bộ chiến lược mở đầu (`HookStrategy`)** thay vì ép 1 kiểu duy nhất:
+     - `in_medias_res`: vào thẳng truyện nếu trang đầu vốn đã có cao trào mạnh sẵn (ví dụ mở đầu giữa đại sảnh máu).
+     - `montage_tease`: trích 3–5 panel đắt giá làm Cold Open đặt câu hỏi trung tâm khi mở đầu gốc nhập cuộc chậm.
+     - `world_premise`: giới thiệu ngắn luật thế giới/bối cảnh nếu truyện có hệ thống lore phức tạp.
+   - Mở khóa `beat_type: Literal["hook_montage", "narrative", "commentary", "outro"]`: cho phép người kể **được quyền** lồng giải thích cơ chế, cảm nhận tâm lý, cà khịa duyên dáng hoặc kết mở ở những chỗ hợp tông truyện/persona (`kich_tinh`, `hai_huoc`, `phan_tich`), chứ **không ép KPI** mọi hồi đều phải chèn bình luận hay tuân theo khung từ cứng nhắc.
+   - Chuẩn hóa **hợp đồng giao tiếp `mood`** giữa Stage 3a và Stage 5 (`Literal["calm", "warm", "comedic", "mysterious", "tense", "action", "tragic"]`) để hiệu ứng camera & âm thanh không bị lệch pha vì chuỗi tự do.
+3. **Closed-Loop Critic + Macro Distribution Critique (Stage 3b)**:
+   - Chia rõ `severity="error"` (chỉ dùng cho **Hard Invariants**: lỗi grounding panel, lùi trang, rò rỉ biên giới Part, lặp N-gram, sai Enum `mood`, vượt quá xa ngân sách thời lượng tổng) vs `warning`.
+   - Kiểm tra **triệu chứng phân phối toàn cục (Macro Critique)**: ví dụ cảnh báo nếu phương sai độ dài beat/tốc độ quá phẳng khiến cả tập bị đều tăm tắp một nhịp — **không** phạt vi mô từng beat ngắn hay dài riêng lẻ.
+   - Khi có `error`, chỉ chạy lại **đúng Part bị lỗi** (1–2 vòng sửa kèm phản hồi cụ thể của Critic) thay vì bỏ qua hoặc viết lại cả tập.
 4. **Audio Pipeline Chuẩn Phòng Thu (Stage 4 → 5)**:
    - **Pronunciation Glossary**: `StoryBible` tự sinh bảng phiên âm tiếng Việt cho các tên riêng/thuật ngữ nước ngoài khó đọc (hoặc có file `pronunciation.json` trong job để user chỉnh tay). Phụ đề vẫn hiện chữ gốc (`Oz Vessalius`, `Abyss`), còn TTS đọc bản đã chuẩn hóa (`tts_text`).
    - **Anti-aliased Resampling** (`scipy.signal.resample_poly` hoặc FFmpeg `aresample`) thay `np.interp`.
    - **Word-level Timestamps** (tận dụng `WordBoundary` có sẵn của Edge-TTS; với VieNeu dùng nhẹ `faster-whisper`/`stable-ts` hoặc silence-boundary alignment) để phụ đề và điểm cắt shot khớp chính xác từng câu nói.
-   - **Multi-Mood BGM + SFX Cue Layer**: Chọn 3–4 track BGM theo `mood` (crossfade 2s tại điểm chuyển section) + 5–6 âm thanh SFX tinh tế (`whoosh`, `impact`, `flash`, `tension_riser`, `comedy_pop`) trộn cùng sidechain ducking.
+   - **Multi-Mood BGM + SFX Cue Layer**: Chọn 3–4 track BGM theo `mood` (crossfade 2s tại điểm chuyển section) + âm thanh SFX tinh tế (`whoosh`, `impact`, `flash`, `tension_riser`, `comedy_pop`) dùng có chọn lọc tại điểm chuyển mood/impact, trộn cùng sidechain ducking.
 5. **Visual Polish & True Generalization (Stage 1, 5, 6)**:
    - **Recursive XY-Cut** cho thứ tự đọc Manga L-shape.
    - **Manhwa YOLO Post-Pass** để Manhwa có đầy đủ `face/text` focal points.
-   - **Sub-shot Splitting**: Nếu 1 panel đứng hình quá `max_shot_duration_ms`, tự tách thành 2 nhịp máy (*Establish Wide → Zoom-in Face/Text*) để video không bao giờ bị đơ hình 7 giây!
+   - **Context-Aware Shot Pacing**: Với shot dài có nhiều focal points (`face` + `text`/hành động), ưu tiên tách 2 nhịp máy (*Wide → Focus Face*) để tránh đơ hình; ngược lại, cho phép giữ tĩnh/zoom cực chậm với trang đôi nghệ thuật (`spread`) hoặc beat trầm lắng (`calm`/`tragic`) thay vì cắt vụn máy móc theo mốc 3.5s.
    - **Đọc `reading_order` ở Stage 5/6** (hỗ trợ chuẩn cả LTR) và **Word-Wrap phụ đề + `aspect_ratio: 9:16`** cho Shorts/Reels/TikTok.
 6. **Human-in-the-Loop Tooling (CLI + Exporters)**:
    - Bổ sung lệnh `manga-recap inspect` (hiển thị bảng telemetry, chi phí token, độ lệch budget từ, điểm Critic).
@@ -209,20 +213,17 @@ flowchart TD
 ## 6. 7 Câu Hỏi Phản Biện Chiến Lược & Câu Trả Lời
 
 ### Q1: Tách Scene theo ngữ nghĩa (Semantic Scene Segmentation) có làm mất tính tổng quát hoặc tăng mạnh chi phí LLM không?
-- **Trả lời**: **Không!** Đầu vào chỉ là danh sách 1 dòng/trang (`ch01_p005: ...`) — với 180 trang chỉ tốn ~`3,500–4,500 tokens` (**1 lời gọi LLM duy nhất**, mất ~8–12 giây). Chỉ cần thêm ràng buộc an toàn bằng Python (mỗi scene tối thiểu 8 trang, tối đa 30 trang; mọi trang story đều phải nằm trong đúng 1 scene, không trùng không sót) là vừa đảm bảo 100% bất biến tập rời `Disjoint Sets`, vừa chấm dứt hoàn toàn việc cắt ngang trận đánh!
+- **Trả lời**: **Không!** Đầu vào chỉ là danh sách 1 dòng/trang (`ch01_p005: ...`) — với 180 trang chỉ tốn ~`3,500–4,500 tokens` (**1 lời gọi LLM duy nhất**, mất ~8–12 giây). Python chỉ kiểm tra 2 bất biến cấu trúc: mọi trang `story` đều thuộc đúng 1 scene (`Disjoint Sets`, không trùng không sót) và tổng token của scene không vượt trần context window — **không áp ngưỡng cứng 8–30 trang**, để flashback ngắn 3–4 trang hay trận chiến dài 40 trang đều giữ nguyên trọn vẹn mạch cảm xúc.
 
-### Q2: Cho phép "Cold Open Hook" (lấy panel giữa tập chiếu ở 30 giây đầu) có vi phạm Bất biến #1 (tiến đơn điệu theo chiều đọc) không?
-- **Trả lời**: **Không, nếu tách biệt rõ pha `hook_montage` trong schema!**
-  - Trong điện ảnh & YouTube recap (như Phê Phim), Cold Open là một **tầng mở đầu tách riêng** (`section == "hook_montage"`, thời lượng cố định 15–35 giây đầu video).
-  - Sau khi chuyển sang thân bài (`setup → rising → climax → resolution`), bất biến **tiến đơn điệu 100% theo chiều đọc** vẫn được áp đặt tuyệt đối! `CriticAgent` chỉ cần miễn trừ kiểm tra đơn điệu tại ranh giới `hook_montage → setup`, và vẫn kiểm tra chặt panel grounding (chỉ lấy panel hợp lệ thuộc `story_pages`, không lấy từ trang cuối để tránh spoil kết thúc).
+### Q2: Cho phép tùy chọn "Cold Open Hook" (lấy panel giữa tập chiếu ở đầu) có vi phạm Bất biến #1 (tiến đơn điệu theo chiều đọc) không?
+- **Trả lời**: **Không, nếu tách biệt `HookStrategy` có chủ đích!**
+  - Thứ nhất, Planner chỉ chọn `montage_tease` khi mở đầu nguyên tác nhập cuộc chậm; nếu tập truyện vốn đã có *in medias res* tự nhiên thì chọn `in_medias_res` đi thẳng vào truyện.
+  - Thứ hai, khi dùng `montage_tease`, pha mở đầu được đánh dấu rõ (`section == "hook_montage"`). Sau khi bước vào thân bài (`setup → rising → climax → resolution`), bất biến **tiến đơn điệu 100% theo chiều đọc** vẫn được áp đặt tuyệt đối! `CriticAgent` chỉ miễn trừ kiểm tra đơn điệu tại ranh giới chuyển vào thân bài, và vẫn khóa grounding hợp lệ (không lấy panel kết tập tránh spoil).
 
 ### Q3: Cho phép thêm lớp "Bình luận / Cảm xúc / Cà khịa" có làm tăng nguy cơ LLM bịa cốt truyện (hallucination) không?
-- **Trả lời**: Rất đáng lưu tâm — giải pháp là **phân vai rõ ràng trong Prompt & Schema**:
+- **Trả lời**: Rất đáng lưu tâm — giải pháp là **mở quyền (affordance) kèm rào chắn sự thật**, không biến thành chỉ tiêu ép buộc:
   - Bình luận chỉ được phép **suy luận từ sự kiện đã xảy ra** (nhận định động cơ, so sánh tương phản, câu hỏi tu từ cho người xem, giải thích lại cơ chế đã xuất hiện trong bóng thoại), **tuyệt đối không tự thêm sự kiện mới** ngoài ghi chú `scene_XXX.md`.
-  - Chọn **mức độ bình luận theo Persona**:
-    - `kich_tinh` (hướng **Phê Phim**): tập trung đào sâu cảm xúc, bi kịch, đặt câu hỏi tu từ, nhấn mạnh tương phản.
-    - `hai_huoc` (hướng **AL Anime / Anime Rewind**): chêm biệt danh vui, cà khịa duyên dáng, phá bức tường thứ 4 ngắn gọn.
-    - `phan_tich` (hướng **Anime Rewind / Deep Dive**): giải thích cơ chế năng lực, xâu chuỗi manh mối & foreshadowing.
+  - Tùy chỉnh thiên hướng theo Persona (`kich_tinh`: cảm xúc & tương phản; `hai_huoc`: cà khịa duyên dáng khi cảnh hợp; `phan_tich`: giải mã luật chơi & foreshadowing) và để Scriptwriter tự quyết định chỗ nào nên lướt nhanh, chỗ nào đáng dừng bình luận.
 
 ### Q4: Tại sao VieNeu TTS chạy mất gần 13 phút? Nên tăng tốc VieNeu hay dùng chiến lược Hybrid?
 - **Trả lời**: Kiểm tra lại [vieneu_tts.py](file:///home/daominhwysi/project/manga_recap_generator/src/audio/vieneu_tts.py#L44): VieNeu đang chạy inference tuần tự từng câu trên CPU (và phải tự chịu tải model nặng ~12.8 phút cho 60 beats).
@@ -237,7 +238,7 @@ flowchart TD
 
 ### Q6: Có nên giữ `CriticAgent` ở dạng Python thuần hay kết hợp LLM?
 - **Trả lời**: **Hybrid 2 lớp tách bạch**:
-  - **Lớp 1 — Deterministic Gate (Python 100%, tốc độ 0.05s, chi phí $0)**: Chặn cứng bằng `severity="error"` các lỗi cơ học (panel không tồn tại, lệch ranh giới Part, lùi trang, độ rộng beat vượt mật độ, vượt budget từ >±20%, trùng N-gram, `mood` sai Enum, cliché cấm).
+  - **Lớp 1 — Deterministic Gate (Python 100%, tốc độ 0.05s, chi phí $0)**: Chặn cứng bằng `severity="error"` các **lỗi sự thật/kỹ thuật** (panel không tồn tại, lệch ranh giới Part, lùi trang, độ rộng beat vượt mật độ, lệch ngân sách thời lượng tổng quá mức, trùng N-gram, `mood` sai hợp đồng Enum, cliché cấm) và cảnh báo **triệu chứng phân phối toàn cục** (phương sai độ dài beat gần bằng 0).
   - **Lớp 2 — Targeted Auto-Repair (LLM, chỉ chạy khi Lớp 1 có `error`)**: Chỉ gửi đúng Part vi phạm + danh sách lỗi cụ thể để viết lại (tối đa 1–2 lần), giúp 99% job đạt chuẩn mà không tốn token sửa toàn bộ khi kịch bản đã tốt.
 
 ### Q7: Thứ tự ưu tiên triển khai thế nào để thấy chất lượng video "lột xác" rõ rệt nhất với ít rủi ro nhất?
@@ -247,29 +248,29 @@ flowchart TD
 
 ## 7. Lộ Trình Đề Xuất Theo Mức Ưu Tiên (Chờ Phê Duyệt)
 
-### 🔴 Đợt P0 — Sửa Bug Ẩn, Dọn Dead Code & Nâng Cấp "Hồn" Kịch Bản (Tác động lớn nhất)
+### 🔴 Đợt P0 — Sửa Bug Ẩn, Dọn Dead Code & Mở Khóa Storytelling Linh Hoạt (Tác động lớn nhất)
 1. **Dọn dẹp & Fix Contract**:
-   - Khóa `ScriptBeat.mood` thành `Literal["calm", "warm", "comedic", "mysterious", "tense", "action", "tragic"]` và đồng bộ 100% với `ChoreographerAgent` (khôi phục lại `shake_impact` & `flash_white`).
+   - Chuẩn hóa `ScriptBeat.mood` thành Enum hợp đồng (`Literal["calm", "warm", "comedic", "mysterious", "tense", "action", "tragic"]`) để đồng bộ 100% giữa Stage 3a và Stage 5 (khôi phục lại `shake_impact` & `flash_white`).
    - Dọn dead code (`src/agents/story_bible.py`, tàn dư `handoff_*`, nối dây `subtitle_font_ratio`, `aspect_ratio`, `max_words_per_beat`, thêm lệnh `manga-recap inspect`).
    - Fix lỗi font tiếng Việt trên `cast_sheet.jpg` (chuyển sang Pillow UTF-8), truyền `seed_cast.json` vào `StoryBible`, fix `AliasResolver` cập nhật cả text `page_summary`/`action_summary`, và kiểm tra spread trùng cả 2 chiều `[P1, P2, Spread]`.
 2. **Semantic Scene Segmentation + Narrative Weighting (Stage 2b → 3a)**:
-   - Chia Scene theo đúng ranh giới hồi/chương/địa điểm kèm trọng số cao trào (1–5) thay vì cắt cứng 20 trang.
-   - Phân bổ ngân sách từ & beat theo trọng số cao trào, siết chặt kiểm soát tổng số từ khớp `target_duration_min` (±10%).
-3. **Nâng cấp Storytelling theo 3 Kênh YouTube (Stage 3a & `configs/personas.yaml`)**:
-   - Thêm cấu trúc **Cold Open Hook Montage (20–35s)** + **Outro Wrap-up** + cho phép đan xen lớp **Commentary / Giải thích cơ chế / Câu hỏi tu từ** theo đúng đặc trưng từng Persona (`kich_tinh` ≈ Phê Phim, `hai_huoc` ≈ AL Anime, `phan_tich` ≈ Anime Rewind).
-   - Bắt buộc đa dạng độ dài beat (ngắn dồn dập 15–22 từ xen dài 35–48 từ).
+   - Chia Scene theo ranh giới tự nhiên của mạch truyện kèm trọng số cao trào (1–5) thay vì cắt cứng 20 trang hay ép khung số trang cố định.
+   - Phân bổ ngân sách từ & beat tỷ lệ theo trọng số cao trào, giữ tổng thời lượng khớp mục tiêu sản phẩm (`target_duration_min`).
+3. **Mở Khóa Bộ Công Cụ Kể Chuyện Theo Ngữ Cảnh (Stage 3a & `configs/personas.yaml`)**:
+   - Thêm lựa chọn `HookStrategy` (`in_medias_res` / `montage_tease` / `world_premise`), `outro`, và quyền đan xen `commentary` tùy chất truyện & Persona (`kich_tinh`, `hai_huoc`, `phan_tich`) — không ép công thức cố định.
+   - Khuyến khích đa dạng nhịp kể tự nhiên theo cảnh thay vì khóa đều tăm tắp.
 4. **Closed-Loop Critic (Stage 3b)**:
-   - Tách `error` vs `warning` và thêm cơ chế tự sửa cục bộ 1 vòng cho đúng Part lỗi.
+   - Tách `error` (sự thật/kỹ thuật) vs `warning` (nhịp phân phối toàn cục) và thêm cơ chế tự sửa cục bộ 1–2 vòng cho đúng Part lỗi.
 
 ### 🟡 Đợt P1 — Nâng Cấp Phòng Thu Âm Thanh & Đạo Diễn Hình Ảnh (Cảm giác "Video Chuyên Nghiệp")
 5. **TTS Pronunciation Normalization + Audio Quality**:
    - Sinh bảng phiên âm tên riêng/thuật ngữ (`pronunciation_map` trong `StoryBible` / `repo/pronunciation.json`) để tách `narration_vi` (phụ đề chuẩn) vs `tts_text` (giọng đọc không bị ngọng).
    - Thay `np.interp` bằng resampling có anti-aliasing chuẩn (`scipy`/`ffmpeg`), đưa `rate` vào `beat_cache_key`, song song hóa Edge-TTS, bổ sung fallback thật cho VieNeu.
 6. **Multi-Mood BGM + SFX Layer + Word-Level Sync**:
-   - Hỗ trợ chọn BGM theo nhóm `mood` (crossfade mượt) + SFX nhẹ trên các điểm chuyển cảnh/impact.
+   - Hỗ trợ chọn BGM theo nhóm `mood` (crossfade mượt) + SFX nhẹ có chọn lọc tại điểm chuyển cảnh/impact.
    - Tích hợp Word Timestamps (Edge-TTS `WordBoundary` trước, mở rộng forced alignment cho VieNeu) để phụ đề & điểm cắt câu khớp chính xác từng mili-giây.
-7. **Sub-Shot Splitting & Trim Sync**:
-   - Tách panel dài > `max_shot_duration_ms` thành 2 nhịp camera (*Wide → Focus Face*) để xóa triệt để các shot đứng hình 7 giây.
+7. **Context-Aware Shot Pacing & Trim Sync**:
+   - Hỗ trợ tách shot dài thành 2 nhịp máy (*Wide → Focus Face*) ở các panel giàu chi tiết, đồng thời giữ nguyên nhịp tĩnh nghệ thuật cho trang đôi spread / cảnh lắng đọng.
    - Đưa `_trim_excess_white_border` về Stage 1 (cập nhật luôn tọa độ `focal_points`) để `focus_face` không bao giờ bị lệch.
 
 ### 🟢 Đợt P2 — Tổng Quát Hóa Toàn Diện & Human-in-the-Loop Tooling
