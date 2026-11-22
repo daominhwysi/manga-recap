@@ -206,12 +206,21 @@ class CriticAgent:
         if target_total_words and len(beats) >= 6:
             actual_words = sum(word_counts)
             if actual_words > int(target_total_words * 1.25):
+                excess = actual_words - int(target_total_words * 1.20)
                 b_msg = (
-                    f"Total script length ({actual_words} từ) exceeds target ({target_total_words} từ) by >25%."
+                    f"Total script length ({actual_words} từ) exceeds target ({target_total_words} từ) by >25% "
+                    f"— hãy rút gọn bớt ~{excess} từ ở các beat dài."
                 )
                 issues.append(
                     CriticIssue(beat_id="global", severity="error", category="budget", message=b_msg)
                 )
+                longest_indices = sorted(
+                    range(len(beats)),
+                    key=lambda i: word_counts[i],
+                    reverse=True,
+                )[: min(8, len(beats))]
+                for li in longest_indices:
+                    flagged_indices.add(li)
                 flagged_notes.append(b_msg)
 
         return issues, flagged_indices, flagged_notes

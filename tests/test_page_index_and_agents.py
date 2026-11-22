@@ -533,3 +533,107 @@ def test_full_alias_resolution_compact_md_and_closed_loop_critic(tmp_path: Path)
     assert not any(i.category == "style" for i in rep.issues)
     assert final_s.beats[2].panel_ids == ["ch01_p003_P1"]
     assert "A thơ" in final_s.beats[2].tts_text
+
+
+def test_critic_round2_budget_targets_longest_beats_and_product_evaluator(tmp_path: Path) -> None:
+    import cv2
+    import numpy as np
+    from src.agents.product_evaluator import ProductEvaluatorAgent
+    from src.config import ScriptConfig
+
+    manifest, analyses = _make_dummy_manifest(8, panels_per_page=2)
+    analyses[-1].page_summary = "Translator's Notes 1"
+    for pg in manifest.chapters[0].pages:
+        for pnl in pg.panels:
+            p_img = tmp_path / f"{pnl.panel_id}.jpg"
+            cv2.imwrite(str(p_img), np.full((180, 140, 3), 160, dtype=np.uint8))
+            pnl.crop_path = str(p_img)
+            pnl.width, pnl.height = 140, 180
+
+    analyses[0].verbatim_quote_vi = "Bằng mọi giá phải mở cánh cửa này!"
+    analyses[0].visual_punch = "Bàn tay nắm chặt tay nắm đồng"
+
+    job_dir = tmp_path / "j_eval"
+    llm_off = LLMClient(LLMConfig(offline_fallback=True))
+    tree, bible = PageIndexBuilder(llm_off, pages_per_scene=10).build(manifest, analyses, job_dir)
+
+    # 1) Critic Round-2 budget overrun must flag longest beats and trim them when Showrunner runs
+    distinct_roots = [
+        "Nhân vật mở cánh cửa gỗ cũ bước vào sảnh lớn tối om.",
+        "Ánh đèn hắt lên chiếc đồng hồ quả quýt đặt trên bệ đá.",
+        "Kẻ lạ mặt mặc áo choàng đỏ rút thanh kiếm bạc ra khỏi vỏ.",
+        "Đội hộ vệ hoàng gia vội vã đóng chặt cổng sắt phía tây.",
+        "Cô gái tóc dài quay người ném sợi xích sắt về phía quái vật.",
+        "Ánh bình minh chiếu rọi ban công lâu đài sau trận chiến dài.",
+    ]
+    short_distinct = [
+        "Cậu đẩy cửa gỗ bước vào sảnh tối.",
+        "Chiếc đồng hồ quả quýt lóe sáng trên bệ đá.",
+        "Kẻ áo choàng đỏ rút kiếm bạc đối đầu.",
+        "Đội hộ vệ đóng chặt cổng sắt phía tây.",
+        "Cô gái vung xích sắt chặn đứng quái vật.",
+        "Nắng bình minh rọi sáng ban công lâu đài.",
+    ]
+    beats = [
+        ScriptBeat(
+            beat_id=f"b{i+1:03d}",
+            narration_vi=(f"{distinct_roots[i]} " * 12).strip(),
+            panel_ids=[f"ch01_p{min(7, i+1):03d}_P1"],
+        )
+        for i in range(6)
+    ]
+    from src.agents.critic import _SeamPolishResponse, _SeamRewrite
+
+    critic = CriticAgent(llm_off, polish_seams=False)
+    eval_issues, eval_flagged, _ = critic._evaluate_issues(
+        beats,
+        all_pages=[p.page_id for p in manifest.chapters[0].pages],
+        page_order={p.page_id: idx for idx, p in enumerate(manifest.chapters[0].pages)},
+        beat_to_allowed={},
+        target_total_words=400,
+    )
+    assert any(i.category == "budget" and i.severity == "error" for i in eval_issues)
+    assert len(eval_flagged) > 0
+
+    captured_flagged: list[str] = []
+    llm_budget = LLMClient(LLMConfig(api_key="dummy"))
+
+    def fake_budget_polish(agent_name, system_prompt, user_prompt, schema_cls, **kw):
+        captured_flagged.append(user_prompt)
+        return _SeamPolishResponse(
+            rewrites=[
+                _SeamRewrite(beat_id=f"b{i+1:03d}", narration_vi=short_distinct[i])
+                for i in range(6)
+            ]
+        )
+
+    llm_budget.complete_json = fake_budget_polish  # type: ignore
+    sc_cfg = ScriptConfig(target_duration_min=1.0, words_per_minute=400)  # target = 400 words
+    final_s, rep = CriticAgent(llm_budget, polish_seams=True).review(
+        RecapScript(title_vi="Budget", beats=beats),
+        manifest,
+        bible,
+        job_dir,
+        force=True,
+        script_config=sc_cfg,
+    )
+    assert rep.passed is True
+    assert len(captured_flagged) == 1
+    assert sum(len(b.narration_vi.split()) for b in final_s.beats) < 400
+
+    # 2) ProductEvaluatorAgent produces JSON + MD + Contact Sheet + ActionableCodeFinding
+    (job_dir / "01_manifest.json").write_text(manifest.model_dump_json(), encoding="utf-8")
+    (job_dir / "02a_all_pages.json").write_text(
+        json.dumps([a.model_dump() for a in analyses]), encoding="utf-8"
+    )
+    # Inject a skipped backmatter panel to test leak detection + actionable code pointer
+    leaked_script = final_s.model_copy(deep=True)
+    leaked_script.beats[-1].panel_ids = ["ch01_p008_P1"]
+    (job_dir / "03b_script_final.json").write_text(leaked_script.model_dump_json(), encoding="utf-8")
+
+    ev = ProductEvaluatorAgent(llm=None, script_config=sc_cfg).evaluate(job_dir, use_llm=False)
+    assert (job_dir / "07_eval_report.json").exists()
+    assert (job_dir / "07_EVAL_REPORT.md").exists()
+    assert (job_dir / "07_visual_contact_sheet.jpg").exists()
+    assert "ch01_p008_P1" in ev.visual_metrics.leaked_skipped_panels
+    assert any(f.category == "front_backmatter_leak" for f in ev.findings)
