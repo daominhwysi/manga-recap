@@ -62,6 +62,7 @@ manga_recap_generator/
 ├── AGENTS.md                        # Đặc tả kiến trúc tóm tắt, filesystem, workflow và quy tắc bắt buộc cho AI Agents
 ├── docs/
 │   ├── ARCHITECTURE.md              # Tài liệu kiến trúc chi tiết tiếng Việt (mục lục, giải thích 6 Stage, bất biến & bảng kiểm tra tác động)
+│   ├── ARCHITECTURE_REVIEW.md       # Báo cáo kiểm toán toàn diện kiến trúc, 15 lỗ hổng, đối chiếu kịch bản YouTube & lộ trình V2
 │   └── FINAL_REPORT.md              # Báo cáo tổng kết thực nghiệm pipeline
 ├── config.yaml                      # Cấu hình trung tâm (LLM provider/models, CV, Script, TTS, Render, Exporters)
 ├── pyproject.toml / uv.lock         # Dependencies Python (uv) và cấu hình pytest/ruff
