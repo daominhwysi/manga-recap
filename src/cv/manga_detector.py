@@ -41,12 +41,32 @@ def _nms(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> list[int]:
     return keep
 
 
-def sort_panels_reading_order(boxes: list[BBox], reading_order: str = "rtl") -> list[BBox]:
-    """Sort 2D manga panel boxes into natural reading order (top-to-bottom, RTL or LTR)."""
-    if len(boxes) <= 1:
-        return boxes
+def trim_white_border_with_offset(img: np.ndarray) -> tuple[np.ndarray, int, int]:
+    """Crop dominant empty white margins on inset pages and return (trimmed_img, x_offset, y_offset)."""
+    ih, iw = img.shape[:2]
+    if ih < 200 or iw < 200:
+        return img, 0, 0
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    if float(np.mean(gray > 245)) <= 0.75:
+        return img, 0, 0
+    ys, xs = np.where(gray < 230)
+    if len(xs) < 100:
+        return img, 0, 0
+    x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+    area_ratio = ((x1 - x0) * (y1 - y0)) / float(ih * iw)
+    if 0.05 <= area_ratio <= 0.60 and (x1 - x0) >= 120 and (y1 - y0) >= 120:
+        pad_x = int(iw * 0.06)
+        pad_y = int(ih * 0.06)
+        x0 = max(0, x0 - pad_x)
+        y0 = max(0, y0 - pad_y)
+        x1 = min(iw, x1 + pad_x)
+        y1 = min(ih, y1 + pad_y)
+        return img[y0:y1, x0:x1], x0, y0
+    return img, 0, 0
 
-    # Sort top-to-bottom first, then cluster rows by vertical overlap
+
+def _row_cluster_sort(boxes: list[BBox], reverse_x: bool) -> list[BBox]:
+    """Fallback row-clustering sort when panels overlap diagonally."""
     by_y = sorted(boxes, key=lambda b: (b.y1 + b.y2) / 2.0)
     rows: list[list[BBox]] = []
     for box in by_y:
@@ -66,11 +86,78 @@ def sort_panels_reading_order(boxes: list[BBox], reading_order: str = "rtl") -> 
 
     rows.sort(key=lambda r: min(b.y1 for b in r))
     ordered: list[BBox] = []
-    reverse_x = reading_order.lower() == "rtl"
     for row in rows:
         row.sort(key=lambda b: (b.x1 + b.x2) / 2.0, reverse=reverse_x)
         ordered.extend(row)
     return ordered
+
+
+def _xy_cut_sort(boxes: list[BBox], reverse_x: bool) -> list[BBox]:
+    """Recursively partition 2D comic layouts (including L-shape splits) via XY-Cut."""
+    if len(boxes) <= 1:
+        return list(boxes)
+
+    # 1) Try horizontal cut (separating top band from bottom band cleanly)
+    by_y = sorted(boxes, key=lambda b: ((b.y1 + b.y2) / 2.0, b.y1))
+    best_y_gap = float("-inf")
+    best_y_split = -1
+    for i in range(1, len(by_y)):
+        top_grp = by_y[:i]
+        bot_grp = by_y[i:]
+        top_bottom = max(b.y2 for b in top_grp)
+        bot_top = min(b.y1 for b in bot_grp)
+        max_top_cy = max((b.y1 + b.y2) / 2.0 for b in top_grp)
+        min_bot_cy = min((b.y1 + b.y2) / 2.0 for b in bot_grp)
+        if max_top_cy >= min_bot_cy:
+            continue
+        min_h = max(1, min(b.height for b in boxes))
+        overlap = top_bottom - bot_top
+        if overlap <= 0.22 * min_h:
+            gap = bot_top - top_bottom
+            if gap > best_y_gap:
+                best_y_gap = gap
+                best_y_split = i
+
+    if best_y_split > 0:
+        return _xy_cut_sort(by_y[:best_y_split], reverse_x) + _xy_cut_sort(
+            by_y[best_y_split:], reverse_x
+        )
+
+    # 2) Try vertical cut (handles tall vertical panel alongside stacked horizontal panels)
+    by_x = sorted(boxes, key=lambda b: ((b.x1 + b.x2) / 2.0, b.x1))
+    best_x_gap = float("-inf")
+    best_x_split = -1
+    for i in range(1, len(by_x)):
+        left_grp = by_x[:i]
+        right_grp = by_x[i:]
+        left_right = max(b.x2 for b in left_grp)
+        right_left = min(b.x1 for b in right_grp)
+        max_left_cx = max((b.x1 + b.x2) / 2.0 for b in left_grp)
+        min_right_cx = min((b.x1 + b.x2) / 2.0 for b in right_grp)
+        if max_left_cx >= min_right_cx:
+            continue
+        min_w = max(1, min(b.width for b in boxes))
+        overlap = left_right - right_left
+        if overlap <= 0.22 * min_w:
+            gap = right_left - left_right
+            if gap > best_x_gap:
+                best_x_gap = gap
+                best_x_split = i
+
+    if best_x_split > 0:
+        left_sorted = _xy_cut_sort(by_x[:best_x_split], reverse_x)
+        right_sorted = _xy_cut_sort(by_x[best_x_split:], reverse_x)
+        return (right_sorted + left_sorted) if reverse_x else (left_sorted + right_sorted)
+
+    return _row_cluster_sort(boxes, reverse_x)
+
+
+def sort_panels_reading_order(boxes: list[BBox], reading_order: str = "rtl") -> list[BBox]:
+    """Sort 2D manga/comic panel boxes into reading order using Recursive XY-Cut."""
+    if len(boxes) <= 1:
+        return list(boxes)
+    reverse_x = reading_order.lower() == "rtl"
+    return _xy_cut_sort(boxes, reverse_x=reverse_x)
 
 
 @DETECTOR_REGISTRY.register("manga_yolo")
@@ -254,29 +341,39 @@ class MangaYoloDetector:
 
         for idx, fb in enumerate(ordered_frames, start=1):
             panel_id = f"{page_id}_P{idx}"
-            crop = img[fb.y1 : fb.y2, fb.x1 : fb.x2]
+            raw_crop = img[fb.y1 : fb.y2, fb.x1 : fb.x2]
+            crop, trim_x0, trim_y0 = trim_white_border_with_offset(raw_crop)
             crop_path = panels_dir / f"{panel_id}.jpg"
             cv2.imwrite(str(crop_path), crop, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
 
-            pw = max(1, fb.width)
-            ph = max(1, fb.height)
+            adj_fb = BBox(
+                x1=fb.x1 + trim_x0,
+                y1=fb.y1 + trim_y0,
+                x2=fb.x1 + trim_x0 + crop.shape[1],
+                y2=fb.y1 + trim_y0 + crop.shape[0],
+            )
+            pw = max(1, crop.shape[1])
+            ph = max(1, crop.shape[0])
             focal_points: list[FocalPoint] = []
             for kind, cand, fscore in focal_candidates:
                 cx = (cand.x1 + cand.x2) / 2.0
                 cy = (cand.y1 + cand.y2) / 2.0
                 if fb.x1 <= cx <= fb.x2 and fb.y1 <= cy <= fb.y2:
-                    local_box = BBox(
-                        x1=max(0, cand.x1 - fb.x1),
-                        y1=max(0, cand.y1 - fb.y1),
-                        x2=min(pw, cand.x2 - fb.x1),
-                        y2=min(ph, cand.y2 - fb.y1),
-                    )
+                    lx1 = max(0, cand.x1 - adj_fb.x1)
+                    ly1 = max(0, cand.y1 - adj_fb.y1)
+                    lx2 = min(pw, cand.x2 - adj_fb.x1)
+                    ly2 = min(ph, cand.y2 - adj_fb.y1)
+                    if lx2 <= lx1 or ly2 <= ly1:
+                        continue
+                    local_box = BBox(x1=lx1, y1=ly1, x2=lx2, y2=ly2)
+                    shifted_cx = float(np.clip((cx - adj_fb.x1) / pw, 0.0, 1.0))
+                    shifted_cy = float(np.clip((cy - adj_fb.y1) / ph, 0.0, 1.0))
                     focal_points.append(
                         FocalPoint(
                             kind=kind,
                             bbox=local_box,
-                            norm_cx=(cx - fb.x1) / pw,
-                            norm_cy=(cy - fb.y1) / ph,
+                            norm_cx=shifted_cx,
+                            norm_cy=shifted_cy,
                             norm_w=local_box.width / pw,
                             norm_h=local_box.height / ph,
                             confidence=fscore,
@@ -290,7 +387,7 @@ class MangaYoloDetector:
                     page_id=page_id,
                     index_in_page=idx,
                     global_index=idx,
-                    bbox=fb,
+                    bbox=adj_fb,
                     width=pw,
                     height=ph,
                     crop_path=str(crop_path.resolve()),

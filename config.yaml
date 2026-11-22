@@ -12,8 +12,8 @@ project:
 llm:
   provider: aixingialaire               # Provider cho text LLM qua unified-llm-proxy (hỗ trợ gpt-6-luna, gpt-6.2-sol, claude-haiku-5-5, claude-sonnet-4-6)
   vision_provider: null                 # null = auto routing trên proxy (agy -> gemini-3.8-flash-medium-vision 200 OK)
-  default_model: gpt-6-luna             # Đã benchmark: gpt-6-luna / gpt-6.2-sol / claude-haiku-5-5 / claude-sonnet-4-6 đều 200 OK qua aixingialaire
-  fallback_model: gpt-6.2-sol           # Chuyển sang GPT 6.2 Sol (văn nói tiếng Việt mượt & nhanh) nếu model chính lỗi
+  default_model: gpt-6.2-sol            # Mặc định GPT 6.2 Sol (văn nói tiếng Việt mượt & nhanh)
+  fallback_model: gpt-6-luna            # Chuyển sang GPT 6 Luna nếu model chính lỗi
   vision_model: gemini-3.8-flash-medium-vision  # Model đọc trang manga Set-of-Mark + Cast Sheet
   temperature: 0.4
   max_tokens: 32768                     # Thả phanh theo trần model proxy để không cắt cụt JSON
@@ -34,13 +34,12 @@ cv:
 
 script:
   target_duration_min: 9.0              # Thời lượng mục tiêu cho 1 tập/job (phút)
-  pages_per_scene: 20                   # Số trang gom thành 1 Scene node trong PageIndex
+  pages_per_scene: 20                   # Số trang gom thành 1 Scene node mặc định (fallback khi tắt semantic segmentation)
   fast_path_max_pages: 30               # <= 30 trang: chạy 1-pass nhanh không cần chia hồi
-  full_context_max_tokens: 120000       # <= 120K tokens: nạp 100% text cả tập, chỉ chia output từng hồi
-  vision_batch_size: 4                  # Số trang mỗi request Vision (Chunked Rolling 3-4 trang/call)
+  vision_batch_size: 4                  # Số trang cơ sở mỗi request Vision (Adaptive Panel Batching ~16-18 panels/call)
   vision_max_workers: 4                 # 4 luồng Chunked Parallel Rolling (+ Pre-Pass cast_sheet)
   words_per_minute: 225                 # Khớp tốc độ đọc thực tế giọng VieNeu Ngọc Linh (~232 wpm)
-  polish_seams: false                   # false: giữ nguyên văn phong tự nhiên từ Scriptwriter (chỉ chạy Critic kiểm tra panel/gap/cliché bằng Python)
+  polish_seams: true                    # true: bật Read-Aloud Showrunner Pass & Closed-Loop Auto-Repair (khóa cứng panel_ids)
 
 tts:
   backend: vieneu                       # vieneu (local offline) | edge_tts (cloud)

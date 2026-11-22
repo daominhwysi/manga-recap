@@ -15,13 +15,14 @@ from src.schemas.ingestion import (
     PageInfo,
     PanelInfo,
 )
-from src.schemas.script import CriticIssue, CriticReport, RecapScript, ScriptBeat
+from src.schemas.script import VALID_MOODS, CriticIssue, CriticReport, RecapScript, ScriptBeat
 from src.schemas.timeline import (
     AudioBeatInfo,
     AudioManifest,
     SubtitleCue,
     TimelineShot,
     VideoTimeline,
+    WordTimestamp,
 )
 
 __all__ = [
@@ -44,5 +45,7 @@ __all__ = [
     "StoryBible",
     "SubtitleCue",
     "TimelineShot",
+    "VALID_MOODS",
     "VideoTimeline",
+    "WordTimestamp",
 ]

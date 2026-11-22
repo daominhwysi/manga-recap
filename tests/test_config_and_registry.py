@@ -13,10 +13,11 @@ from src.render.registry import RENDERER_REGISTRY
 
 def test_load_default_config() -> None:
     cfg = load_config(Path("config.yaml"))
-    assert cfg.llm.default_model == "gpt-6-luna"
+    assert cfg.llm.default_model == "gpt-6.2-sol"
+    assert cfg.llm.fallback_model == "gpt-6-luna"
     assert cfg.llm.provider == "aixingialaire"
     assert cfg.llm.vision_provider is None
-    assert cfg.script.polish_seams is False
+    assert cfg.script.polish_seams is True
     assert cfg.render.bgm_path == "assets/bgm/default_dark_fantasy.wav"
     assert cfg.render.audio_channels == 2
     assert cfg.project.jobs_dir == Path("jobs")

@@ -1,7 +1,8 @@
-"""Stage 5 Agent: Frame Choreographer mapping audio beats to smart camera shots, diptychs & subtitles."""
+"""Stage 5 Agent: Frame Choreographer with Word-Level Sync, Sub-Shot Pacing & Multi-Format Layouts."""
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from pathlib import Path
@@ -14,6 +15,7 @@ from src.schemas.timeline import (
     SubtitleCue,
     TimelineShot,
     VideoTimeline,
+    WordTimestamp,
 )
 
 
@@ -31,6 +33,55 @@ def _split_caption_chunks(text: str, max_words: int = 8) -> list[str]:
     if cur:
         chunks.append(" ".join(cur))
     return chunks
+
+
+def _chunk_timing_weight(chunk: str) -> float:
+    """Punctuation-aware duration weight when exact word boundaries are unavailable."""
+    base = float(max(2, len(chunk.strip())))
+    if re.search(r"[.!?…]$", chunk.strip()):
+        base += 6.0
+    elif re.search(r"[,;:]$", chunk.strip()):
+        base += 3.0
+    return base
+
+
+def _align_chunks_with_word_timestamps(
+    chunks: list[str],
+    word_ts: list[WordTimestamp],
+    beat_start: int,
+    spoken_end: int,
+) -> list[tuple[int, int, str]]:
+    """Map caption chunks cleanly onto pre-aligned word timestamps."""
+    if not chunks:
+        return []
+    if not word_ts:
+        total_wt = sum(_chunk_timing_weight(c) for c in chunks) or 1.0
+        cur_t = beat_start
+        spoken_span = max(300, spoken_end - beat_start)
+        aligned: list[tuple[int, int, str]] = []
+        for idx, ch in enumerate(chunks):
+            dur = (
+                (spoken_end - cur_t)
+                if idx == len(chunks) - 1
+                else int(round(spoken_span * _chunk_timing_weight(ch) / total_wt))
+            )
+            c_end = min(spoken_end, cur_t + max(200, dur))
+            aligned.append((cur_t, c_end, ch))
+            cur_t = c_end
+        return aligned
+
+    out: list[tuple[int, int, str]] = []
+    cursor = 0
+    n_ts = len(word_ts)
+    for idx, ch in enumerate(chunks):
+        n_words = max(1, len(ch.split()))
+        lo = min(cursor, n_ts - 1)
+        hi = n_ts - 1 if idx == len(chunks) - 1 else min(n_ts - 1, lo + n_words - 1)
+        s_ms = beat_start if idx == 0 else max(out[-1][1], word_ts[lo].start_ms)
+        e_ms = spoken_end if idx == len(chunks) - 1 else min(spoken_end, max(s_ms + 180, word_ts[hi].end_ms))
+        out.append((s_ms, e_ms, ch))
+        cursor = min(n_ts, hi + 1)
+    return out
 
 
 def _is_diptych_candidate(p1: PanelInfo, p2: PanelInfo, page_short: int = 1000) -> bool:
@@ -67,10 +118,19 @@ def _is_good_visual_panel(p: PanelInfo, page_short: int = 1000) -> bool:
 
 
 class ChoreographerAgent:
-    """Allocates panel shots, diptych pairs, aspect-aware camera motions, transitions, and subtitles."""
+    """Allocates panel shots, context-aware sub-shots, diptychs, camera motions, and synced subtitles."""
 
     def __init__(self, render_config: RenderConfig) -> None:
         self.cfg = render_config
+
+    def _resolved_canvas(self) -> tuple[int, int]:
+        w, h = int(self.cfg.width), int(self.cfg.height)
+        ratio = str(self.cfg.aspect_ratio).strip()
+        if ratio == "9:16" and w > h:
+            return h, w
+        if ratio == "16:9" and h > w:
+            return h, w
+        return w, h
 
     def choreograph(
         self,
@@ -85,6 +145,10 @@ class ChoreographerAgent:
         if tl_path.exists() and not force:
             return VideoTimeline.model_validate_json(tl_path.read_text(encoding="utf-8"))
 
+        canvas_w, canvas_h = self._resolved_canvas()
+        is_portrait_canvas = canvas_h > canvas_w
+        is_ltr = manifest.reading_order.lower() == "ltr"
+
         all_panels: list[PanelInfo] = [
             p
             for ch in manifest.chapters
@@ -96,8 +160,6 @@ class ChoreographerAgent:
         tree_file = job_dir / "repo" / "tree_index.json"
         if tree_file.exists():
             try:
-                import json
-
                 skipped_pages = set(json.loads(tree_file.read_text(encoding="utf-8")).get("skipped_pages", []))
             except Exception:
                 skipped_pages = set()
@@ -117,6 +179,7 @@ class ChoreographerAgent:
         max_shot_ms = self.cfg.max_shot_duration_ms
         used_panel_ids: set[str] = set()
         prev_section: str | None = None
+        prev_mood: str | None = None
 
         for b_idx, beat in enumerate(script.beats):
             ab = audio_by_beat.get(beat.beat_id)
@@ -126,34 +189,22 @@ class ChoreographerAgent:
             beat_end = ab.end_ms + ab.pause_after_ms
             beat_span = max(300, beat_end - beat_start)
 
-            # Subtitles split proportionally by character count
-            chunks = _split_caption_chunks(beat.narration_vi)
-            if chunks:
-                total_chars = sum(max(1, len(c)) for c in chunks)
-                cur_t = beat_start
-                spoken_span = max(300, ab.end_ms - ab.start_ms)
-                for c_idx, chunk in enumerate(chunks):
-                    c_dur = (
-                        (ab.end_ms - cur_t)
-                        if c_idx == len(chunks) - 1
-                        else int(spoken_span * len(chunk) / total_chars)
-                    )
-                    c_end = min(ab.end_ms, cur_t + max(200, c_dur))
-                    subtitles.append(
-                        SubtitleCue(
-                            index=sub_idx,
-                            start_ms=cur_t,
-                            end_ms=c_end,
-                            text=chunk,
-                        )
-                    )
-                    sub_idx += 1
-                    cur_t = c_end
+            # Word-timestamp-aware subtitle timing (with punctuation-weighted fallback)
+            chunks = _split_caption_chunks(
+                beat.narration_vi,
+                max_words=6 if is_portrait_canvas else 8,
+            )
+            for s_ms, e_ms, chunk in _align_chunks_with_word_timestamps(
+                chunks, ab.word_timestamps, beat_start, ab.end_ms
+            ):
+                subtitles.append(
+                    SubtitleCue(index=sub_idx, start_ms=s_ms, end_ms=e_ms, text=chunk)
+                )
+                sub_idx += 1
 
             # Deduplicate repeated panel_ids inside the same beat
             raw_pids = [pid for pid in beat.panel_ids if pid in panel_map]
             pids = list(dict.fromkeys(raw_pids))
-            # Drop low-quality empty slivers only if the beat still retains usable panels
             good_pids = [
                 pid
                 for pid in pids
@@ -163,7 +214,6 @@ class ChoreographerAgent:
             ]
             if good_pids:
                 pids = good_pids
-            # Avoid repeating the final panel of the preceding beat at the start of this beat
             if len(pids) > 1 and shots:
                 prev_shot_pids = {shots[-1].panel_id, shots[-1].secondary_panel_id} - {None}
                 dedup_cross = [pid for pid in pids if pid not in prev_shot_pids]
@@ -199,13 +249,14 @@ class ChoreographerAgent:
                     cursor += 1
                 pids.sort(key=lambda pid: panel_pos[pid])
 
-            # Group consecutive tall narrow panels into diptych pairs when enabled
+            # Group consecutive tall narrow panels into diptych pairs when on landscape canvas
             groups: list[tuple[PanelInfo, PanelInfo | None]] = []
             i = 0
             while i < len(pids):
                 p1 = panel_map[pids[i]]
                 if (
                     self.cfg.enable_diptych
+                    and not is_portrait_canvas
                     and i + 1 < len(pids)
                     and _is_diptych_candidate(
                         p1, panel_map[pids[i + 1]], page_short_map.get(p1.page_id, 1000)
@@ -218,7 +269,7 @@ class ChoreographerAgent:
                     groups.append((p1, None))
                     i += 1
 
-            # Allocate per-shot durations weighted proportionally by spoken sentence length
+            # Allocate per-group durations weighted by sentence length
             sentences = [
                 s.strip()
                 for s in re.split(r"(?<=[.!?…])\s+", beat.narration_vi.strip())
@@ -238,12 +289,35 @@ class ChoreographerAgent:
                 total_w = sum(clamped) or float(num_groups)
                 slot_durations = [max(300, int(round(beat_span * w / total_w))) for w in clamped]
             else:
-                slot_durations = [beat_span // num_groups] * num_groups
+                base_d = beat_span // num_groups
+                slot_durations = [base_d] * (num_groups - 1) + [beat_span - base_d * (num_groups - 1)]
+
+            # Context-aware 2-Subshot Splitting (Wide -> Focus Face) for long single-panel slots
+            shot_specs: list[tuple[PanelInfo, PanelInfo | None, int, str | None]] = []
+            for g_idx, (panel, sec_panel) in enumerate(groups):
+                sdur = slot_durations[g_idx]
+                aspect = panel.width / max(1, panel.height)
+                face_fp = next((fp for fp in panel.focal_points if fp.kind == "face"), None)
+                text_fp = next((fp for fp in panel.focal_points if fp.kind == "text"), None)
+                is_calm_spread = aspect > 1.35 and beat.mood in ("calm", "warm", "tragic")
+                if (
+                    sec_panel is None
+                    and sdur > int(max_shot_ms * 1.25)
+                    and not is_calm_spread
+                    and (face_fp is not None or text_fp is not None or sdur > int(max_shot_ms * 1.45))
+                ):
+                    t1 = max(900, int(round(sdur * 0.45)))
+                    t2 = max(900, sdur - t1)
+                    shot_specs.append((panel, None, t1, "wide"))
+                    shot_specs.append((panel, None, t2, "detail"))
+                else:
+                    shot_specs.append((panel, sec_panel, sdur, None))
 
             cur_shot_ms = beat_start
-            for s_idx, (panel, sec_panel) in enumerate(groups):
+            num_specs = len(shot_specs)
+            for s_idx, (panel, sec_panel, sdur, subshot_role) in enumerate(shot_specs):
                 s_start = cur_shot_ms
-                s_end = beat_end if s_idx == num_groups - 1 else min(beat_end, s_start + slot_durations[s_idx])
+                s_end = beat_end if s_idx == num_specs - 1 else min(beat_end, s_start + sdur)
                 cur_shot_ms = s_end
                 dur_sec = max(0.3, (s_end - s_start) / 1000.0)
                 delta = min(
@@ -253,28 +327,42 @@ class ChoreographerAgent:
 
                 aspect = panel.width / max(1, panel.height)
                 face_fp = next((fp for fp in panel.focal_points if fp.kind == "face"), None)
+                text_fp = next((fp for fp in panel.focal_points if fp.kind == "text"), None)
 
                 if sec_panel is not None:
                     fx, fy = 0.5, 0.5
                     move = "diptych"
                     z0, z1 = 1.0, round(1.0 + min(0.08, delta), 3)
+                elif subshot_role == "wide":
+                    fx, fy = 0.5, 0.45
+                    move = "zoom_in"
+                    z0, z1 = 1.0, round(1.0 + min(0.09, delta), 3)
+                elif subshot_role == "detail":
+                    target_fp = face_fp or text_fp
+                    if target_fp is not None:
+                        fx, fy = target_fp.norm_cx, target_fp.norm_cy
+                    else:
+                        fx, fy = 0.5, 0.38
+                    move = "focus_face"
+                    z0 = 1.08
+                    z1 = round(z0 + min(0.14, delta + self.cfg.face_zoom_bonus), 3)
+                elif beat.mood in ("action", "explosive") and (s_idx % 2 == 0 or num_specs == 1):
+                    fx, fy = (face_fp.norm_cx, face_fp.norm_cy) if face_fp else (0.5, 0.5)
+                    move = "shake_impact"
+                    z0, z1 = 1.04, round(1.04 + delta, 3)
                 elif aspect < 0.65:
                     fx, fy = 0.5, 0.5
                     move = "pan_down" if s_idx % 2 == 0 else "pan_up"
                     z0, z1 = 1.22, round(1.22 + min(0.05, delta * 0.4), 3)
                 elif aspect > 1.55:
                     fx, fy = 0.5, 0.5
-                    move = "pan_left"
+                    move = "pan_right" if is_ltr else "pan_left"
                     z0, z1 = 1.18, round(1.18 + min(0.05, delta * 0.4), 3)
                 elif face_fp:
                     fx, fy = face_fp.norm_cx, face_fp.norm_cy
                     move = "focus_face"
                     z0 = 1.02
                     z1 = round(z0 + delta + self.cfg.face_zoom_bonus, 3)
-                elif beat.mood in ("action", "explosive") and s_idx % 2 == 0:
-                    fx, fy = 0.5, 0.5
-                    move = "shake_impact"
-                    z0, z1 = 1.04, round(1.04 + delta, 3)
                 else:
                     fx, fy = 0.5, 0.45
                     move = "zoom_in" if s_idx % 2 == 0 else "zoom_out"
@@ -285,10 +373,14 @@ class ChoreographerAgent:
 
                 transition = "cut"
                 if self.cfg.enable_transitions and shots:
-                    if s_idx == 0:
+                    if subshot_role == "detail":
+                        transition = "crossfade"
+                    elif s_idx == 0:
                         if prev_section is not None and beat.section != prev_section:
                             transition = "fade_black"
-                        elif beat.mood in ("action", "shocking", "explosive", "horrific"):
+                        elif beat.mood in ("action", "explosive") or (
+                            prev_mood is not None and prev_mood != beat.mood and beat.mood in ("tense", "action")
+                        ):
                             transition = "flash_white"
                         else:
                             transition = "crossfade"
@@ -313,12 +405,14 @@ class ChoreographerAgent:
                     )
                 )
             prev_section = beat.section
+            prev_mood = beat.mood
 
         timeline = VideoTimeline(
             job_id=job_id,
-            width=self.cfg.width,
-            height=self.cfg.height,
+            width=canvas_w,
+            height=canvas_h,
             fps=self.cfg.fps,
+            reading_order=manifest.reading_order,
             total_duration_ms=audio_manifest.total_duration_ms,
             voiceover_path=audio_manifest.voiceover_path,
             bgm_path=self.cfg.bgm_path,

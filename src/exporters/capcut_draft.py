@@ -23,6 +23,7 @@ class CapCutDraftExporter:
 
         video_materials = []
         video_segments = []
+        diptych_segments = []
         for shot in timeline.shots:
             mat_id = str(uuid.uuid4())
             seg_id = str(uuid.uuid4())
@@ -46,6 +47,26 @@ class CapCutDraftExporter:
                     "source_timerange": {"start": 0, "duration": dur_us},
                 }
             )
+            if shot.secondary_panel_path:
+                sec_mat_id = str(uuid.uuid4())
+                video_materials.append(
+                    {
+                        "id": sec_mat_id,
+                        "type": "photo",
+                        "path": shot.secondary_panel_path,
+                        "material_name": shot.secondary_panel_id or f"{shot.panel_id}_2",
+                        "width": timeline.width,
+                        "height": timeline.height,
+                    }
+                )
+                diptych_segments.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "material_id": sec_mat_id,
+                        "target_timerange": {"start": start_us, "duration": dur_us},
+                        "source_timerange": {"start": 0, "duration": dur_us},
+                    }
+                )
 
         audio_id = str(uuid.uuid4())
         audio_materials = [
@@ -65,17 +86,68 @@ class CapCutDraftExporter:
                 "source_timerange": {"start": 0, "duration": timeline.total_duration_ms * 1000},
             }
         ]
+        if timeline.bgm_path:
+            bgm_id = str(uuid.uuid4())
+            audio_materials.append(
+                {
+                    "id": bgm_id,
+                    "type": "music",
+                    "path": timeline.bgm_path,
+                    "name": "bgm",
+                    "duration": timeline.total_duration_ms * 1000,
+                }
+            )
+            audio_segments.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "material_id": bgm_id,
+                    "target_timerange": {"start": 0, "duration": timeline.total_duration_ms * 1000},
+                    "source_timerange": {"start": 0, "duration": timeline.total_duration_ms * 1000},
+                }
+            )
+
+        text_materials = []
+        text_segments = []
+        for sub in timeline.subtitles:
+            tid = str(uuid.uuid4())
+            s_us = sub.start_ms * 1000
+            d_us = max(1000, (sub.end_ms - sub.start_ms) * 1000)
+            text_materials.append(
+                {
+                    "id": tid,
+                    "type": "subtitle",
+                    "content": sub.text,
+                }
+            )
+            text_segments.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "material_id": tid,
+                    "target_timerange": {"start": s_us, "duration": d_us},
+                    "source_timerange": {"start": 0, "duration": d_us},
+                }
+            )
+
+        tracks = [
+            {"id": str(uuid.uuid4()), "type": "video", "segments": video_segments},
+            {"id": str(uuid.uuid4()), "type": "audio", "segments": audio_segments},
+        ]
+        if diptych_segments:
+            tracks.append({"id": str(uuid.uuid4()), "type": "video", "segments": diptych_segments})
+        if text_segments:
+            tracks.append({"id": str(uuid.uuid4()), "type": "text", "segments": text_segments})
 
         draft_content = {
             "id": str(uuid.uuid4()),
             "name": timeline.job_id,
             "duration": timeline.total_duration_ms * 1000,
             "canvas_config": {"width": timeline.width, "height": timeline.height, "ratio": "custom"},
-            "materials": {"videos": video_materials, "audios": audio_materials},
-            "tracks": [
-                {"id": str(uuid.uuid4()), "type": "video", "segments": video_segments},
-                {"id": str(uuid.uuid4()), "type": "audio", "segments": audio_segments},
-            ],
+            "materials": {
+                "videos": video_materials,
+                "audios": audio_materials,
+                "texts": text_materials,
+            },
+            "tracks": tracks,
         }
         (draft_dir / "draft_content.json").write_text(
             json.dumps(draft_content, indent=2, ensure_ascii=False), encoding="utf-8"

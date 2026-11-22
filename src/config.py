@@ -21,8 +21,8 @@ class ProjectConfig(BaseModel):
 class LLMConfig(BaseModel):
     provider: str | None = None
     vision_provider: str | None = None
-    default_model: str = "gpt-6-luna"
-    fallback_model: str | None = "claude-sonnet-4-6"
+    default_model: str = "gpt-6.2-sol"
+    fallback_model: str | None = "gpt-6-luna"
     vision_model: str = "gemini-3.8-flash-low-vision"
     temperature: float = 0.4
     max_tokens: int = 32768
@@ -90,10 +90,11 @@ class DownloaderConfig(BaseModel):
 
 
 class ScriptConfig(BaseModel):
+    model_config = {"extra": "ignore"}
+
     target_duration_min: float = 9.0
     pages_per_scene: int = 20
     fast_path_max_pages: int = 30
-    full_context_max_tokens: int = 120000
     vision_batch_size: int = 4
     vision_max_workers: int = 4
     words_per_minute: int = 225

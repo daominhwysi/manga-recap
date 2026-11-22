@@ -422,3 +422,114 @@ def test_no_series_specific_overfitting_in_codebase() -> None:
                 assert not re.search(rf"\b{re.escape(kw)}\b", low), f"Series keyword {kw!r} found in {f}"
             for sub in forbidden_substrings:
                 assert sub not in low, f"Hardcoded substring {sub!r} found in {f}"
+
+
+def test_mood_contract_and_bidirectional_spread_and_early_skip(tmp_path: Path) -> None:
+    import cv2
+    import numpy as np
+
+    # 1) Free-form mood coercion into 7 canonical moods
+    assert ScriptBeat(beat_id="b1", narration_vi="x", mood="explosive").mood == "action"
+    assert ScriptBeat(beat_id="b2", narration_vi="x", mood="horrific").mood == "tense"
+    assert ScriptBeat(beat_id="b3", narration_vi="x", mood="desperate").mood == "tragic"
+    assert ScriptBeat(beat_id="b4", narration_vi="x", mood="playful").mood == "comedic"
+
+    # 2) Bidirectional spread detection: [P1, P2, Spread] order
+    manifest, _ = _make_dummy_manifest(6, panels_per_page=1)
+    pages = manifest.chapters[0].pages
+    for i, pg in enumerate(pages):
+        img_p = tmp_path / f"bi_{i+1}.jpg"
+        if i == 1:
+            cv2.imwrite(str(img_p), np.full((150, 100), 210, dtype=np.uint8))
+            pg.width, pg.height = 100, 150
+        elif i == 2:
+            cv2.imwrite(str(img_p), np.full((150, 100), 40, dtype=np.uint8))
+            pg.width, pg.height = 100, 150
+        elif i == 3:
+            spread = np.zeros((150, 200), dtype=np.uint8)
+            spread[:, :100] = 40
+            spread[:, 100:] = 210
+            cv2.imwrite(str(img_p), spread)
+            pg.width, pg.height = 200, 150
+        else:
+            cv2.imwrite(str(img_p), np.full((150, 100), (i * 30 + 20) % 255, dtype=np.uint8))
+            pg.width, pg.height = 100, 150
+        pg.source_path = str(img_p)
+
+    # PageAnalyzerAgent.run_all skips P1 & P2 deterministically before Vision calls
+    llm = LLMClient(LLMConfig(offline_fallback=True))
+    out = PageAnalyzerAgent(llm).run_all(manifest, tmp_path / "j_bi", max_workers=1)
+    assert "[PHỤ LỤC] Trang đơn cắt trùng" in out[1].page_summary
+    assert "[PHỤ LỤC] Trang đơn cắt trùng" in out[2].page_summary
+    assert "[PHỤ LỤC]" not in out[3].page_summary
+
+
+def test_full_alias_resolution_compact_md_and_closed_loop_critic(tmp_path: Path) -> None:
+    from src.agents.critic import _SeamPolishResponse, _SeamRewrite
+    from src.agents.page_index import _AliasResolutionResponse, _AliasRule, format_pages_compact_md
+
+    manifest, analyses = _make_dummy_manifest(12, panels_per_page=2)
+    analyses[0].verbatim_quote_vi = "Không đời nào ta bỏ cuộc!"
+    analyses[0].visual_punch = "Ánh mắt sắc lạnh dưới mũ trùm"
+    analyses[0].page_summary = "[Chưa rõ tên: người mặc áo choàng] bước vào."
+    analyses[0].panels[0].characters_present = ["[Chưa rõ tên: người mặc áo choàng]"]
+    analyses[0].panels[0].action_summary = "[Chưa rõ tên: người mặc áo choàng] rút kiếm."
+    analyses[6].page_summary = "Ken cười lớn."
+    analyses[6].panels[0].characters_present = ["Ken"]
+
+    compact = format_pages_compact_md(analyses[:1])
+    assert "⚡Thoại:" in compact and "👁️Hình:" in compact
+
+    llm = LLMClient(LLMConfig(api_key="dummy"))
+
+    def fake_alias(agent_name, system_prompt, user_prompt, schema_cls, **kw):
+        if schema_cls is _AliasResolutionResponse:
+            return _AliasResolutionResponse(
+                rules=[
+                    _AliasRule(
+                        raw_name="[Chưa rõ tên: người mặc áo choàng]",
+                        canonical_name="Arthur",
+                        page_ids=["ch01_p001"],
+                    )
+                ]
+            )
+        return schema_cls()
+
+    llm.complete_json = fake_alias  # type: ignore
+    resolved = PageIndexBuilder(llm)._resolve_character_aliases(analyses, tmp_path / "j_al")
+    assert "Arthur" in resolved[0].page_summary
+    assert "Arthur" in resolved[0].panels[0].action_summary
+
+    # Closed-Loop Critic Auto-Repair resolves clichés and locks panel_ids
+    _, bible = PageIndexBuilder(LLMClient(LLMConfig(offline_fallback=True))).build(
+        manifest, analyses, tmp_path / "j_cr"
+    )
+    bible.pronunciation_map = {"Arthur": "A thơ"}
+
+    distinct_texts = [
+        "Nhân vật chính mở cánh cửa gỗ cũ kỹ bước vào đại sảnh.",
+        "Cậu phát hiện chiếc đồng hồ quả quýt phát sáng trên bàn đá.",
+        "Chuyển sang phần mới, bánh răng định mệnh quay cuồng.",
+        "Cánh cửa mật thất đóng sầm khiến cả nhóm bị kẹt dưới hầm.",
+        "Đội hiệp sĩ hoàng gia lập tức bao vây khu rừng phía bắc.",
+        "Cả hai vội vã trèo qua tường thành để trốn khỏi cuộc truy đuổi.",
+    ]
+    beats = [
+        ScriptBeat(beat_id=f"b{i+1:03d}", narration_vi=distinct_texts[i], panel_ids=[f"ch01_p{i+1:03d}_P1"])
+        for i in range(6)
+    ]
+
+    llm_c = LLMClient(LLMConfig(api_key="dummy"))
+
+    def fake_polish(agent_name, system_prompt, user_prompt, schema_cls, **kw):
+        return _SeamPolishResponse(
+            rewrites=[_SeamRewrite(beat_id="b003", narration_vi="Arthur lập tức lao lên phá vỡ vòng vây.")]
+        )
+
+    llm_c.complete_json = fake_polish  # type: ignore
+    critic = CriticAgent(llm_c, polish_seams=True)
+    final_s, rep = critic.review(RecapScript(title_vi="T", beats=beats), manifest, bible, tmp_path / "j_cr")
+    assert rep.passed is True
+    assert not any(i.category == "style" for i in rep.issues)
+    assert final_s.beats[2].panel_ids == ["ch01_p003_P1"]
+    assert "A thơ" in final_s.beats[2].tts_text

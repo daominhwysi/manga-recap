@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from src.config import load_config
 from src.downloaders.nyaa import NyaaDownloader
@@ -24,6 +26,7 @@ def run(
     persona: Optional[str] = typer.Option(None, "--persona", "-p", help="Narration persona"),
     tts_backend: Optional[str] = typer.Option(None, "--tts", help="Override TTS backend (edge_tts, vieneu)"),
     max_pages: Optional[int] = typer.Option(None, "--max-pages", help="Limit pages per chapter"),
+    prev_job: Optional[Path] = typer.Option(None, "--prev-job", help="Optional previous volume job dir for cast continuity"),
     force: bool = typer.Option(False, "--force", "-f", help="Ignore cached checkpoints"),
     skip_render: bool = typer.Option(False, "--skip-render", help="Run stages 1-5 + exporters without MP4 render"),
 ) -> None:
@@ -42,8 +45,73 @@ def run(
         persona=persona,
         force=force,
         skip_render=skip_render,
+        prev_job_dir=prev_job,
     )
     console.print(f"[bold green]Done![/] Output: {result}")
+
+
+@app.command()
+def inspect(
+    job_dir: Path = typer.Argument(..., help="Path to a job directory under jobs/"),
+) -> None:
+    """Inspect telemetry, LLM tokens, script metrics, and Critic report for a job."""
+    if not job_dir.exists():
+        console.print(f"[bold red]Not found:[/] {job_dir}")
+        raise typer.Exit(code=1)
+
+    tel_path = job_dir / "telemetry.json"
+    if tel_path.exists():
+        tel = json.loads(tel_path.read_text(encoding="utf-8"))
+        console.print(
+            f"[bold cyan]Job:[/] {tel.get('job_id')} | default={tel.get('config_default_model')} | "
+            f"vision={tel.get('config_vision_model')} | total={tel.get('total_duration_sec', 0):.2f}s"
+        )
+        t_stage = Table(title="Pipeline Stages")
+        t_stage.add_column("Stage")
+        t_stage.add_column("Duration (s)", justify="right")
+        t_stage.add_column("Details")
+        for st in tel.get("stages", []):
+            t_stage.add_row(st.get("stage", ""), str(st.get("duration_sec", 0)), json.dumps(st.get("details", {}), ensure_ascii=False))
+        console.print(t_stage)
+
+        calls = tel.get("llm_calls", [])
+        if calls:
+            by_agent: dict[str, list[int]] = {}
+            for c in calls:
+                ag = c.get("agent", "unknown")
+                agg = by_agent.setdefault(ag, [0, 0, 0])
+                agg[0] += 1
+                agg[1] += int(c.get("prompt_tokens", 0) or 0)
+                agg[2] += int(c.get("completion_tokens", 0) or 0)
+            t_tok = Table(title="LLM Token Usage")
+            t_tok.add_column("Agent")
+            t_tok.add_column("Calls", justify="right")
+            t_tok.add_column("Prompt", justify="right")
+            t_tok.add_column("Completion", justify="right")
+            t_tok.add_column("Total", justify="right")
+            tot_p = tot_c = 0
+            for ag, (cnt, p_tok, c_tok) in by_agent.items():
+                tot_p += p_tok
+                tot_c += c_tok
+                t_tok.add_row(ag, str(cnt), str(p_tok), str(c_tok), str(p_tok + c_tok))
+            t_tok.add_row("[bold]TOTAL[/]", str(len(calls)), str(tot_p), str(tot_c), str(tot_p + tot_c))
+            console.print(t_tok)
+
+    script_path = job_dir / "03b_script_final.json"
+    if script_path.exists():
+        sc = json.loads(script_path.read_text(encoding="utf-8"))
+        beats = sc.get("beats", [])
+        wc = sum(len(b.get("narration_vi", "").split()) for b in beats)
+        console.print(
+            f"[bold green]Script:[/] hook={sc.get('hook_strategy', '?')} | beats={len(beats)} | words={wc}"
+        )
+
+    rep_path = job_dir / "03b_critic_report.json"
+    if rep_path.exists():
+        rep = json.loads(rep_path.read_text(encoding="utf-8"))
+        console.print(
+            f"[bold yellow]Critic:[/] passed={rep.get('passed')} | score={rep.get('score')} | issues={len(rep.get('issues', []))}"
+        )
 
 
 @app.command()

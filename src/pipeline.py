@@ -34,6 +34,7 @@ class MangaRecapPipeline:
         persona: str | None = None,
         force: bool = False,
         skip_render: bool = False,
+        prev_job_dir: Path | None = None,
     ) -> Path:
         job_dir = self.config.project.jobs_dir / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -68,17 +69,24 @@ class MangaRecapPipeline:
                 force=force,
                 max_workers=self.config.script.vision_max_workers,
                 batch_size=self.config.script.vision_batch_size,
+                prev_job_dir=prev_job_dir,
             )
             index_builder = PageIndexBuilder(
                 llm, pages_per_scene=self.config.script.pages_per_scene
             )
-            tree, bible = index_builder.build(manifest, page_analyses, job_dir, force=force)
+            tree, bible = index_builder.build(
+                manifest,
+                page_analyses,
+                job_dir,
+                force=force,
+                prev_job_dir=prev_job_dir,
+            )
             d["pages"] = len(page_analyses)
             d["scenes"] = tree.total_scenes
             d["tree_tiers"] = tree.tiers
             d["characters"] = len(bible.characters)
 
-        # Stage 3: 3-Tier Scriptwriter & Critic
+        # Stage 3: Scriptwriter & Closed-Loop Critic
         with telemetry.stage("stage3_script_and_critic") as d:
             writer = ScriptwriterAgent(llm, script_config=self.config.script)
             draft = writer.write_script(
@@ -90,9 +98,18 @@ class MangaRecapPipeline:
                 force=force,
             )
             critic = CriticAgent(llm, polish_seams=self.config.script.polish_seams)
-            final_script, report = critic.review(draft, manifest, bible, job_dir, force=force)
+            final_script, report = critic.review(
+                draft,
+                manifest,
+                bible,
+                job_dir,
+                force=force,
+                script_config=self.config.script,
+                page_analyses=page_analyses,
+            )
             d["beats"] = len(final_script.beats)
             d["critic_issues"] = len(report.issues)
+            d["critic_score"] = report.score
 
         # Stage 4: TTS Audio
         with telemetry.stage("stage4_tts_audio") as d:
@@ -138,6 +155,7 @@ class MangaRecapPipeline:
                     bottom_safe_ratio=self.config.render.bottom_safe_ratio,
                     bgm_volume=self.config.render.bgm_volume,
                     bgm_ducking=self.config.render.bgm_ducking,
+                    subtitle_font_ratio=self.config.render.subtitle_font_ratio,
                 )
                 renderer.render(timeline, output_mp4, subtitles_path=srt_path)
                 d["renderer"] = self.config.render.backend

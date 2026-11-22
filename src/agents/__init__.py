@@ -5,7 +5,6 @@ from src.agents.critic import CriticAgent
 from src.agents.page_analyzer import PageAnalyzerAgent
 from src.agents.page_index import PageIndexBuilder, PageIndexTree
 from src.agents.scriptwriter import ScriptwriterAgent
-from src.agents.story_bible import StoryBibleAgent
 
 __all__ = [
     "ChoreographerAgent",
@@ -14,5 +13,4 @@ __all__ = [
     "PageIndexBuilder",
     "PageIndexTree",
     "ScriptwriterAgent",
-    "StoryBibleAgent",
 ]

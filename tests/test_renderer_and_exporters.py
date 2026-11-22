@@ -66,9 +66,12 @@ def test_render_mp4_with_stereo_audio_and_exporters(tmp_path: Path) -> None:
     draft = CapCutDraftExporter().export(timeline, tmp_path)
     assert (draft / "draft_content.json").exists()
     data = json.loads((draft / "draft_content.json").read_text(encoding="utf-8"))
-    assert len(data["tracks"]) == 2
+    assert len(data["tracks"]) >= 2
+    assert any(t["type"] == "text" for t in data["tracks"])
     html = HtmlPreviewExporter().export(timeline, tmp_path)
     assert html.exists()
+    html_txt = html.read_text(encoding="utf-8")
+    assert "<audio" in html_txt and "<img" in html_txt
 
 
 def test_diptych_transitions_and_ducked_bgm_render(tmp_path: Path) -> None:
@@ -237,3 +240,66 @@ def test_choreographer_same_page_diptych_and_no_cross_page_borrow(tmp_path: Path
     used_panels = {s.panel_id for s in tl.shots} | {s.secondary_panel_id for s in tl.shots if s.secondary_panel_id}
     assert "ch01_p002_P1" not in used_panels
     assert "ch01_p001_P2" in used_panels
+
+
+def test_subshot_splitting_and_vertical_subtitle_wrap(tmp_path: Path) -> None:
+    from src.agents.choreographer import ChoreographerAgent
+    from src.config import RenderConfig
+    from src.render.subtitles import draw_subtitle_overlay
+    from src.schemas.ingestion import BBox, ChapterInfo, FocalPoint, JobManifest, PageInfo, PanelInfo
+    from src.schemas.script import RecapScript, ScriptBeat
+    from src.schemas.timeline import AudioBeatInfo, AudioManifest
+
+    # 1) Vertical 9:16 canvas wraps long Vietnamese captions cleanly without clipping
+    portrait_frame = np.zeros((1280, 720, 3), dtype=np.uint8)
+    out = draw_subtitle_overlay(
+        portrait_frame,
+        "Một câu phụ đề tiếng Việt rất dài cần tự động ngắt xuống hai dòng trên màn hình dọc",
+        font_ratio=0.036,
+    )
+    assert out.shape == (1280, 720, 3) and out.sum() > 0
+
+    # 2) Long single-panel action slot splits into 2 subshots (Wide -> Focus Face)
+    p = PanelInfo(
+        panel_id="ch01_p001_P1",
+        chapter_id="ch01",
+        page_id="ch01_p001",
+        index_in_page=1,
+        global_index=1,
+        bbox=BBox(x1=0, y1=0, x2=400, y2=400),
+        width=400,
+        height=400,
+        crop_path="p1.jpg",
+        focal_points=[
+            FocalPoint(
+                kind="face", bbox=BBox(x1=150, y1=80, x2=250, y2=180),
+                norm_cx=0.5, norm_cy=0.32, norm_w=0.25, norm_h=0.25, confidence=0.95,
+            )
+        ],
+    )
+    manifest = JobManifest(
+        job_id="j_sub",
+        input_path="in",
+        reading_order="ltr",
+        chapters=[
+            ChapterInfo(
+                chapter_id="ch01", title="ch01",
+                pages=[PageInfo(page_id="ch01_p001", chapter_id="ch01", page_index=1, source_path="p1.jpg", width=400, height=600, panels=[p])],
+            )
+        ],
+    )
+    script = RecapScript(
+        title_vi="Subshot",
+        beats=[ScriptBeat(beat_id="b001", narration_vi="Câu rất dài kể chi tiết pha đối đầu nghẹt thở.", panel_ids=["ch01_p001_P1"], mood="action")],
+    )
+    audio = AudioManifest(
+        backend="edge_tts", voice="v", total_duration_ms=6000, voiceover_path="vo.wav",
+        beats=[AudioBeatInfo(beat_id="b001", audio_path="b1.wav", start_ms=0, end_ms=5800, duration_ms=5800, pause_after_ms=200)],
+    )
+    cfg = RenderConfig(aspect_ratio="9:16", max_shot_duration_ms=3500)
+    tl = ChoreographerAgent(cfg).choreograph("j_sub", manifest, script, audio, tmp_path)
+    assert tl.width == 720 and tl.height == 1280
+    assert tl.reading_order == "ltr"
+    assert len(tl.shots) == 2
+    assert tl.shots[0].camera_move == "zoom_in"
+    assert tl.shots[1].camera_move == "focus_face"

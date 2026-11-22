@@ -122,7 +122,9 @@ class LLMClient:
         else:
             user_content = user_prompt
 
-        schema_hint = json.dumps(schema_cls.model_json_schema(), ensure_ascii=False)
+        schema_hint = json.dumps(
+            schema_cls.model_json_schema(), ensure_ascii=False, separators=(",", ":")
+        )
         full_system_prompt = (
             f"{system_prompt}\n\n"
             "BẮT BUỘC trả về JSON hợp lệ khớp chính xác JSON Schema sau (chỉ trả về JSON, không thêm giải thích):\n"

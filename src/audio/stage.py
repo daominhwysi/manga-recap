@@ -1,15 +1,21 @@
-"""Stage 4 orchestrator: synthesize per-beat voiceovers and stitch master WAV."""
+"""Stage 4 orchestrator: synthesize per-beat voiceovers (with pronunciation normalization) and stitch master WAV."""
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from src.audio.base import beat_cache_key, concat_beat_wavs, get_wav_duration_ms
+from src.audio.base import (
+    beat_cache_key,
+    concat_beat_wavs,
+    estimate_word_timestamps_from_wav,
+    get_wav_duration_ms,
+)
 from src.audio.edge_tts_backend import EdgeTTSBackend  # noqa: F401
 from src.audio.registry import TTS_REGISTRY
 from src.audio.vieneu_tts import VieNeuTTSBackend  # noqa: F401
 from src.config import TTSConfig
-from src.schemas.script import RecapScript
+from src.schemas.script import RecapScript, ScriptBeat
 from src.schemas.timeline import AudioBeatInfo, AudioManifest
 
 
@@ -27,38 +33,57 @@ def run_stage4_audio(
 
     backend_name = tts_config.backend
     voice = tts_config.vieneu_voice if backend_name == "vieneu" else tts_config.voice
-    backend = TTS_REGISTRY.create(
-        backend_name,
-        default_voice=voice,
-        sample_rate=tts_config.sample_rate,
-    )
+    backend_kwargs: dict = {
+        "default_voice": voice,
+        "sample_rate": tts_config.sample_rate,
+    }
+    if backend_name == "vieneu":
+        backend_kwargs["fallback_edge_voice"] = tts_config.voice
+    backend = TTS_REGISTRY.create(backend_name, **backend_kwargs)
 
     beats_dir = job_dir / "audio" / "beats"
     beats_dir.mkdir(parents=True, exist_ok=True)
-    beat_infos: list[AudioBeatInfo] = []
 
-    for beat in script.beats:
-        wav_name = beat_cache_key(beat.beat_id, beat.narration_vi, voice, backend_name)
+    def _synth_one(beat: ScriptBeat) -> AudioBeatInfo:
+        spoken_text = beat.tts_text.strip() or beat.narration_vi
+        wav_name = beat_cache_key(
+            beat.beat_id,
+            spoken_text,
+            voice,
+            backend_name,
+            rate=tts_config.rate,
+        )
         wav_path = beats_dir / wav_name
         if wav_path.exists() and not force:
             dur_ms = get_wav_duration_ms(wav_path)
-            info = AudioBeatInfo(
+            word_ts = estimate_word_timestamps_from_wav(wav_path, beat.narration_vi)
+            return AudioBeatInfo(
                 beat_id=beat.beat_id,
                 audio_path=str(wav_path.resolve()),
                 duration_ms=dur_ms,
                 pause_after_ms=beat.pause_after_ms,
                 sample_rate=tts_config.sample_rate,
+                word_timestamps=word_ts,
             )
-        else:
-            info = backend.synthesize(
-                text=beat.narration_vi,
-                output_path=wav_path,
-                voice=voice,
-                rate=tts_config.rate,
-            )
-            info.beat_id = beat.beat_id
-            info.pause_after_ms = beat.pause_after_ms
-        beat_infos.append(info)
+
+        info = backend.synthesize(
+            text=spoken_text,
+            output_path=wav_path,
+            voice=voice,
+            rate=tts_config.rate,
+        )
+        # Re-align timestamps against display narration_vi so subtitles match exact words
+        info.word_timestamps = estimate_word_timestamps_from_wav(wav_path, beat.narration_vi)
+        info.beat_id = beat.beat_id
+        info.pause_after_ms = beat.pause_after_ms
+        return info
+
+    # Parallelize cloud Edge-TTS safely; keep local ONNX VieNeu sequential to avoid thread contention
+    if backend_name == "edge_tts" and len(script.beats) > 1:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            beat_infos = list(pool.map(_synth_one, script.beats))
+    else:
+        beat_infos = [_synth_one(beat) for beat in script.beats]
 
     total_ms, timed_beats = concat_beat_wavs(
         beat_infos,

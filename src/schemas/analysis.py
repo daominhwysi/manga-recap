@@ -20,6 +20,8 @@ class PageAnalysis(BaseModel):
     page_id: str
     chapter_id: str
     page_summary: str
+    verbatim_quote_vi: str = ""
+    visual_punch: str = ""
     panels: list[PanelAnalysis] = Field(default_factory=list)
 
 
@@ -68,6 +70,7 @@ class StoryBible(BaseModel):
     characters: list[CharacterProfile] = Field(default_factory=list)
     chapter_summaries: list[ChapterSummary] = Field(default_factory=list)
     ongoing_plot_threads: list[str] = Field(default_factory=list)
+    pronunciation_map: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -85,4 +88,16 @@ class StoryBible(BaseModel):
                 else:
                     threads.append(str(item))
             d["ongoing_plot_threads"] = threads
+        raw_pmap = d.get("pronunciation_map")
+        if isinstance(raw_pmap, list):
+            coerced_map: dict[str, str] = {}
+            for item in raw_pmap:
+                if isinstance(item, dict):
+                    term = str(item.get("term") or item.get("word") or item.get("raw") or "").strip()
+                    spoken = str(item.get("spoken") or item.get("phonetic") or item.get("pronunciation") or "").strip()
+                    if term and spoken:
+                        coerced_map[term] = spoken
+            d["pronunciation_map"] = coerced_map
+        elif raw_pmap is None:
+            d["pronunciation_map"] = {}
         return d

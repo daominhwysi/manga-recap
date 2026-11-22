@@ -38,7 +38,7 @@ def run_stage1_ingest(
         conf_thresh=cv_config.confidence_threshold,
         iou_thresh=cv_config.iou_threshold,
     )
-    manhwa_slicer = ManhwaStripSlicer()
+    manhwa_slicer = ManhwaStripSlicer(yolo_detector=manga_detector)
 
     panels_dir = job_dir / "panels"
     som_dir = job_dir / "som"

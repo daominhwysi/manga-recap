@@ -1,4 +1,4 @@
-"""Stage 3a Agent: 3-tier Narrative Scriptwriter (Fast Path / Multi-Part + Clean Context & Handoff)."""
+"""Stage 3a Agent: Narrative Scriptwriter (Fast Path / Disjoint Multi-Part PageIndex)."""
 
 from __future__ import annotations
 
@@ -9,11 +9,16 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from src.agents.page_index import PageIndexTree, format_pages_compact_md, render_memory_md
+from src.agents.page_index import (
+    PageIndexTree,
+    format_pages_compact_md,
+    render_memory_md,
+    render_scoped_memory_md,
+)
 from src.config import ScriptConfig, load_personas
 from src.llm.client import LLMClient
 from src.schemas.analysis import PageAnalysis, StoryBible
-from src.schemas.script import RecapScript, ScriptBeat
+from src.schemas.script import VALID_MOODS, RecapScript, ScriptBeat
 
 
 def _panel_to_page_id(panel_id: str) -> str:
@@ -23,12 +28,12 @@ def _panel_to_page_id(panel_id: str) -> str:
 def _collect_part_panels(
     tree: PageIndexTree,
     scene_ids: list[str],
-    handoff_panels: list[str],
+    handoff_panels: list[str] | None = None,
 ) -> tuple[list[str], str, str]:
     """Collect ordered allowed panel_ids and page range for a part."""
-    ordered: list[str] = list(handoff_panels)
+    ordered: list[str] = list(handoff_panels or [])
     seen = set(ordered)
-    pages: list[str] = [_panel_to_page_id(p) for p in handoff_panels]
+    pages: list[str] = [_panel_to_page_id(p) for p in ordered]
     for sid in scene_ids:
         sc = tree.get_scene(sid)
         if not sc:
@@ -56,6 +61,7 @@ class OutlinePart(BaseModel):
 
 class ScriptOutline(BaseModel):
     title_vi: str
+    hook_strategy: str = "in_medias_res"  # in_medias_res | montage_tease | world_premise
     hook_summary: str
     parts: list[OutlinePart] = Field(default_factory=list)
 
@@ -67,10 +73,9 @@ class PartScriptResponse(BaseModel):
 
 
 class ScriptwriterAgent:
-    """3-tier Scriptwriter:
+    """2-mode Scriptwriter:
     1) <= fast_path_max_pages: Single-shot full context.
-    2) <= full_context_max_tokens: Full Tree Index + Clean Scoped Scene Context + Handoff.
-    3) > full_context_max_tokens: PageIndex Tree + Rolling Window + JSON Lookup.
+    2) > fast_path_max_pages: Disjoint 1-Scene-per-Part PageIndex with O(N) Scoped Window & Affordances.
     """
 
     def __init__(self, llm: LLMClient, script_config: ScriptConfig | None = None) -> None:
@@ -97,35 +102,56 @@ class ScriptwriterAgent:
         if outline_path.exists() and not force:
             return ScriptOutline.model_validate_json(outline_path.read_text(encoding="utf-8"))
 
+        p_cfg = self.personas.get(persona, {})
+        avg_words_per_beat = min(38, max(26, int(p_cfg.get("max_words_per_beat", 42) or 42)))
         total_words = max(400, int(round(self.cfg.target_duration_min * self.cfg.words_per_minute)))
-        total_target_beats = max(8, round(total_words / 36))
+        total_target_beats = max(8, round(total_words / avg_words_per_beat))
 
-        # Build strictly disjoint 1-scene-per-part groups (merge trailing mini-scene < 5 pages)
+        # Build strictly disjoint scene groups (merge trailing mini-scene < 5 pages)
         scene_groups: list[list] = [[sc] for sc in tree.scenes]
         if len(scene_groups) > 1 and len(scene_groups[-1][0].page_ids) < 5:
             scene_groups[-2].extend(scene_groups.pop())
         num_parts = max(1, len(scene_groups))
 
-        total_pages = max(1, sum(len(sc.page_ids) for grp in scene_groups for sc in grp))
-        part_budgets: list[tuple[int, int]] = []
+        # Allocate beats & words by narrative_weight * pages so climaxes breathe and setup stays brisk
+        raw_weights: list[float] = []
         for grp in scene_groups:
-            grp_pages = sum(len(sc.page_ids) for sc in grp)
-            ratio = grp_pages / total_pages
-            t_beats = max(4, min(14, round(total_target_beats * ratio))) if len(scene_groups) > 1 else total_target_beats
-            t_words = max(140, round(total_words * ratio)) if len(scene_groups) > 1 else total_words
-            part_budgets.append((t_beats, t_words))
+            grp_pages = max(1, sum(len(sc.page_ids) for sc in grp))
+            avg_nw = sum(getattr(sc, "narrative_weight", 3) for sc in grp) / max(1, len(grp))
+            raw_weights.append(grp_pages * (0.68 + 0.13 * avg_nw))
+        weight_sum = sum(raw_weights) or 1.0
+
+        part_budgets: list[tuple[int, int]] = []
+        if len(scene_groups) == 1:
+            part_budgets.append((total_target_beats, total_words))
+        else:
+            words_list = [max(110, round(total_words * (w / weight_sum))) for w in raw_weights]
+            # Normalize exact total sum so overall duration matches config.yaml target
+            diff_w = total_words - sum(words_list)
+            if diff_w != 0:
+                best_i = max(range(len(raw_weights)), key=lambda i: raw_weights[i])
+                words_list[best_i] = max(110, words_list[best_i] + diff_w)
+            beats_list = [
+                max(3, min(14, round(w_cnt / avg_words_per_beat)))
+                for w_cnt in words_list
+            ]
+            part_budgets = list(zip(beats_list, words_list))
 
         user_prompt = (
             f"Persona: {persona}\n"
             f"Mục tiêu tổng thời lượng video: ~{self.cfg.target_duration_min:.1f} phút "
-            f"(khoảng {total_words} từ tiếng Việt với tốc độ đọc {self.cfg.words_per_minute} wpm, chia thành {num_parts} hồi nối tiếp KHÔNG chồng lặp scene).\n\n"
+            f"(~{total_words} từ tiếng Việt với tốc độ {self.cfg.words_per_minute} wpm, chia thành {num_parts} hồi nối tiếp KHÔNG chồng lặp scene).\n\n"
             f"{memory_md}\n\n"
             f"{tree.compact_outline_view()}\n\n"
-            "QUY TẮC LẬP DÀN Ý BẮT BUỘC:\n"
-            "1) Phân bổ TOÀN BỘ các scene từ đầu đến cuối tập vào `parts` theo đúng 1 scene trọng tâm mỗi hồi, KHÔNG chồng lặp scene và KHÔNG tự bịa scene_id không tồn tại.\n"
-            "2) `required_callbacks` CHỈ chứa các `scene_id` cụ thể thực sự có trong Tree Index cần đối chiếu; KHÔNG viết câu chữ tự do vào trường này.\n"
-            "3) Ghi rõ trong `focus_notes` điểm bắt đầu và điểm kết thúc của scene để người viết bám sát, không nhảy cóc hay lặp lại hồi trước.\n"
-            "Hãy lập ScriptOutline dạng JSON: title_vi, hook_summary, và danh sách `parts` "
+            "QUY TẮC LẬP DÀN Ý & CHỌN HOOK BẮT BUỘC:\n"
+            "1) Chọn `hook_strategy` phù hợp nhất với mở đầu tập truyện:\n"
+            "   - 'in_medias_res': vào thẳng truyện nếu cảnh mở đầu đã kịch tính sẵn.\n"
+            "   - 'world_premise': giải thích ngắn bối cảnh/luật thế giới trước khi vào cảnh đầu.\n"
+            "   - 'montage_tease': dựng 1 câu hỏi trung tâm khơi tò mò từ 3-4 khung đắt giá trước khi quay lại từ đầu.\n"
+            "2) Phân bổ TOÀN BỘ các scene từ đầu đến cuối tập vào `parts` theo đúng danh sách gợi ý, KHÔNG chồng lặp scene.\n"
+            "3) `required_callbacks` CHỈ chứa tối đa 1-2 `scene_id` xa thực sự cần đối chiếu (KHÔNG cần thêm scene ngay liền trước vì hệ thống tự cấp cầu nối 2 trang cuối).\n"
+            "4) Ghi rõ `focus_notes` điểm bắt đầu và điểm kết thúc của scene để giữ mạch truyện mượt.\n"
+            "Hãy lập ScriptOutline dạng JSON: title_vi, hook_strategy, hook_summary, và `parts` "
             "(part_id='part_01'.., title, section='hook/setup/rising/climax/cliffhanger', "
             "scene_ids, required_callbacks, target_beats, target_words, focus_notes)."
         )
@@ -133,21 +159,36 @@ class ScriptwriterAgent:
             agent_name="OutlinePlannerAgent",
             system_prompt=(
                 "Bạn là đạo diễn biên kịch YouTube review manga. Hãy phân bổ toàn bộ các scene từ đầu đến cuối tập "
-                "thành mạch truyện liền lạc theo đúng thứ tự thời gian, không bỏ sót chuyển cảnh giữa các scene hay đoạn kết."
+                "thành mạch truyện liền lạc theo đúng thứ tự thời gian, chọn chiến lược mở đầu (hook_strategy) phù hợp tác phẩm."
             ),
             user_prompt=user_prompt,
             schema_cls=ScriptOutline,
         )
 
-        # Normalize parts deterministically to disjoint scene_groups & balanced beat budgets
+        # Normalize parts deterministically to disjoint scene_groups & narrative-weighted budgets
         valid_scene_ids = {sc.node_id for sc in tree.scenes}
         normalized_parts: list[OutlinePart] = []
         for idx, grp in enumerate(scene_groups):
             grp_sids = [sc.node_id for sc in grp]
             t_beats, t_words = part_budgets[idx]
             src_part = outline.parts[idx] if idx < len(outline.parts) else None
-            default_sec = "hook" if idx == 0 else ("cliffhanger" if idx == len(scene_groups) - 1 else "rising")
+            avg_nw = sum(getattr(sc, "narrative_weight", 3) for sc in grp) / max(1, len(grp))
+            if idx == 0:
+                default_sec = "hook"
+            elif idx == len(scene_groups) - 1:
+                default_sec = "cliffhanger"
+            elif avg_nw >= 4.0:
+                default_sec = "climax"
+            elif idx == 1 and len(scene_groups) >= 4:
+                default_sec = "setup"
+            else:
+                default_sec = "rising"
+
             if src_part is not None:
+                # Only allow cliffhanger on final part; avoid mislabeling middle parts as cliffhanger
+                chosen_sec = src_part.section or default_sec
+                if chosen_sec == "cliffhanger" and idx < len(scene_groups) - 1:
+                    chosen_sec = default_sec
                 cb_clean = [
                     cid for cid in src_part.required_callbacks if cid in valid_scene_ids and cid not in grp_sids
                 ][:2]
@@ -155,7 +196,7 @@ class ScriptwriterAgent:
                     OutlinePart(
                         part_id=f"part_{idx + 1:02d}",
                         title=src_part.title or grp[0].title,
-                        section=src_part.section or default_sec,
+                        section=chosen_sec,
                         scene_ids=grp_sids,
                         required_callbacks=cb_clean,
                         target_beats=t_beats,
@@ -185,64 +226,79 @@ class ScriptwriterAgent:
         part_idx: int,
         total_parts: int,
         system_prompt: str,
-        memory_md: str,
+        bible: StoryBible,
         tree: PageIndexTree,
         prev_tail: list[ScriptBeat],
         panel_images: dict[str, Path],
-        handoff_text: str = "",
-        handoff_panels: list[str] | None = None,
-        last_covered_page: str | None = None,
+        prev_scene_id: str | None = None,
+        hook_strategy: str = "in_medias_res",
     ) -> list[ScriptBeat]:
         tail_txt = (
-            json.dumps([b.model_dump() for b in prev_tail], ensure_ascii=False)
+            json.dumps(
+                [
+                    {"beat_id": b.beat_id, "section": b.section, "narration_vi": b.narration_vi}
+                    for b in prev_tail
+                ],
+                ensure_ascii=False,
+            )
             if prev_tail
-            else "Chưa có (đây là phần mở đầu video — cần hook thật cuốn bằng văn nói tự nhiên)."
+            else f"Chưa có (mở đầu video với hook_strategy='{hook_strategy}')."
         )
 
-        # Clean scoped context: Global Tree Index + Current Scenes + Uncovered Handoff + Explicit Callbacks
-        handoff_pids = handoff_panels or []
-        allowed_panels, first_pg, last_pg = _collect_part_panels(tree, part.scene_ids, handoff_pids)
+        # O(N) Scoped Memory & Tree Index (window=1) ordered with static context first for prefix caching
+        scoped_memory = render_scoped_memory_md(bible, tree, part.scene_ids, window=1)
+        scoped_tree = tree.scoped_outline_view(part.scene_ids, window=1)
+
+        allowed_panels, first_pg, last_pg = _collect_part_panels(tree, part.scene_ids)
         allowed_set = set(allowed_panels)
 
         current_texts = "\n\n".join(
-            f"--- {sid} ---\n{tree.get_scene_text(sid)}"
+            f"--- {sid} (transition={getattr(tree.get_scene(sid), 'transition_type', 'continuous')}, "
+            f"weight={getattr(tree.get_scene(sid), 'narrative_weight', 3)}/5) ---\n{tree.get_scene_text(sid)}"
             for sid in part.scene_ids
             if tree.get_scene_text(sid)
         )
-        callback_ids = [cid for cid in part.required_callbacks if cid not in part.scene_ids]
-        callback_texts = "\n\n".join(
-            f"--- CALLBACK CHỈ ĐỂ ĐỐI CHIẾU ({cid}) ---\n{tree.get_scene_text(cid)}"
-            for cid in callback_ids
-            if tree.get_scene_text(cid)
-        )
 
-        handoff_block = (
-            f"### PHẦN ĐUÔI CHƯA KỂ TỪ HỒI TRƯỚC (BẮT BUỘC KỂ NỐI TIẾP NGAY TẠI ĐÂY, KHÔNG NHẢY CÓC!):\n"
-            f"Hồi trước mới dừng ở trang `{last_covered_page}`. Bạn PHẢI bắt đầu hồi này bằng các trang nối tiếp dưới đây trước khi sang diễn biến mới:\n"
-            f"{handoff_text}\n\n"
-            if handoff_text
-            else ""
+        # Boundary Bridge: inject only the last 2 pages of the immediately preceding scene (~550 tokens vs 7k)
+        boundary_bridge = ""
+        if prev_scene_id and prev_scene_id not in part.scene_ids:
+            tail_pages_md = tree.get_scene_tail_pages_md(prev_scene_id, max_pages=2)
+            if tail_pages_md:
+                boundary_bridge = (
+                    f"\n\n### CẦU NỐI 2 TRANG CUỐI SCENE TRƯỚC ({prev_scene_id} — CHỈ ĐỂ NỐI MẠCH, CẤM BỐC panel_id HOẶC KỂ LẠI):\n"
+                    f"{tail_pages_md}"
+                )
+
+        callback_ids = [
+            cid
+            for cid in part.required_callbacks
+            if cid not in part.scene_ids and cid != prev_scene_id
+        ]
+        callback_summaries = "\n".join(
+            tree.get_scene_compact_summary(cid)
+            for cid in callback_ids
+            if tree.get_scene_compact_summary(cid)
         )
 
         context_block = (
-            f"### BẢN ĐỒ TOÀN BỘ TẬP TRUYỆN (Tree Index — để nắm bức tranh tổng thể):\n{tree.compact_outline_view()}\n\n"
-            f"{handoff_block}"
-            f"### NỘI DUNG CHI TIẾT CÁC SCENE TRỌNG TÂM CỦA HỒI NÀY:\n{current_texts}"
+            f"### SỔ TAY NHÂN VẬT & MẠCH BÍ ẨN (SCOPED MEMORY):\n{scoped_memory}\n\n"
+            f"### BẢN ĐỒ TẬP TRUYỆN (SCOPED TREE INDEX):\n{scoped_tree}"
             + (
-                f"\n\n### DỮ LIỆU CALLBACK THAM KHẢO NGỮ CẢNH (TUYỆT ĐỐI KHÔNG BỐC panel_id TỪ MỤC NÀY):\n{callback_texts}"
-                if callback_texts
+                f"\n\n### CALLBACK TÓM TẮT (cần chi tiết trang thì gọi `need_nodes`, TUYỆT ĐỐI KHÔNG bốc panel_id từ đây):\n{callback_summaries}"
+                if callback_summaries
                 else ""
             )
+            + boundary_bridge
+            + f"\n\n### NỘI DUNG CHI TIẾT CÁC SCENE TRỌNG TÂM CỦA HỒI NÀY:\n{current_texts}"
         )
         lookup_hint = (
-            "Nếu phát hiện chi tiết liên quan ở scene khác trong Tree Index mà chưa đọc, hãy trả về "
-            "`need_nodes` (tối đa 3 scene_id) hoặc `need_panels` (tối đa 4 panel_id) và để trống `beats` để hệ thống nạp thêm. "
-            "Nếu đã đủ thông tin, hãy viết thẳng `beats`."
+            "Nếu thực sự cần đọc chi tiết trang ở scene xa trong Tree Index, trả về `need_nodes` (tối đa 2 scene_id) "
+            "hoặc `need_panels` (tối đa 4 panel_id) và để trống `beats`. Nếu đã đủ dữ liệu, viết thẳng `beats`."
         )
 
         extra_nodes_text = ""
         extra_images: list[Path] = []
-        max_words = max(160, int(round(part.target_words * 1.15)))
+        max_words = max(130, int(round(part.target_words * 1.12)))
 
         part_pages: list[str] = []
         for sid in part.scene_ids:
@@ -262,24 +318,37 @@ class ScriptwriterAgent:
                 pacing_lines.append(f"- Beat {k + 1}: khoảng trang {span}")
         pacing_guide = "\n".join(pacing_lines)
 
+        part_affordance_notes: list[str] = []
+        if part_idx == 1:
+            part_affordance_notes.append(
+                f"- Chiến lược mở đầu gợi ý (`hook_strategy={hook_strategy}`): đặt 1 câu mở thật cuốn neo đúng vào cảnh mở đầu (có thể đặt câu hỏi trung tâm ngay ở Beat 1)."
+            )
+        if part_idx == total_parts:
+            part_affordance_notes.append(
+                "- Beat cuối cùng của Hồi cuối đặt `beat_type='outro'`: chốt ngắn 1 câu đúc kết chủ đề/tò mò cho tập sau dựa trên biến cố vừa diễn ra."
+            )
+        affordance_txt = "\n".join(part_affordance_notes)
+        moods_txt = ", ".join(VALID_MOODS)
+
         for turn in range(3):
             user_prompt = (
+                f"{context_block}\n\n"
+                f"---\n"
                 f"Đang viết Hồi {part_idx}/{total_parts}: {part.part_id} — {part.title} (section={part.section})\n"
                 f"Các scene của hồi này: {part.scene_ids} | Phạm vi trang hợp lệ: {first_pg} .. {last_pg}\n"
-                f"Mục tiêu độ dài NGHIÊM NGẶT: đúng {part.target_beats} beats, tổng cả hồi ~{part.target_words} từ tiếng Việt (TUYỆT ĐỐI KHÔNG vượt quá {max_words} từ; đan xen beat ngắn dồn dập 16-24 từ ở cảnh hành động/cắt cảnh với beat kể chuyện 26-42 từ, tránh viết các beat dài đều tăm tắp).\n"
-                f"Ghi chú đạo diễn: {part.focus_notes}\n\n"
-                f"### PHÂN BỔ TRANG THEO TỪNG BEAT (BẮT BUỘC BÁM SÁT ĐỂ KHÔNG DỒN CỤC CUỐI HỒI):\n{pacing_guide}\n\n"
-                f"### SỔ TAY NHÂN VẬT & CHỐNG NHẦM TÊN (MEMORY):\n{memory_md}\n\n"
-                f"### 2 BEAT CUỐI CỦA HỒI TRƯỚC (chỉ để nối giọng kể mượt mà, TUYỆT ĐỐI KHÔNG kể lại bất kỳ sự kiện hay câu thoại nào đã có ở hồi trước):\n{tail_txt}\n\n"
-                f"{context_block}\n"
-                f"{extra_nodes_text}\n\n"
+                f"Ngân sách CHẶT: đúng {part.target_beats} beats, tổng ~{part.target_words} từ tiếng Việt (TRẦN TỐI ĐA {max_words} từ; "
+                "chủ động đan xen beat ngắn 12-22 từ ở pha gắt/twist với beat 26-44 từ ở pha đối thoại).\n"
+                f"Ghi chú đạo diễn: {part.focus_notes}\n"
+                + (f"{affordance_txt}\n" if affordance_txt else "")
+                + f"\n### PHÂN BỔ TRANG THEO TỪNG BEAT (BÁM SÁT ĐỂ PHỦ ĐỀU TỚI {last_pg}):\n{pacing_guide}\n\n"
+                f"### 2 BEAT CUỐI HỒI TRƯỚC (chỉ để nối nhịp giọng, TUYỆT ĐỐI KHÔNG lặp lại sự kiện đã kể):\n{tail_txt}\n\n"
+                f"{extra_nodes_text}"
                 f"{lookup_hint}\n\n"
-                "RÀNG BUỘC BẮT BUỘC KHI VIẾT `beats`:\n"
-                "1) VĂN NÓI 100% ĐỂ ĐỌC VOICEOVER: kể giàu cảm xúc, mượt mà như đang kể cho bạn bè nghe — tránh kiểu tóm tắt khô khan hay nhồi dấu chấm phẩy (;), hãy tách câu ngắn gọn, cài câu hỏi tu từ tự nhiên và lồng 1 câu thoại trực tiếp đắt giá trong ngoặc kép (\"...\") ở các khung cao trào. CẤM sáo rỗng AI, đảo ngữ văn viết, và CẤM câu chuyển đoạn giả tạo kiểu bình luận viên (\"Chuyển sang phần mới...\", \"Nối tiếp cao trào...\", \"Bước sang diễn biến tiếp theo...\", \"Sang hồi kết...\"). KHÔNG lặp quá 1-2 lần các từ nối \"ai ngờ\", \"cứ tưởng\", \"tới lúc này\", \"thế nhưng\". Trước khi nhân vật bí ẩn xưng tên ở trang đang kể, gọi theo mô tả/bí danh tại trang đó, không tiết lộ sớm tên thật.\n"
-                "2) KHÔNG KỂ TRƯỚC / KHÔNG DỒN CỤC: Mỗi beat CHỈ được kể đúng hành động/lời thoại nằm trong 2-4 panel_id gắn cho chính beat đó (phạm vi tối đa 1-3 trang liền kề). TUYỆT ĐỐI KHÔNG tóm tắt gộp nhiều trang cuối hồi vào 1 beat, KHÔNG kể trước sự kiện của trang chưa gắn panel, và KHÔNG lặp lại sự kiện đã kể ở hồi trước!\n"
-                f"3) ĐỒNG BỘ HÌNH-TIẾNG & PHỦ TRỌN PHẠM VI ({first_pg} -> {last_pg}): đi tuần tự từ Beat 1 tới Beat {part.target_beats} theo đúng mốc trang gợi ý; mỗi beat gắn **2 đến 4 panel_id khác nhau, liên tiếp cùng trình tự** (không lặp lại cùng 1 panel_id trong một beat hay nhảy lùi trang). "
-                "ƯU TIÊN panel có `[face]` / `[text]` rõ mặt nhân vật hoặc lời thoại; TRÁNH chọn panel `[bg-only]` hoặc dải hẹp (`ar < 0.35` / `ar > 2.8`) trừ khi cảnh toàn trang thực sự quan trọng.\n"
-                "4) Mỗi beat gồm: beat_id (b001..), section, narration_vi, panel_ids, mood, pause_after_ms."
+                "RÀNG BUỘC & BỘ CÔNG CỤ KỂ CHUYỆN:\n"
+                "1) VĂN NÓI 100% ĐỌC THÀNH TIẾNG: tự nhiên như YouTuber kể chuyện, tận dụng thoại đắt trong `⚡Thoại` (ngoặc kép \"...\") và chi tiết thị giác `👁️Hình`. Được phép xen 1-2 beat `beat_type='commentary'` (câu nhận định/giải thích cơ chế ngắn neo hoàn toàn vào cảnh đang chiếu, không bịa thêm sự kiện). Chuyển tuyến POV/Flashback bằng mốc không gian/thời gian tự nhiên; CẤM sáo rỗng AI và câu chuyển đoạn bình luận viên.\n"
+                "2) KHÔNG KỂ TRƯỚC / KHÔNG DỒN CỤC: mỗi beat CHỈ kể đúng hành động/thoại trong 2-4 `panel_id` của chính beat đó.\n"
+                f"3) ĐỒNG BỘ HÌNH-TIẾNG ({first_pg} -> {last_pg}): đi tuần tự từ Beat 1 tới Beat {part.target_beats}; mỗi beat gắn 2-4 `panel_id` khác nhau, tiến đơn điệu theo trình tự; ưu tiên `[face]`/`[text]`, tránh `[bg]` trừ khi cảnh toàn trang quan trọng.\n"
+                f"4) `mood` CHỈ được chọn đúng 1 trong 7 giá trị chuẩn: `{moods_txt}`. Mỗi beat gồm: beat_id, section, beat_type ('narrative'|'commentary'|'hook_montage'|'outro'), narration_vi, panel_ids, mood, pause_after_ms."
             )
 
             resp = self.llm.complete_json(
@@ -297,11 +366,11 @@ class ScriptwriterAgent:
             if resp.need_nodes:
                 chunks = [
                     f"--- EXTRA {nid} ---\n{tree.get_scene_text(nid)}"
-                    for nid in resp.need_nodes[:3]
+                    for nid in resp.need_nodes[:2]
                     if tree.get_scene_text(nid)
                 ]
                 if chunks:
-                    extra_nodes_text += "\n\n### DỮ LIỆU TRA CỨU THÊM:\n" + "\n\n".join(chunks)
+                    extra_nodes_text += "\n\n### DỮ LIỆU TRA CỨU THÊM:\n" + "\n\n".join(chunks) + "\n\n"
                     added = True
             if resp.need_panels:
                 imgs = [panel_images[pid] for pid in resp.need_panels[:4] if pid in panel_images]
@@ -319,11 +388,11 @@ class ScriptwriterAgent:
         allowed_panels: list[str],
         allowed_set: set[str],
     ) -> list[ScriptBeat]:
-        """Keep panel_ids anchored inside the part's valid range when real multi-beat parts leak."""
+        """Keep panel_ids anchored monotonically inside the part's valid range."""
         if not beats or not allowed_panels:
             return beats
 
-        # Preserve single-beat dummy unit-test outputs where mock doesn't inspect scene panel IDs
+        # Preserve minimal unit-test outputs where mock doesn't inspect scene panel IDs
         has_any_in_range = any(pid in allowed_set for b in beats for pid in b.panel_ids)
         if not has_any_in_range and len(beats) < 3:
             return beats
@@ -385,16 +454,18 @@ class ScriptwriterAgent:
             draft_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
             return script
 
-        # Tier 1: Fast Path for short inputs (<= fast_path_max_pages)
+        # Path 1: Fast Path for short inputs (<= fast_path_max_pages)
         if len(page_analyses) <= self.cfg.fast_path_max_pages or tree is None:
             compact_md = format_pages_compact_md(page_analyses)
+            moods_txt = ", ".join(VALID_MOODS)
             user_prompt = (
                 f"Persona: {persona}\n"
                 f"StoryBible:\n{bible.model_dump_json(indent=2)}\n\n"
                 f"Nội dung chi tiết ({len(page_analyses)} trang):\n{compact_md}\n\n"
                 "Viết kịch bản RecapScript dạng JSON bằng VĂN NÓI 100% (tránh văn viết sáo rỗng), "
-                "mỗi beat gắn 2-4 panel_id liên tiếp đúng diễn biến, gồm title_vi, persona, hook_summary, và beats "
-                "(beat_id b001.., section: hook/setup/rising/climax/cliffhanger, narration_vi, panel_ids, mood, pause_after_ms)."
+                f"mỗi beat gắn 2-4 panel_id liên tiếp đúng diễn biến, mood thuộc [{moods_txt}], "
+                "gồm title_vi, persona, hook_strategy, hook_summary, và beats "
+                "(beat_id b001.., section, beat_type, narration_vi, panel_ids, mood, pause_after_ms)."
             )
             script = self.llm.complete_json(
                 agent_name="ScriptwriterAgent",
@@ -405,7 +476,7 @@ class ScriptwriterAgent:
             draft_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
             return script
 
-        # Tier 2 / Tier 3: Outline + Scoped Multi-Part Writing with Automatic Page Handoff
+        # Path 2: Disjoint 1-Scene-per-Part Multi-Part PageIndex
         memory_path = job_dir / "repo" / "MEMORY.md"
         memory_md = (
             memory_path.read_text(encoding="utf-8")
@@ -422,17 +493,10 @@ class ScriptwriterAgent:
         all_beats: list[ScriptBeat] = []
         boundaries: list[dict] = []
         total_parts = len(outline.parts)
-        last_covered_page: str | None = None
-        prev_scene_ids: list[str] = []
+        prev_scene_id: str | None = None
 
         for idx, part in enumerate(outline.parts, start=1):
-            # Disjoint scene partitions avoid re-injecting and duplicating tail pages from the prior part
-            handoff_text = ""
-            handoff_panels: list[str] = []
-
-            allowed_panels, first_pg, last_pg = _collect_part_panels(
-                tree, part.scene_ids, handoff_panels
-            )
+            allowed_panels, first_pg, last_pg = _collect_part_panels(tree, part.scene_ids)
 
             part_file = parts_dir / f"{part.part_id}.json"
             if part_file.exists() and not force:
@@ -446,13 +510,12 @@ class ScriptwriterAgent:
                     part_idx=idx,
                     total_parts=total_parts,
                     system_prompt=system_prompt,
-                    memory_md=memory_md,
+                    bible=bible,
                     tree=tree,
                     prev_tail=all_beats[-2:],
                     panel_images=panel_images,
-                    handoff_text=handoff_text,
-                    handoff_panels=handoff_panels,
-                    last_covered_page=last_covered_page,
+                    prev_scene_id=prev_scene_id,
+                    hook_strategy=outline.hook_strategy,
                 )
                 part_file.write_text(
                     json.dumps([b.model_dump() for b in part_beats], indent=2, ensure_ascii=False),
@@ -472,20 +535,8 @@ class ScriptwriterAgent:
                     "page_range": f"{first_pg}..{last_pg}",
                 }
             )
-
-            # Update handoff cursor to the last page actually covered by this part
-            covered_pages = [
-                _panel_to_page_id(pid)
-                for b in part_beats
-                for pid in b.panel_ids
-            ]
-            if covered_pages:
-                last_covered_page = covered_pages[-1]
-            elif part.scene_ids:
-                sc_last = tree.get_scene(part.scene_ids[-1])
-                if sc_last and sc_last.page_ids:
-                    last_covered_page = sc_last.page_ids[-1]
-            prev_scene_ids = part.scene_ids
+            if part.scene_ids:
+                prev_scene_id = part.scene_ids[-1]
 
         # Renumber beat_ids sequentially b001..bNNN
         for b_idx, beat in enumerate(all_beats, start=1):
@@ -499,6 +550,7 @@ class ScriptwriterAgent:
         script = RecapScript(
             title_vi=outline.title_vi,
             persona=persona,
+            hook_strategy=outline.hook_strategy,
             hook_summary=outline.hook_summary,
             beats=all_beats,
         )

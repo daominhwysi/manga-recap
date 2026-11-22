@@ -1,4 +1,4 @@
-"""Stage 3b Agent: Critic validating panel grounding, coverage gaps, clichés, and narrative flow."""
+"""Stage 3b Agent: Closed-Loop Critic, Read-Aloud Showrunner Pass & Pronunciation Prep."""
 
 from __future__ import annotations
 
@@ -6,13 +6,18 @@ import json
 import math
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from src.audio.base import apply_pronunciation_glossary
 from src.llm.client import LLMClient
-from src.schemas.analysis import StoryBible
+from src.schemas.analysis import PageAnalysis, StoryBible
 from src.schemas.ingestion import JobManifest
 from src.schemas.script import CriticIssue, CriticReport, RecapScript, ScriptBeat
+
+if TYPE_CHECKING:
+    from src.config import ScriptConfig
 
 
 _BANNED_CLICHES = (
@@ -56,7 +61,7 @@ class _SeamPolishResponse(BaseModel):
 
 
 class CriticAgent:
-    """Checks script consistency against manifest panels, page coverage, AI clichés, and seams."""
+    """Validates hard invariants, macro rhythm distribution, and runs Closed-Loop Showrunner Auto-Repair."""
 
     def __init__(self, llm: LLMClient, polish_seams: bool = True) -> None:
         self.llm = llm
@@ -77,55 +82,209 @@ class CriticAgent:
         ratio = beat_idx / max(1, total_beats)
         return valid_ids[min(len(valid_ids) - 1, int(ratio * len(valid_ids)))]
 
+    @staticmethod
+    def _evaluate_issues(
+        beats: list[ScriptBeat],
+        all_pages: list[str],
+        page_order: dict[str, int],
+        beat_to_allowed: dict[int, set[str]],
+        target_total_words: int | None = None,
+    ) -> tuple[list[CriticIssue], set[int], list[str]]:
+        """Evaluate hard invariants (error) & macro rhythm/span warnings without mutating panel_ids."""
+        issues: list[CriticIssue] = []
+        flagged_indices: set[int] = set()
+        flagged_notes: list[str] = []
+        total_beats = len(beats)
+        avg_pages_per_beat = (len(all_pages) / max(1, total_beats)) if total_beats >= 6 else 2.5
+        max_single_beat_span = max(3, math.ceil(avg_pages_per_beat * 1.5))
+        max_coverage_gap = max(8, math.ceil(avg_pages_per_beat * 3.5))
+
+        prev_page_pos: int | None = None
+        beat_ngrams: list[tuple[str, set[str]]] = []
+        word_counts: list[int] = []
+
+        for idx, beat in enumerate(beats):
+            kept = beat.panel_ids
+            if idx in beat_to_allowed and kept:
+                allowed = beat_to_allowed[idx]
+                out_ids = [pid for pid in kept if pid not in allowed]
+                if out_ids:
+                    msg = f"{beat.beat_id} references panels outside assigned part range: {out_ids}."
+                    issues.append(
+                        CriticIssue(beat_id=beat.beat_id, severity="error", category="panel_sync", message=msg)
+                    )
+                    flagged_indices.add(idx)
+                    flagged_notes.append(msg)
+
+            positions = [p for pid in kept if (p := _page_pos_from_panel(pid, page_order)) is not None]
+            if positions and beat.beat_type != "hook_montage":
+                cur_min = min(positions)
+                cur_max = max(positions)
+                if cur_max - cur_min > max_single_beat_span:
+                    span_msg = (
+                        f"{beat.beat_id} spans {cur_max - cur_min} pages "
+                        f"({all_pages[cur_min]}..{all_pages[cur_max]}), risking visual cramming."
+                    )
+                    issues.append(
+                        CriticIssue(beat_id=beat.beat_id, severity="warning", category="panel_sync", message=span_msg)
+                    )
+                    flagged_notes.append(span_msg)
+                if prev_page_pos is not None and cur_min < prev_page_pos:
+                    back_msg = (
+                        f"{beat.beat_id} jumped backwards from {all_pages[prev_page_pos]} to {all_pages[cur_min]}."
+                    )
+                    issues.append(
+                        CriticIssue(beat_id=beat.beat_id, severity="error", category="panel_sync", message=back_msg)
+                    )
+                    flagged_indices.add(idx)
+                    flagged_notes.append(back_msg)
+                if prev_page_pos is not None and (cur_min - prev_page_pos) > max_coverage_gap:
+                    gap_msg = (
+                        f"Page coverage gap before {beat.beat_id}: jumped from {all_pages[prev_page_pos]} "
+                        f"to {all_pages[cur_min]} ({cur_min - prev_page_pos} pages skipped)."
+                    )
+                    issues.append(
+                        CriticIssue(beat_id=beat.beat_id, severity="error", category="coverage_gap", message=gap_msg)
+                    )
+                    flagged_notes.append(gap_msg)
+                prev_page_pos = max(prev_page_pos or 0, cur_max)
+
+            cur_ng = _content_ngrams(beat.narration_vi)
+            if len(cur_ng) >= 8:
+                for prev_bid, prev_ng in beat_ngrams:
+                    overlap = len(cur_ng & prev_ng)
+                    denom = max(1, min(len(cur_ng), len(prev_ng)))
+                    if overlap >= 4 and (overlap / denom) >= 0.35:
+                        dup_msg = f"{beat.beat_id} possible repeated content overlapping with {prev_bid}."
+                        issues.append(
+                            CriticIssue(
+                                beat_id=beat.beat_id,
+                                severity="error",
+                                category="duplication",
+                                message=dup_msg,
+                            )
+                        )
+                        flagged_indices.add(idx)
+                        flagged_notes.append(dup_msg)
+                        break
+                beat_ngrams.append((beat.beat_id, cur_ng))
+
+            words = len(beat.narration_vi.split())
+            word_counts.append(words)
+            if words > 80:
+                p_msg = f"{beat.beat_id} exceeds 80 words ({words} từ); tighten phrasing for voiceover."
+                issues.append(
+                    CriticIssue(beat_id=beat.beat_id, severity="warning", category="pacing", message=p_msg)
+                )
+                flagged_indices.add(idx)
+                flagged_notes.append(p_msg)
+
+            low_text = beat.narration_vi.lower()
+            for phrase in _BANNED_CLICHES:
+                if phrase in low_text:
+                    c_msg = f"{beat.beat_id} chứa cụm sáo rỗng '{phrase}'."
+                    issues.append(
+                        CriticIssue(beat_id=beat.beat_id, severity="error", category="style", message=c_msg)
+                    )
+                    flagged_indices.add(idx)
+                    flagged_notes.append(c_msg)
+
+        # Macro Distribution Critique (Rule 5): check volume-level pacing variance & total word budget
+        if len(word_counts) >= 12:
+            mean_wc = sum(word_counts) / len(word_counts)
+            std_wc = math.sqrt(sum((w - mean_wc) ** 2 for w in word_counts) / len(word_counts))
+            if std_wc < 4.5:
+                issues.append(
+                    CriticIssue(
+                        beat_id="global",
+                        severity="warning",
+                        category="macro_rhythm",
+                        message=f"Beat rhythm is overly uniform (std={std_wc:.1f} words); vary short/long beats.",
+                    )
+                )
+
+        if target_total_words and len(beats) >= 6:
+            actual_words = sum(word_counts)
+            if actual_words > int(target_total_words * 1.25):
+                b_msg = (
+                    f"Total script length ({actual_words} từ) exceeds target ({target_total_words} từ) by >25%."
+                )
+                issues.append(
+                    CriticIssue(beat_id="global", severity="error", category="budget", message=b_msg)
+                )
+                flagged_notes.append(b_msg)
+
+        return issues, flagged_indices, flagged_notes
+
     def _polish_multi_part_seams(
         self,
         beats: list[ScriptBeat],
         bible: StoryBible,
         seam_indices: list[int],
+        flagged_indices: set[int],
         flagged_notes: list[str],
+        panel_text_lookup: dict[str, str] | None = None,
+        run_global_showrunner: bool = False,
+        target_total_words: int | None = None,
     ) -> list[ScriptBeat]:
-        """Run 1 LLM Narrative Editor pass to polish seams, narrative gaps, and AI clichés."""
+        """Read-Aloud Showrunner Pass + Targeted Auto-Repair (panel_ids strictly locked in Python)."""
         if not self.polish_seams or not self.llm.has_text_credentials or len(beats) < 6:
             return beats
 
-        # Only target actual flagged cliché/pacing beats and boundary seams instead of blindly rewriting all beats
-        flagged_indices = {
-            i
-            for i, b in enumerate(beats)
-            if (
-                any(phrase in b.narration_vi.lower() for phrase in _BANNED_CLICHES)
-                or len(b.narration_vi.split()) < 10
-                or len(b.narration_vi.split()) > 65
-            )
-        }
         seam_set = {i for i in seam_indices if 0 <= i < len(beats)}
-        target_indices = sorted(flagged_indices | seam_set)
+        error_neighbors: set[int] = set()
+        for fi in flagged_indices:
+            for d in (fi - 1, fi, fi + 1):
+                if 0 <= d < len(beats):
+                    error_neighbors.add(d)
+
+        target_indices = (
+            list(range(len(beats)))
+            if run_global_showrunner
+            else sorted(flagged_indices | seam_set | error_neighbors)
+        )
         if not target_indices:
             return beats
 
         seam_beat_ids = [beats[i].beat_id for i in sorted(seam_set)]
-        payload = [
-            {"beat_id": beats[i].beat_id, "section": beats[i].section, "narration_vi": beats[i].narration_vi}
-            for i in target_indices
-        ]
+        payload = []
+        for i in target_indices:
+            b = beats[i]
+            item: dict = {
+                "beat_id": b.beat_id,
+                "section": b.section,
+                "beat_type": b.beat_type,
+                "mood": b.mood,
+                "narration_vi": b.narration_vi,
+            }
+            if i in flagged_indices and panel_text_lookup:
+                facts = [panel_text_lookup[pid] for pid in b.panel_ids if pid in panel_text_lookup]
+                if facts:
+                    item["grounded_panel_facts"] = " | ".join(facts)[:380]
+            payload.append(item)
+
         cast_names = [c.canonical_name for c in bible.characters]
-        notes_txt = "\n".join(f"- {n}" for n in flagged_notes[:12]) or "Không có cảnh báo tự động."
+        notes_txt = "\n".join(f"- {n}" for n in flagged_notes[:12]) or "Không có lỗi nghiêm trọng — hãy chuốt văn nói mượt mà."
+        budget_hint = (
+            f"Tổng ngân sách mục tiêu toàn tập: ~{target_total_words} từ (cắt gọn câu thừa nếu vượt quá nhiều)."
+            if target_total_words
+            else ""
+        )
         try:
             res = self.llm.complete_json(
                 agent_name="CriticSeamPolisher",
                 system_prompt=(
-                    "Bạn là biên tập viên kịch bản voiceover YouTube manga. CHỈ trả về các beat thực sự có lỗi cần sửa để:\n"
-                    "1) Nối mượt các điểm chuyển hồi (đặc biệt tại seam_beat_ids), xóa lời giới thiệu nhân vật bị lặp. "
-                    "TUYỆT ĐỐI CẤM câu chuyển đoạn kiểu bình luận viên ('Chuyển sang đầu phần mới...', 'Nối tiếp cao trào...', 'Bước sang diễn biến tiếp theo...', 'Sang hồi kết mở...'). Hãy nối thẳng bằng hành động của nhân vật.\n"
-                    "2) Khử sạch cụm sáo rỗng AI ('định mệnh nghiệt ngã', 'bánh răng định mệnh', 'không gian vỡ vụn', 'rợn tóc gáy', 'đẫm máu' lặp lại) "
-                    "và câu đảo ngữ văn viết gượng, giữ đúng ngôi kể và VĂN NÓI 100% tự nhiên.\n"
-                    "3) Không làm sai lệch sự kiện, không cắt cụt chữ đầu câu, và không đổi độ dài quá mức."
+                    "Bạn là Tổng Biên Tập Kịch Bản Voiceover (Read-Aloud Showrunner). CHỈ trả về trong `rewrites` những `beat_id` thực sự cần sửa để:\n"
+                    "1) Nối mượt chuyển hồi tại `seam_beat_ids` bằng hành động/không gian tự nhiên, xóa giới thiệu lặp nhân vật. CẤM câu chuyển đoạn bình luận viên.\n"
+                    "2) Khử sạch cliché AI, lặp từ nối ('ai ngờ', 'cứ tưởng', 'tới lúc này', 'thế nhưng') và sửa trùng lặp dựa ĐÚNG trên `grounded_panel_facts` (KHÔNG bịa thêm sự kiện).\n"
+                    "3) Tạo nhịp đọc tai nghe tự nhiên (xen câu ngắn dồn dập và câu kể trôi chảy), giữ đúng tên nhân vật chuẩn và KHÔNG cắt cụt chữ đầu câu."
                 ),
                 user_prompt=(
-                    f"Danh sách nhân vật chuẩn: {cast_names}\n"
+                    f"Nhân vật chuẩn: {cast_names}\n"
                     f"Các điểm nối hồi (seam): {seam_beat_ids}\n"
-                    f"Các lỗi kỹ thuật/văn phong phát hiện tự động:\n{notes_txt}\n\n"
-                    f"Các beat cần rà soát:\n{json.dumps(payload, ensure_ascii=False)}"
+                    f"{budget_hint}\n"
+                    f"Lỗi phát hiện tự động:\n{notes_txt}\n\n"
+                    f"Kịch bản cần rà soát ({len(payload)} beats):\n{json.dumps(payload, ensure_ascii=False)}"
                 ),
                 schema_cls=_SeamPolishResponse,
             )
@@ -152,6 +311,8 @@ class CriticAgent:
         bible: StoryBible,
         job_dir: Path,
         force: bool = False,
+        script_config: ScriptConfig | None = None,
+        page_analyses: list[PageAnalysis] | None = None,
     ) -> tuple[RecapScript, CriticReport]:
         final_path = job_dir / "03b_script_final.json"
         report_path = job_dir / "03b_critic_report.json"
@@ -170,6 +331,13 @@ class CriticAgent:
             for p in pg.panels
         ]
         valid_set = set(valid_ids)
+
+        panel_text_lookup: dict[str, str] = {}
+        if page_analyses:
+            for pa in page_analyses:
+                for pnl in pa.panels:
+                    dlg = f' "{pnl.dialogue_summary}"' if pnl.dialogue_summary else ""
+                    panel_text_lookup[pnl.panel_id] = f"{pnl.action_summary}{dlg}".strip()
 
         # Load real part boundaries if written by ScriptwriterAgent
         seam_indices: list[int] = []
@@ -191,142 +359,106 @@ class CriticAgent:
                             beat_to_allowed[idx_in] = allowed
             except Exception:
                 seam_indices = []
-
         seam_indices = sorted(set(seam_indices))
 
-        issues: list[CriticIssue] = []
+        # Step 1: Deterministic Panel Grounding repair (guaranteed valid panel_ids)
+        grounding_issues: list[CriticIssue] = []
         cleaned_beats: list[ScriptBeat] = []
         total_beats = len(script.beats)
-        avg_pages_per_beat = (
-            len(all_pages) / max(1, total_beats)
-            if total_beats >= 6
-            else 2.5
-        )
-        max_single_beat_span = max(3, math.ceil(avg_pages_per_beat * 1.5))
-        max_coverage_gap = max(8, math.ceil(avg_pages_per_beat * 3.5))
-
-        prev_page_pos: int | None = None
-        flagged_notes: list[str] = []
-        beat_ngrams: list[tuple[str, set[str]]] = []
-
         for idx, beat in enumerate(script.beats):
-            kept = [pid for pid in beat.panel_ids if pid in valid_set]
+            b_copy = beat.model_copy(deep=True)
+            kept = [pid for pid in b_copy.panel_ids if pid in valid_set]
             if not kept and valid_ids:
                 fallback_id = self._scoped_fallback_panel(idx, total_beats, valid_ids, cleaned_beats)
                 kept = [fallback_id]
-                issues.append(
+                grounding_issues.append(
                     CriticIssue(
-                        beat_id=beat.beat_id,
+                        beat_id=b_copy.beat_id,
                         severity="warning",
                         category="grounding",
                         message=f"Replaced invalid panel_ids with scoped {fallback_id}.",
                     )
                 )
+            b_copy.panel_ids = kept
+            cleaned_beats.append(b_copy)
 
-            # Check out-of-part panel drift when boundaries exist (only flag, do not break tests)
-            if idx in beat_to_allowed and kept:
-                allowed = beat_to_allowed[idx]
-                out_ids = [pid for pid in kept if pid not in allowed]
-                if out_ids:
-                    msg = f"{beat.beat_id} references panels outside assigned part range: {out_ids}."
-                    issues.append(
-                        CriticIssue(beat_id=beat.beat_id, severity="warning", category="panel_sync", message=msg)
-                    )
-                    flagged_notes.append(msg)
-
-            # Check page coverage gaps, wide single-beat spans, and backward jumps adaptively
-            positions = [p for pid in kept if (p := _page_pos_from_panel(pid, page_order)) is not None]
-            if positions:
-                cur_min = min(positions)
-                cur_max = max(positions)
-                if cur_max - cur_min > max_single_beat_span:
-                    span_msg = (
-                        f"{beat.beat_id} spans {cur_max - cur_min} pages "
-                        f"({all_pages[cur_min]}..{all_pages[cur_max]}), risking visual cramming."
-                    )
-                    issues.append(
-                        CriticIssue(beat_id=beat.beat_id, severity="warning", category="panel_sync", message=span_msg)
-                    )
-                    flagged_notes.append(span_msg)
-                if prev_page_pos is not None and cur_min < prev_page_pos:
-                    back_msg = (
-                        f"{beat.beat_id} jumped backwards from {all_pages[prev_page_pos]} to {all_pages[cur_min]}."
-                    )
-                    issues.append(
-                        CriticIssue(beat_id=beat.beat_id, severity="warning", category="panel_sync", message=back_msg)
-                    )
-                    flagged_notes.append(back_msg)
-                if prev_page_pos is not None and (cur_min - prev_page_pos) > max_coverage_gap:
-                    gap_msg = (
-                        f"Page coverage gap before {beat.beat_id}: jumped from {all_pages[prev_page_pos]} "
-                        f"to {all_pages[cur_min]} ({cur_min - prev_page_pos} pages skipped)."
-                    )
-                    issues.append(
-                        CriticIssue(beat_id=beat.beat_id, severity="warning", category="coverage_gap", message=gap_msg)
-                    )
-                    flagged_notes.append(gap_msg)
-                prev_page_pos = max(prev_page_pos or 0, cur_max)
-
-            # Check cross-beat content duplication via n-gram overlap
-            cur_ng = _content_ngrams(beat.narration_vi)
-            if len(cur_ng) >= 8:
-                for prev_bid, prev_ng in beat_ngrams:
-                    overlap = len(cur_ng & prev_ng)
-                    denom = max(1, min(len(cur_ng), len(prev_ng)))
-                    if overlap >= 4 and (overlap / denom) >= 0.35:
-                        dup_msg = f"{beat.beat_id} possible repeated content overlapping with {prev_bid}."
-                        issues.append(
-                            CriticIssue(
-                                beat_id=beat.beat_id,
-                                severity="warning",
-                                category="duplication",
-                                message=dup_msg,
-                            )
-                        )
-                        flagged_notes.append(dup_msg)
-                        break
-                beat_ngrams.append((beat.beat_id, cur_ng))
-
-            # Check pacing & banned AI clichés
-            words = len(beat.narration_vi.split())
-            if words > 75:
-                issues.append(
-                    CriticIssue(
-                        beat_id=beat.beat_id,
-                        severity="warning",
-                        category="pacing",
-                        message="Beat narration exceeds 75 words; consider splitting.",
-                    )
-                )
-
-            low_text = beat.narration_vi.lower()
-            for phrase in _BANNED_CLICHES:
-                if phrase in low_text:
-                    c_msg = f"{beat.beat_id} chứa cụm sáo rỗng '{phrase}'."
-                    issues.append(
-                        CriticIssue(beat_id=beat.beat_id, severity="warning", category="style", message=c_msg)
-                    )
-                    flagged_notes.append(c_msg)
-
-            beat.panel_ids = kept
-            cleaned_beats.append(beat)
-
-        cleaned_beats = self._polish_multi_part_seams(
-            cleaned_beats, bible, seam_indices=seam_indices, flagged_notes=flagged_notes
+        target_total_words = (
+            max(400, int(round(script_config.target_duration_min * script_config.words_per_minute)))
+            if script_config is not None and len(cleaned_beats) >= 6
+            else None
         )
 
-        # Re-check cliché count on final output for accurate report notes
+        issues_eval, flagged_indices, flagged_notes = self._evaluate_issues(
+            cleaned_beats,
+            all_pages=all_pages,
+            page_order=page_order,
+            beat_to_allowed=beat_to_allowed,
+            target_total_words=target_total_words,
+        )
+
+        # Step 2: Closed-Loop Showrunner Pass + Auto-Repair (up to 2 passes if errors persist)
+        if self.polish_seams and self.llm.has_text_credentials and len(cleaned_beats) >= 6:
+            has_budget_overrun = any(i.category == "budget" for i in issues_eval)
+            run_global = len(seam_indices) >= 2 or has_budget_overrun
+            cleaned_beats = self._polish_multi_part_seams(
+                cleaned_beats,
+                bible,
+                seam_indices=seam_indices,
+                flagged_indices=flagged_indices,
+                flagged_notes=flagged_notes,
+                panel_text_lookup=panel_text_lookup,
+                run_global_showrunner=run_global,
+                target_total_words=target_total_words,
+            )
+            issues_eval, flagged_indices, flagged_notes = self._evaluate_issues(
+                cleaned_beats,
+                all_pages=all_pages,
+                page_order=page_order,
+                beat_to_allowed=beat_to_allowed,
+                target_total_words=target_total_words,
+            )
+            remaining_errors = {i.beat_id for i in issues_eval if i.severity == "error"}
+            if remaining_errors:
+                retry_indices = {
+                    idx for idx, b in enumerate(cleaned_beats) if b.beat_id in remaining_errors
+                } | flagged_indices
+                cleaned_beats = self._polish_multi_part_seams(
+                    cleaned_beats,
+                    bible,
+                    seam_indices=[],
+                    flagged_indices=retry_indices,
+                    flagged_notes=[i.message for i in issues_eval if i.severity == "error"],
+                    panel_text_lookup=panel_text_lookup,
+                    run_global_showrunner=False,
+                    target_total_words=target_total_words,
+                )
+                issues_eval, _, _ = self._evaluate_issues(
+                    cleaned_beats,
+                    all_pages=all_pages,
+                    page_order=page_order,
+                    beat_to_allowed=beat_to_allowed,
+                    target_total_words=target_total_words,
+                )
+
+        # Step 3: Populate TTS pronunciation-normalized strings without mutating display subtitles
+        for b in cleaned_beats:
+            b.tts_text = apply_pronunciation_glossary(b.narration_vi, bible.pronunciation_map)
+
+        all_issues = grounding_issues + issues_eval
         final_script = RecapScript(
             title_vi=script.title_vi,
             persona=script.persona,
+            hook_strategy=script.hook_strategy,
             hook_summary=script.hook_summary,
             beats=cleaned_beats,
         )
+        err_count = sum(1 for i in all_issues if i.severity == "error")
+        warn_count = len(all_issues) - err_count
         report = CriticReport(
-            passed=all(i.severity != "error" for i in issues),
-            score=max(5.0, round(10.0 - 0.5 * len(issues), 2)),
-            issues=issues,
-            notes="Validated panel grounding, part boundaries, page coverage gaps, AI clichés, and narrative seams.",
+            passed=(err_count == 0),
+            score=max(2.0, round(10.0 - 1.2 * err_count - 0.35 * warn_count, 2)),
+            issues=all_issues,
+            notes="Validated hard invariants, macro rhythm distribution, Showrunner flow, and TTS pronunciation.",
         )
         final_path.write_text(final_script.model_dump_json(indent=2), encoding="utf-8")
         report_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")

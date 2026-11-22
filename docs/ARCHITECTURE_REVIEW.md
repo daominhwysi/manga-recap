@@ -1,7 +1,7 @@
 # Báo Cáo Review Toàn Diện Kiến Trúc — Manga Recap Generator
 
-> **Phạm vi kiểm toán**: Toàn bộ 6-Stage Pipeline (`src/`, `config.yaml`, `configs/personas.yaml`), dữ liệu thực nghiệm `jobs/pandora_hearts_vol1` (`telemetry.json`, `OUTLINE.json`, `03b_script_final.json`, `05_timeline.json`), và đối chiếu trực tiếp với 3 kịch bản YouTube Việt Nam thực tế (**Phê Phim**, **Anime Rewind**, **AL Anime**).  
-> **Trạng thái**: Chỉ phân tích & đề xuất — **chưa chỉnh sửa bất kỳ file nào trong dự án** theo đúng yêu cầu.
+> **Phạm vi kiểm toán**: Toàn bộ 6-Stage Pipeline (`src/`, `config.yaml`, `configs/personas.yaml`), dữ liệu thực nghiệm `jobs/pandora_hearts_vol1` (`telemetry.json`, `OUTLINE.json`, `03b_script_final.json`, `05_timeline.json`), và đối chiếu trực tiếp với 3 kịch bản YouTube Việt Nam thực tế (**Phê Phim**, **Anime Rewind**, **AL Anime**).
+> **Trạng thái**: **ĐÃ TRIỂN KHAI HOÀN TẤT V2** (17 bug đã xử lý + tối ưu token Nhóm A + B + Adaptive Panel Batching + 5 nâng cấp chất lượng kịch bản + `default_model: gpt-6.2-sol`).
 
 ---
 

@@ -6,10 +6,12 @@ import json
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 
 from src.llm.client import LLMClient
@@ -22,9 +24,10 @@ Quy tắc bắt buộc:
 2) Phân tích từng khung hình theo đúng thứ tự panel_id từ [P1] đến [Pn] theo chiều đọc.
 3) Nếu đã đính kèm ảnh BẢNG CHÂN DUNG NHÂN VẬT (cast_sheet.jpg), BẮT BUỘC đối chiếu gương mặt, kiểu tóc và trang phục với bảng đó kết hợp với Ngữ cảnh cảnh trước (Rolling Scene State) để gọi ĐÚNG tên nhân vật, tránh nhầm lẫn nhân vật này sang nhân vật khác.
 4) Trong `dialogue_summary`, tóm tắt hoặc trích dịch gọn lời thoại quan trọng nhất trong bóng thoại bằng tiếng Việt rõ nghĩa.
-5) Nếu trang là trang bìa (cover), trang trắng/trang lót, trang tiêu đề (title page), mục lục (table of contents), lời cảm ơn (Special Thanks), chú thích dịch giả (Translator's Notes), trang bản quyền hay truyện ngắn tặng kèm cuối tập, BẮT BUỘC ghi rõ cụm "[PHỤ LỤC]" ở đầu `page_summary`.
-6) CHỐNG BỊA TÊN (BẮT BUỘC): Chỉ dùng tên nhân vật có trong Bảng Chân Dung / Rolling Scene State hoặc được gọi rõ trong bóng thoại/chữ trên trang. TUYỆT ĐỐI KHÔNG tự đoán tên từ kiến thức ngoài truyện khi tên đó chưa hề xuất hiện; nếu là người lạ chưa xưng tên, hãy ghi dạng `[Chưa rõ tên: đặc điểm ngoại hình nổi bật]` (ví dụ `[Chưa rõ tên: người đeo mặt nạ mặc áo choàng tối màu]`).
-7) CHỐNG BỊA CỐT TRUYỆN TRÊN TRANG BÌA / TRANG TRẮNG / MỤC LỤC (BẮT BUỘC): Nếu trang chỉ là trang trắng, trang bìa, trang tiêu đề hoặc mục lục (không có bóng thoại truyện), chỉ mô tả đúng những gì in trên trang (ví dụ: `[PHỤ LỤC] Trang trắng`, `[PHỤ LỤC] Trang mục lục tập 1`). TUYỆT ĐỐI KHÔNG lấy trí nhớ về Anime hay các trang sau để bịa ra cảnh hành động hoặc lời thoại không có trên ảnh."""
+5) Trong `verbatim_quote_vi` (cấp trang), trích NGUYÊN VĂN câu thoại/câu dẫn đắt giá nhất trên trang dịch sang tiếng Việt tự nhiên (để rỗng "" nếu trang không có thoại đáng chú ý). Trong `visual_punch`, ghi ngắn gọn 1 chi tiết thị giác/biểu cảm đắt nhất trên trang (để rỗng "" nếu bình thường).
+6) Nếu trang là trang bìa (cover), trang trắng/trang lót, trang tiêu đề (title page), mục lục (table of contents), lời cảm ơn (Special Thanks), chú thích dịch giả (Translator's Notes), trang bản quyền hay truyện ngắn tặng kèm cuối tập, BẮT BUỘC ghi rõ cụm "[PHỤ LỤC]" ở đầu `page_summary`.
+7) CHỐNG BỊA TÊN (BẮT BUỘC): Chỉ dùng tên nhân vật có trong Bảng Chân Dung / Rolling Scene State hoặc được gọi rõ trong bóng thoại/chữ trên trang. TUYỆT ĐỐI KHÔNG tự đoán tên từ kiến thức ngoài truyện khi tên đó chưa hề xuất hiện; nếu là người lạ chưa xưng tên, hãy ghi dạng `[Chưa rõ tên: đặc điểm ngoại hình nổi bật]` (ví dụ `[Chưa rõ tên: người đeo mặt nạ mặc áo choàng tối màu]`).
+8) CHỐNG BỊA CỐT TRUYỆN TRÊN TRANG BÌA / TRANG TRẮNG / MỤC LỤC (BẮT BUỘC): Nếu trang chỉ là trang trắng, trang bìa, trang tiêu đề hoặc mục lục (không có bóng thoại truyện), chỉ mô tả đúng những gì in trên trang (ví dụ: `[PHỤ LỤC] Trang trắng`, `[PHỤ LỤC] Trang mục lục tập 1`). TUYỆT ĐỐI KHÔNG lấy trí nhớ ngoài truyện hay các trang sau để bịa ra cảnh hành động hoặc lời thoại không có trên ảnh."""
 
 
 class PageBatchAnalysis(BaseModel):
@@ -83,7 +86,31 @@ def _is_dummy_page_analysis(pa: PageAnalysis) -> bool:
     return False
 
 
-def _select_prepass_pages(manifest: JobManifest, max_samples: int = 16) -> list[PageInfo]:
+def _make_duplicate_spread_page_analysis(page: PageInfo) -> PageAnalysis:
+    """Deterministic analysis for split pages duplicating an adjacent double-page spread."""
+    return PageAnalysis(
+        page_id=page.page_id,
+        chapter_id=page.chapter_id,
+        page_summary="[PHỤ LỤC] Trang đơn cắt trùng từ trang đôi (double-page spread).",
+        panels=[
+            PanelAnalysis(
+                panel_id=p.panel_id,
+                action_summary="[PHỤ LỤC] Trang đơn cắt trùng từ trang đôi.",
+                dialogue_summary="",
+                characters_present=[],
+                emotion="neutral",
+                importance=1,
+            )
+            for p in page.panels
+        ],
+    )
+
+
+def _select_prepass_pages(
+    manifest: JobManifest,
+    max_samples: int = 16,
+    exclude_pages: set[str] | None = None,
+) -> list[PageInfo]:
     """Select face-rich, dialogue-rich pages distributed across the volume for Pre-Pass Cast Discovery."""
     all_pages = [pg for ch in manifest.chapters for pg in ch.pages]
     if len(all_pages) <= max_samples:
@@ -91,6 +118,8 @@ def _select_prepass_pages(manifest: JobManifest, max_samples: int = 16) -> list[
 
     scored: list[tuple[float, int, PageInfo]] = []
     for idx, pg in enumerate(all_pages):
+        if exclude_pages and pg.page_id in exclude_pages:
+            continue
         if _is_blank_or_solid_page(pg.source_path):
             continue
         faces = sum(1 for pnl in pg.panels for fp in pnl.focal_points if fp.kind == "face")
@@ -165,6 +194,33 @@ def _crop_face_portrait(panel: PanelInfo, target_w: int = 188, target_h: int = 1
     return tile
 
 
+@lru_cache(maxsize=8)
+def _load_cast_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    )
+    for c in candidates:
+        if Path(c).exists():
+            return ImageFont.truetype(c, size=size)
+    return ImageFont.load_default()
+
+
+def _draw_utf8_label(
+    canvas_bgr: np.ndarray,
+    text: str,
+    pos: tuple[int, int],
+    font_size: int = 14,
+    color_rgb: tuple[int, int, int] = (255, 255, 255),
+) -> np.ndarray:
+    """Render UTF-8 Vietnamese text cleanly onto a BGR canvas using Pillow."""
+    pil_img = Image.fromarray(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_img)
+    draw.text(pos, text, font=_load_cast_font(font_size), fill=color_rgb)
+    return cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+
+
 def _build_cast_sheet(
     seed_cast: list[SeedCharacter],
     manifest: JobManifest,
@@ -213,16 +269,7 @@ def _build_cast_sheet(
         card[6 : 6 + tile_h, 6 : 6 + tile_w] = portrait
         cv2.rectangle(card, (5, 5), (6 + tile_w, 6 + tile_h), (210, 210, 210), 1)
         label = ch_entry.canonical_name[:22]
-        cv2.putText(
-            card,
-            label,
-            (8, card_h - 11),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        card = _draw_utf8_label(card, label, (8, card_h - 27), font_size=14, color_rgb=(255, 255, 255))
         cards.append(card)
 
     if not cards:
@@ -234,15 +281,12 @@ def _build_cast_sheet(
     grid_w = cols * card_w + (cols + 1) * pad
     grid_h = rows * card_h + (rows + 1) * pad + 28
     canvas = np.full((grid_h, grid_w, 3), 10, dtype=np.uint8)
-    cv2.putText(
+    canvas = _draw_utf8_label(
         canvas,
         "CAST REFERENCE SHEET (match faces & hairstyles strictly)",
-        (pad, 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.58,
-        (120, 230, 255),
-        1,
-        cv2.LINE_AA,
+        (pad, 6),
+        font_size=15,
+        color_rgb=(255, 230, 120),
     )
     for idx, card in enumerate(cards):
         r = idx // cols
@@ -268,6 +312,8 @@ class PageAnalyzerAgent:
         job_dir: Path,
         force: bool = False,
         max_workers: int = 4,
+        exclude_pages: set[str] | None = None,
+        prev_job_dir: Path | None = None,
     ) -> tuple[list[SeedCharacter], Path | None]:
         """Stage 1.5 Pre-Pass: scan face/dialogue-rich sample pages to lock cast names + build cast_sheet.jpg."""
         all_pages = [pg for ch in manifest.chapters for pg in ch.pages]
@@ -285,7 +331,7 @@ class PageAnalyzerAgent:
         if len(all_pages) < 8 or not self.llm.has_vision_credentials:
             return [], None
 
-        samples = _select_prepass_pages(manifest, max_samples=16)
+        samples = _select_prepass_pages(manifest, max_samples=16, exclude_pages=exclude_pages)
         batches = [samples[i : i + 4] for i in range(0, len(samples), 4)]
 
         def _scan_sample_batch(batch: list[PageInfo]) -> list[SeedCharacter]:
@@ -357,9 +403,23 @@ class PageAnalyzerAgent:
         else:
             merged = grounded
 
-        # Python deduplication safety net
+        # Python deduplication safety net (optionally inheriting prior volume cast)
         deduped: list[SeedCharacter] = []
         seen_keys: set[str] = set()
+        if prev_job_dir is not None:
+            prev_seed_path = prev_job_dir / "repo" / "seed_cast.json"
+            if prev_seed_path.exists():
+                try:
+                    prev_res = PrePassCastResult.model_validate_json(
+                        prev_seed_path.read_text(encoding="utf-8")
+                    )
+                    for pc in prev_res.characters:
+                        pk = pc.canonical_name.strip().lower()
+                        if pk and pk not in seen_keys:
+                            seen_keys.add(pk)
+                            deduped.append(pc)
+                except Exception:
+                    pass
         for c in merged:
             key = c.canonical_name.strip().lower()
             if key and key not in seen_keys:
@@ -424,7 +484,7 @@ class PageAnalyzerAgent:
                 f"{hint}"
                 f"Phân tích trang {page.page_id} (chương {page.chapter_id}, format={page.format}).\n"
                 f"Các panel_id cần phân tích theo thứ tự: {panel_list}.\n"
-                "Trả về JSON gồm page_id, chapter_id, page_summary (tiếng Việt), và danh sách panels "
+                "Trả về JSON gồm page_id, chapter_id, page_summary (tiếng Việt), verbatim_quote_vi, visual_punch, và danh sách panels "
                 "(panel_id, action_summary, dialogue_summary, characters_present, emotion, importance 1-5)."
             )
             return self.llm.complete_json(
@@ -532,7 +592,7 @@ class PageAnalyzerAgent:
             + hint
             + "Phân tích lần lượt từng trang manga cần xuất kết quả dưới đây bằng TIẾNG VIỆT:\n"
             + "\n".join(page_specs)
-            + "\nTrả về JSON dạng PageBatchAnalysis gồm danh sách `pages`, mỗi phần tử có đúng `page_id`, `chapter_id`, `page_summary`, `panels`."
+            + "\nTrả về JSON dạng PageBatchAnalysis gồm danh sách `pages`, mỗi phần tử có đúng `page_id`, `chapter_id`, `page_summary`, `verbatim_quote_vi`, `visual_punch`, `panels`."
         )
         try:
             batch_res = self.llm.complete_json(
@@ -550,6 +610,40 @@ class PageAnalyzerAgent:
         except Exception:
             return blank_results
 
+    @staticmethod
+    def _build_adaptive_batches(
+        pages: list[PageInfo],
+        batch_size: int = 4,
+        target_panels: int = 16,
+    ) -> list[list[PageInfo]]:
+        """Group consecutive pages adaptively by panel density (~16-18 panels/call)."""
+        if batch_size <= 2 or len(pages) <= 2:
+            step = max(1, batch_size)
+            return [pages[i : i + step] for i in range(0, len(pages), step)]
+
+        min_pages = 2
+        max_pages = max(batch_size, min(6, batch_size + 1))
+        batches: list[list[PageInfo]] = []
+        cur_batch: list[PageInfo] = []
+        cur_panels = 0
+
+        for pg in pages:
+            p_cnt = max(1, len(pg.panels))
+            if cur_batch and (
+                len(cur_batch) >= max_pages
+                or (len(cur_batch) >= min_pages and cur_panels + p_cnt > target_panels + 2)
+            ):
+                batches.append(cur_batch)
+                cur_batch = [pg]
+                cur_panels = p_cnt
+            else:
+                cur_batch.append(pg)
+                cur_panels += p_cnt
+
+        if cur_batch:
+            batches.append(cur_batch)
+        return batches
+
     def run_all(
         self,
         manifest: JobManifest,
@@ -557,19 +651,28 @@ class PageAnalyzerAgent:
         force: bool = False,
         max_workers: int = 4,
         batch_size: int = 4,
+        prev_job_dir: Path | None = None,
     ) -> list[PageAnalysis]:
         out_all = job_dir / "02a_all_pages.json"
         pages_dir = job_dir / "02a_pages"
         pages_dir.mkdir(parents=True, exist_ok=True)
 
+        from src.agents.page_index import _detect_duplicate_spread_pages
+
+        dup_spread_pages = _detect_duplicate_spread_pages(manifest)
         all_pages = [page for ch in manifest.chapters for page in ch.pages]
         page_idx_map = {pg.page_id: idx for idx, pg in enumerate(all_pages)}
         results: dict[str, PageAnalysis] = {}
         uncached: list[PageInfo] = []
 
-        # Cache hygiene: reload valid cached pages and automatically re-queue any dummy placeholder pages
+        # Cache hygiene: skip spread-duplicate splits deterministically before calling Vision LLM
         for page in all_pages:
             page_json = pages_dir / f"{page.page_id}.json"
+            if page.page_id in dup_spread_pages:
+                dup_pa = _make_duplicate_spread_page_analysis(page)
+                results[page.page_id] = dup_pa
+                page_json.write_text(dup_pa.model_dump_json(indent=2), encoding="utf-8")
+                continue
             if page_json.exists() and not force:
                 try:
                     pa = PageAnalysis.model_validate_json(page_json.read_text(encoding="utf-8"))
@@ -581,7 +684,12 @@ class PageAnalyzerAgent:
             uncached.append(page)
 
         seed_cast, cast_sheet_path = self.discover_seed_cast(
-            manifest, job_dir, force=force, max_workers=max_workers
+            manifest,
+            job_dir,
+            force=force,
+            max_workers=max_workers,
+            exclude_pages=dup_spread_pages,
+            prev_job_dir=prev_job_dir,
         )
         known_cast_seed = [c.canonical_name for c in seed_cast]
 
@@ -617,7 +725,7 @@ class PageAnalyzerAgent:
                         overlap_for_first.append(prev_pg)
 
                 chunk_out: list[PageAnalysis] = []
-                batches = [chunk_pages[i : i + step] for i in range(0, len(chunk_pages), step)]
+                batches = self._build_adaptive_batches(chunk_pages, batch_size=step)
                 for b_idx, batch in enumerate(batches):
                     got = self.analyze_batch(
                         batch,

@@ -77,40 +77,39 @@ manga_recap_generator/
 ├── models/manga109_yolo/            # Model ONNX YOLOv11 nhận diện frame, face, body, text
 ├── src/
 │   ├── cli.py                       # Typer CLI (`run`, `download`, `inspect`)
-│   ├── config.py                    # Pydantic schemas AppConfig; nạp config.yaml + ghi đè từ .env
-│   ├── pipeline.py                  # Bộ điều phối 6 Stage (MangaRecapPipeline) kèm checkpointing & telemetry
+│   ├── config.py                    # Pydantic schemas AppConfig; nạp config.yaml + ghi đè từ .env (`default_model=gpt-6.2-sol`)
+│   ├── pipeline.py                  # Bộ điều phối 6 Stage (MangaRecapPipeline) kèm checkpointing, `--prev-job` & telemetry
 │   ├── core/
 │   │   ├── protocols.py             # Typing Protocol cho Detector, TTSBackend, Renderer, Exporter
 │   │   ├── registry.py              # PluginRegistry quản lý đăng ký các backend theo tên
 │   │   └── telemetry.py             # Theo dõi thời gian chạy từng stage, lượng token, fallback và cảnh báo
 │   ├── schemas/
 │   │   ├── ingestion.py             # Schemas Stage 1: BBox, FocalPoint, PanelInfo, PageInfo, ChapterInfo, JobManifest
-│   │   ├── analysis.py              # Schemas Stage 2: PanelAnalysis, PageAnalysis, CharacterProfile, ChapterSummary, StoryBible
-│   │   ├── script.py                # Schemas Stage 3: ScriptBeat, RecapScript, CriticIssue, CriticReport
-│   │   └── timeline.py              # Schemas Stage 4-5: AudioBeatInfo, AudioManifest, TimelineShot, SubtitleCue, VideoTimeline
+│   │   ├── analysis.py              # Schemas Stage 2: PanelAnalysis, PageAnalysis (+`verbatim_quote_vi`, `visual_punch`), CharacterProfile, StoryBible (+`pronunciation_map`)
+│   │   ├── script.py                # Schemas Stage 3: `VALID_MOODS`, `normalize_mood`, ScriptBeat (+`beat_type`, `tts_text`), RecapScript (+`hook_strategy`), CriticIssue, CriticReport
+│   │   └── timeline.py              # Schemas Stage 4-5: WordTimestamp, AudioBeatInfo, AudioManifest, TimelineShot, SubtitleCue, VideoTimeline (+`reading_order`)
 │   ├── llm/client.py                # LLMClient chuẩn OpenAI API: tách provider text/vision (`extra_body`), circuit breaker, Pydantic JSON
 │   ├── cv/
 │   │   ├── registry.py / loader.py  # DETECTOR_REGISTRY; giải nén .cbz/.zip hoặc đọc thư mục theo `natural_sort_key`
-│   │   ├── manga_detector.py        # MangaYoloDetector (ONNX): phát hiện frame/face/body/text, lọc mảnh rác theo tỷ lệ trang, sắp xếp RTL/LTR
-│   │   ├── manhwa_slicer.py         # ManhwaStripSlicer: cắt dải ảnh dọc webtoon theo khoảng trắng ngang (gutter detection)
+│   │   ├── manga_detector.py        # MangaYoloDetector (ONNX): Recursive XY-Cut RTL/LTR (chuẩn L-shape), cắt viền trắng inset đồng bộ `focal_points` ngay Stage 1
+│   │   ├── manhwa_slicer.py         # ManhwaStripSlicer: cắt dải ảnh dọc webtoon theo ngưỡng tỷ lệ chiều rộng + hậu kiểm YOLO `face/body/text`
 │   │   ├── som.py / stage.py        # Vẽ nhãn Set-of-Mark ([P1]..[Pn]) và điều phối Stage 1 (`run_stage1_ingest`)
 │   ├── agents/
-│   │   ├── page_analyzer.py         # Stage 1.5 & 2a: Pre-Pass tìm nhân vật + ghép `cast_sheet.jpg`; lọc trang trắng bằng độ lệch chuẩn; Chunked Parallel Rolling Vision
-│   │   ├── page_index.py            # Stage 2b: Chuẩn hóa bí danh (`scoped_map` chống spoiler); lọc trang đôi cắt trùng bằng MAE ảnh thu nhỏ; lọc front/backmatter theo trạng thái; dựng `PageIndexTree`, `StoryBible`, `MEMORY.md`
-│   │   ├── story_bible.py           # Tiện ích truy vấn và hợp nhất hồ sơ nhân vật StoryBible
-│   │   ├── scriptwriter.py          # Stage 3a: Biên kịch 3 tầng với phân hoạch `1 Scene = 1 Part` tách biệt, bảng phân bổ trang theo beat và khóa thứ tự panel đơn điệu theo mật độ trang/beat
-│   │   ├── critic.py                # Stage 3b: Kiểm định kịch bản (grounding, biên giới Part, khoảng trống trang và độ rộng beat theo mật độ động, nhảy lùi trang, lặp nội dung N-gram, từ sáo rỗng AI)
-│   │   └── choreographer.py         # Stage 5: Đạo diễn hình ảnh — ghép diptych cùng trang, mượn panel cùng trang (`beat_pages`), chia thời lượng shot theo độ dài câu đọc, Ken Burns và chia phụ đề
+│   │   ├── page_analyzer.py         # Stage 1.5 & 2a: Pre-Pass cast sheet UTF-8 Pillow; khử spread trùng sớm bằng CV; Adaptive Panel Batching (~16-18 panels/call); trích `verbatim_quote_vi` & `visual_punch`
+│   │   ├── page_index.py            # Stage 2b: Chuẩn hóa bí danh toàn văn bản (`scoped_map` chống spoiler); lọc spread 2 chiều; Semantic Scene Segmentation + `narrative_weight`; `PageIndexSceneSummarizer` gộp batch + cache; `StoryBible` (+`seed_cast`, `pronunciation.json`) & `scoped_outline_view` O(N)
+│   │   ├── scriptwriter.py          # Stage 3a: Phân hoạch `1 Scene = 1 Part`, O(N) Scoped Memory/Tree Index + cầu nối 2 trang cuối, ngân sách theo `narrative_weight`, Storytelling Affordances
+│   │   ├── critic.py                # Stage 3b: Closed-Loop Critic (`error` vs `warning`, Macro Rhythm Critique), Read-Aloud Showrunner Pass (khóa cứng `panel_ids`) & chuẩn bị `tts_text`
+│   │   └── choreographer.py         # Stage 5: Đạo diễn hình ảnh — word-timestamp sync, tách 2 nhịp sub-shot (`Wide -> Focus Face`), LTR/RTL & 9:16 vertical, đồng bộ 7 `mood`
 │   ├── audio/
-│   │   ├── registry.py / base.py    # TTS_REGISTRY, hash cache theo từng beat, đọc thời lượng WAV và nối `04_voiceover.wav`
-│   │   ├── edge_tts_backend.py      # Microsoft Edge TTS tiếng Việt xuất WAV PCM
-│   │   ├── vieneu_tts.py            # Backend VieNeu TTS nội bộ (tùy chọn)
-│   │   ├── bgm_generator.py / stage.py # Tự tổng hợp nhạc nền Dark Fantasy D-minor (`ensure_default_bgm`) & điều phối Stage 4
+│   │   ├── registry.py / base.py    # TTS_REGISTRY, `apply_pronunciation_glossary`, `beat_cache_key` (gồm `rate`), anti-aliased Fourier resampling & word timestamp alignment
+│   │   ├── edge_tts_backend.py      # Microsoft Edge TTS tiếng Việt kèm `WordBoundary` timestamps & tổng hợp song song
+│   │   ├── vieneu_tts.py            # Backend VieNeu TTS nội bộ kèm fallback tự động sang Edge-TTS
+│   │   ├── bgm_generator.py / stage.py # Nhạc nền động đa `mood` + SFX tinh tế (`build_dynamic_timeline_bgm`) & điều phối Stage 4
 │   ├── render/
-│   │   ├── registry.py / compositor.py # RENDERER_REGISTRY; kết xuất frame OpenCV (nền mờ bokeh, bóng đổ, diptych RTL, pan/zoom/shake)
-│   │   ├── subtitles.py / preview_html.py # Xuất `.srt`, vẽ hộp phụ đề UTF-8 có cache RGBA pre-multiplied, xuất preview HTML
-│   │   └── ffmpeg_renderer.py       # Kết xuất MP4 đa luồng qua pipe FFmpeg (VAAPI/libx264), tự cắt viền trắng thừa (`_trim_excess_white_border`) và trộn BGM sidechain ducking
-│   ├── exporters/                   # `registry.py`, `srt_exporter.py`, `capcut_draft.py` (`draft_content.json`), `html_preview.py`
+│   │   ├── registry.py / compositor.py # RENDERER_REGISTRY; kết xuất frame OpenCV (bokeh, shadow, diptych RTL/LTR, Ken Burns/shake)
+│   │   ├── subtitles.py / preview_html.py # Xuất `.srt`, phụ đề word-wrap UTF-8 (9:16/16:9) có `subtitle_font_ratio`, HTML preview kèm ảnh thumbnail & audio player
+│   │   └── ffmpeg_renderer.py       # Kết xuất MP4 đa luồng (VAAPI/libx264), tự nạp dynamic multi-mood BGM + sidechaincompress ducking
+│   ├── exporters/                   # `registry.py`, `srt_exporter.py`, `capcut_draft.py` (đủ diptych + BGM + subtitles), `html_preview.py`
 │   └── downloaders/nyaa.py          # Tìm kiếm và tải torrent/magnet manga từ Nyaa
 └── tests/                           # 7 file pytest: `test_schemas_and_json.py`, `test_config_and_registry.py`, `test_cv.py`, `test_page_index_and_agents.py`, `test_audio.py`, `test_renderer_and_exporters.py`, `test_downloader.py`
 ```
@@ -127,23 +126,20 @@ manga_recap_generator/
 ## 5. Kiến Trúc & Luồng Xử Lý Chi Tiết 6-Stage Pipeline
 
 1. **Stage 1 — CV Ingest (`src/cv/`)**:
-   - Giải nén `.cbz`/`.zip` theo `natural_sort_key`. Tự động chọn `ManhwaStripSlicer` cho ảnh dải dọc webtoon hoặc `MangaYoloDetector` (ONNX YOLOv11 phát hiện `frame`, `face`, `body`, `text`) cho trang sách.
-   - Loại bỏ khung rác có kích thước quá nhỏ so với cạnh ngắn của trang (`min(w, h)`) hoặc dải screentone trống không có mặt/chữ, sắp xếp khung theo hàng ngang theo chiều đọc `rtl`/`ltr` và vẽ nhãn Set-of-Mark `[P1]..[Pn]`.
+   - Giải nén `.cbz`/`.zip` theo `natural_sort_key`. Tự động chọn `ManhwaStripSlicer` (ngưỡng tương đối theo chiều rộng ảnh + hậu kiểm YOLO `face/body/text`) cho webtoon hoặc `MangaYoloDetector` (ONNX YOLOv11 + sắp xếp **Recursive XY-Cut** chuẩn bố cục L-shape RTL/LTR) cho trang sách.
+   - Cắt viền trắng thừa trang inset và dịch chuyển tọa độ `focal_points` ngay tại Stage 1 (`trim_white_border_with_offset`), rồi vẽ nhãn Set-of-Mark `[P1]..[Pn]`.
 2. **Stage 1.5 & 2a — Pre-Pass Cast Sheet & Rolling Vision (`src/agents/page_analyzer.py`)**:
-   - **Chặn trang trắng bằng CV**: `_is_blank_or_solid_page()` kiểm tra độ lệch chuẩn mức xám của ảnh; nếu là trang trắng/đen trơn thì trả về ngay `[PHỤ LỤC] Trang trắng` mà không gọi Vision LLM để chống bịa nội dung.
-   - **Pre-Pass**: Chọn các trang mẫu giàu mặt người và chữ trải đều qua các phân vùng của tập truyện để trích xuất nhân vật có câu thoại bằng chứng (`evidence_quote`) và dựng ảnh `repo/cast_sheet.jpg`.
-   - **Chunked Parallel Rolling Vision**: Đọc ảnh theo batch song song; mỗi batch luôn đính kèm `cast_sheet.jpg` ở ảnh đầu tiên cùng `RollingSceneState` (nhân vật đang có mặt + tóm tắt các trang liền trước).
+   - **Khử trang trắng & trang đôi cắt trùng trước khi gọi Vision**: `_is_blank_or_solid_page()` + `_detect_duplicate_spread_pages()` (kiểm tra cả 2 chiều `[Spread,P1,P2]` và `[P1,P2,Spread]`) chặn bằng CV thuần (0 token) trước khi đưa vào Vision LLM.
+   - **Pre-Pass UTF-8 & Cross-Volume**: Quét trang mẫu có bằng chứng thoại (`evidence_quote`), ghép bảng `repo/cast_sheet.jpg` bằng Pillow UTF-8, tùy chọn kế thừa `--prev-job`.
+   - **Adaptive Panel Batching & Rich Visuals**: Gom batch thích ứng theo mật độ khung (`~16–18 panels/call`) kèm `cast_sheet.jpg` và `RollingSceneState`, trích thêm `verbatim_quote_vi` + `visual_punch`.
 3. **Stage 2b — PageIndex Tree & StoryBible (`src/agents/page_index.py`)**:
-   - **Scoped Alias Resolution**: Hợp nhất tên nhân vật về `canonical_name`. Mọi nhãn mô tả vô danh (bắt đầu bằng `[` hoặc chứa `"chưa rõ"`, `"bí ẩn"`, `"người lạ"`) chỉ được ánh xạ cục bộ trong `scoped_map` theo `page_ids`, cấm đưa vào `global_map` để chống lộ spoiler danh tính ở đầu truyện.
-   - **Khử trang đơn cắt trùng từ trang đôi (`_detect_duplicate_spread_pages`)**: Với mỗi trang đôi ngang có 2 trang dọc kế tiếp `p1, p2`, cắt đôi trang ngang, thu nhỏ đồng tỷ lệ về lưới grayscale và so sánh MAE với `p1, p2` theo cả chiều RTL và LTR; nếu khớp thì đưa `p1, p2` vào `skipped_pages`.
-   - **Lọc Frontmatter/Backmatter theo trạng thái (`_filter_story_pages`)**: Khi `not story` (chưa gặp trang truyện thật đầu tiên), lọc toàn bộ bìa/mục lục/trang 1-panel không thoại qua `_is_frontmatter_page()`. Mọi trang có tiền tố `[phụ lục]` hoặc khớp `_BACKMATTER_KEYWORDS` sau khi vào truyện đều bị loại khỏi `SceneNode`.
+   - **Scoped Alias Resolution Toàn Văn Bản**: Chuẩn hóa tên trong `characters_present`, `page_summary`, `action_summary` và `dialogue_summary`. Mọi nhãn vô danh giữ cục bộ trong `scoped_map` chống lộ spoiler.
+   - **Semantic Scene Segmentation + Nén Notes**: Tách cảnh tự nhiên kèm `narrative_weight` (1–5) & `transition_type` (có kiểm tra phủ rời rạc 100% trang), nén cú pháp `scene_*.md` (bỏ giới hạn 24k), gom batch 3 scenes/call có cache từng scene và nạp `seed_cast.json` + sinh `pronunciation_map` (`repo/pronunciation.json`).
 4. **Stage 3a — Disjoint Multi-Part Scriptwriter (`src/agents/scriptwriter.py`)**:
-   - **Phân hoạch `1 Scene = 1 Part` tách biệt**: Mỗi `SceneNode` ánh xạ 1-1 thành một `OutlinePart` với `target_beats` và `target_words` tỷ lệ thuận theo số trang. Không chồng lấn trang giữa các Part và không cắt đuôi `handoff` gây kể lặp.
-   - **Per-Beat Page Pacing Guide**: Chia đều danh sách trang của Part cho `target_beats` ngay trong prompt để LLM đi đều đến trang cuối Part, không dồn cục cuối hồi.
-   - **Khóa thứ tự Panel đơn điệu (`_sanitize_part_beats`)**: Giữ `panel_id` trong `allowed_set`, ép con trỏ `cursor_rank` tiến đơn điệu và giới hạn độ rộng mỗi beat theo mật độ trang/beat động (`max_beat_page_span` tính từ `len(ordered_pages) / len(beats)`).
-5. **Stage 3b — Critic Verification (`src/agents/critic.py`)**:
-   - Kiểm tra 6 chốt chặn: (1) Panel Grounding có fallback theo vị trí tương đối, (2) Ranh giới `allowed_panels` của từng Part, (3) Độ rộng 1 beat vượt ngưỡng mật độ động `max_single_beat_span`, (4) Nhảy lùi trang `cur_min < prev_page_pos`, (5) Khoảng trống bỏ cách trang vượt ngưỡng động `max_coverage_gap`, (6) Trùng lặp nội dung giữa các beat qua tập 2/3-grams (`_content_ngrams`) cùng danh sách `_BANNED_CLICHES`.
+   - **Phân hoạch `1 Scene = 1 Part` & $O(N)$ Context**: Mỗi `SceneNode` ánh xạ thành `OutlinePart` có `target_beats`/`target_words` phân bổ theo `narrative_weight * pages`, dùng `scoped_outline_view()` + `render_scoped_memory_md()` + cầu nối 2 trang cuối scene trước.
+   - **Storytelling Affordances & Contract `mood`**: Mở quyền chọn `hook_strategy`, `beat_type` (`narrative`/`commentary`/`outro`), `mood` chuẩn hóa về 7 giá trị (`calm`, `warm`, `comedic`, `mysterious`, `tense`, `action`, `tragic`), và khóa `cursor_rank` đơn điệu trong `_sanitize_part_beats`.
+5. **Stage 3b — Closed-Loop Critic & Showrunner (`src/agents/critic.py`)**:
+   - Phân tách `severity="error"` (grounding, biên giới Part, lùi trang, gap, lặp N-gram, cliché AI, vượt trần ngân sách từ tổng) vs `warning` (nhịp phân phối toàn tập `macro_rhythm`). Chạy **Read-Aloud Showrunner Pass** & Auto-Repair tối đa 2 vòng (khóa cứng `panel_ids` trong Python), đồng thời điền `tts_text` theo `pronunciation_map`.
 6. **Stage 4, 5 & 6 — Audio, Choreographer & FFmpeg Renderer (`src/audio/`, `src/agents/choreographer.py`, `src/render/`)**:
-   - **Audio**: Tổng hợp WAV PCM theo mã băm từng beat và nối thành `04_voiceover.wav` + `04_audio_manifest.json`.
-   - **Choreographer**: Lọc panel theo kích thước tương đối của trang (`page_short`); chỉ ghép diptych khi 2 panel dọc thuộc **cùng một trang (`p1.page_id == p2.page_id`)**; khi beat dài cần thêm hình, chỉ mượn panel chưa dùng thuộc **cùng các trang của beat đó (`cand.page_id in beat_pages`)**; chia thời lượng từng shot tỷ lệ thuận với độ dài câu đọc (`slot_durations`).
-   - **FFmpeg Renderer**: Tự cắt viền trắng thừa cho các trang inset có phần lớn diện tích là nền trắng (`_trim_excess_white_border`), dựng frame bokeh + phụ đề đa luồng và đẩy qua FFmpeg (`h264_vaapi` hoặc `libx264`) kèm trộn nhạc nền `sidechaincompress` ducking.
+   - **Audio**: Tổng hợp `tts_text` song song qua Edge-TTS (kèm `WordBoundary` timestamps) hoặc VieNeu (fallback sang Edge-TTS khi lỗi), dùng Fourier anti-aliased resampling, `beat_cache_key` tính cả `rate`, và sinh BGM đa `mood` + SFX (`build_dynamic_timeline_bgm`).
+   - **Choreographer & Renderer**: Word-timestamp subtitle sync, word-wrap phụ đề cho cả `16:9` & `9:16`, tách 2 nhịp sub-shot (`Wide -> Focus Face`) trên slot dài giàu chi tiết, hỗ trợ RTL/LTR ở `compositor.py`, HTML preview có `<img>` + `<audio>`, và CapCut draft đầy đủ diptych + BGM + subtitles.

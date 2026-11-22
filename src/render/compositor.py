@@ -121,6 +121,7 @@ def render_shot_frame(
     margin_ratio: float = 0.06,
     bottom_safe_ratio: float = 0.14,
     out_buf: np.ndarray | None = None,
+    reading_order: str = "rtl",
 ) -> np.ndarray:
     """Compose a single 1080p/720p frame (single or diptych) above subtitle safe area."""
     t = float(np.clip(progress, 0.0, 1.0))
@@ -171,9 +172,14 @@ def render_shot_frame(
         total_w = dw1 + dw2 + gap
         start_x = int(np.clip((width - total_w) // 2, 6, max(6, width - total_w - 6)))
         py = int(np.clip(margin_top + (max_h - target_h) // 2, 6, max(6, height - target_h - 6)))
-        # RTL order: newer secondary panel on Left, primary panel on Right
-        _blit_with_shadow(canvas, fg2, start_x, py)
-        _blit_with_shadow(canvas, fg1, start_x + dw2 + gap, py)
+        if reading_order.lower() == "ltr":
+            # LTR order: primary panel on Left, secondary panel on Right
+            _blit_with_shadow(canvas, fg1, start_x, py)
+            _blit_with_shadow(canvas, fg2, start_x + dw1 + gap, py)
+        else:
+            # RTL order: newer secondary panel on Left, primary panel on Right
+            _blit_with_shadow(canvas, fg2, start_x, py)
+            _blit_with_shadow(canvas, fg1, start_x + dw2 + gap, py)
         return canvas
 
     fg = _render_single_panel(panel_bgr, shot, ease, t, max_w=max_w, max_h=max_h)

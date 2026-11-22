@@ -13,6 +13,7 @@ import cv2
 import imageio_ffmpeg
 import numpy as np
 
+from src.cv.manga_detector import trim_white_border_with_offset
 from src.render.compositor import _make_blurred_bg, render_shot_frame
 from src.render.registry import RENDERER_REGISTRY
 from src.render.subtitles import draw_subtitle_overlay, warm_subtitle_cache
@@ -77,26 +78,8 @@ def _apply_transition(
 
 def _trim_excess_white_border(img: np.ndarray) -> np.ndarray:
     """Crop dominant empty white margins on sparse single-panel inset pages."""
-    ih, iw = img.shape[:2]
-    if ih < 200 or iw < 200:
-        return img
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-    if float(np.mean(gray > 245)) <= 0.75:
-        return img
-    ys, xs = np.where(gray < 230)
-    if len(xs) < 100:
-        return img
-    x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
-    area_ratio = ((x1 - x0) * (y1 - y0)) / float(ih * iw)
-    if 0.05 <= area_ratio <= 0.60 and (x1 - x0) >= 120 and (y1 - y0) >= 120:
-        pad_x = int(iw * 0.06)
-        pad_y = int(ih * 0.06)
-        x0 = max(0, x0 - pad_x)
-        y0 = max(0, y0 - pad_y)
-        x1 = min(iw, x1 + pad_x)
-        y1 = min(ih, y1 + pad_y)
-        return img[y0:y1, x0:x1]
-    return img
+    trimmed, _, _ = trim_white_border_with_offset(img)
+    return trimmed
 
 
 @RENDERER_REGISTRY.register("ffmpeg_opencv")
@@ -116,6 +99,7 @@ class FFmpegOpenCVRenderer:
         bottom_safe_ratio: float = 0.14,
         bgm_volume: float = 0.14,
         bgm_ducking: bool = True,
+        subtitle_font_ratio: float = 0.036,
         use_hw_accel: bool = True,
     ) -> None:
         self.crf = crf
@@ -127,6 +111,7 @@ class FFmpegOpenCVRenderer:
         self.bottom_safe_ratio = bottom_safe_ratio
         self.bgm_volume = bgm_volume
         self.bgm_ducking = bgm_ducking
+        self.subtitle_font_ratio = subtitle_font_ratio
         self.use_hw_accel = use_hw_accel
 
     def render(
@@ -141,13 +126,22 @@ class FFmpegOpenCVRenderer:
 
         total_frames = max(1, int(round(timeline.total_duration_ms / 1000.0 * timeline.fps)))
         has_audio = bool(timeline.voiceover_path and Path(timeline.voiceover_path).exists())
+        active_bgm_path: str | None = timeline.bgm_path
         if timeline.bgm_path:
             bgm_file = Path(timeline.bgm_path)
-            if not bgm_file.exists() and bgm_file.suffix.lower() == ".wav":
+            unique_moods = {s.mood for s in timeline.shots}
+            has_sfx = any(s.camera_move == "shake_impact" or s.transition_in == "flash_white" for s in timeline.shots)
+            if has_audio and bgm_file.name == "default_dark_fantasy.wav" and (len(unique_moods) > 1 or has_sfx):
+                from src.audio.bgm_generator import build_dynamic_timeline_bgm
+
+                dyn_bgm = output_path.parent / "audio" / "04b_bgm_dynamic.wav"
+                build_dynamic_timeline_bgm(timeline, dyn_bgm)
+                active_bgm_path = str(dyn_bgm.resolve())
+            elif not bgm_file.exists() and bgm_file.suffix.lower() == ".wav":
                 from src.audio.bgm_generator import ensure_default_bgm
 
                 ensure_default_bgm(bgm_file)
-        has_bgm = bool(has_audio and timeline.bgm_path and Path(timeline.bgm_path).exists())
+        has_bgm = bool(has_audio and active_bgm_path and Path(active_bgm_path).exists())
 
         cmd = [ffmpeg, "-y"]
         if vaapi_dev:
@@ -171,7 +165,7 @@ class FFmpegOpenCVRenderer:
         if has_audio:
             cmd.extend(["-i", str(timeline.voiceover_path)])
         if has_bgm:
-            cmd.extend(["-stream_loop", "-1", "-i", str(timeline.bgm_path)])
+            cmd.extend(["-stream_loop", "-1", "-i", str(active_bgm_path)])
 
         if has_bgm:
             vol = max(0.02, min(0.6, self.bgm_volume))
@@ -293,7 +287,12 @@ class FFmpegOpenCVRenderer:
         subs = timeline.subtitles
 
         if self.burn_subtitles and subs:
-            warm_subtitle_cache([s.text for s in subs], timeline.width, timeline.height)
+            warm_subtitle_cache(
+                [s.text for s in subs],
+                timeline.width,
+                timeline.height,
+                font_ratio=self.subtitle_font_ratio,
+            )
 
         def _load_img(pid: str, ppath: str) -> np.ndarray:
             cached = panel_cache.get(pid)
@@ -354,7 +353,9 @@ class FFmpegOpenCVRenderer:
                     if s_idx < 0:
                         for _, sub_txt in items:
                             frame = (
-                                draw_subtitle_overlay(black_frame, sub_txt)
+                                draw_subtitle_overlay(
+                                    black_frame, sub_txt, font_ratio=self.subtitle_font_ratio
+                                )
                                 if sub_txt
                                 else black_frame
                             )
@@ -395,6 +396,7 @@ class FFmpegOpenCVRenderer:
                             secondary_bgr=secondary,
                             margin_ratio=self.margin_ratio,
                             bottom_safe_ratio=self.bottom_safe_ratio,
+                            reading_order=timeline.reading_order,
                         )
                         out_f = _apply_transition(
                             raw,
@@ -403,7 +405,12 @@ class FFmpegOpenCVRenderer:
                             t_ms - shot.start_ms,
                         )
                         if sub_txt:
-                            out_f = draw_subtitle_overlay(out_f, sub_txt, in_place=True)
+                            out_f = draw_subtitle_overlay(
+                                out_f,
+                                sub_txt,
+                                in_place=True,
+                                font_ratio=self.subtitle_font_ratio,
+                            )
                         return np.ascontiguousarray(out_f)
 
                     # Pre-compute end-of-shot raw frame only if next shot crossfades into it
@@ -424,6 +431,7 @@ class FFmpegOpenCVRenderer:
                             secondary_bgr=secondary,
                             margin_ratio=self.margin_ratio,
                             bottom_safe_ratio=self.bottom_safe_ratio,
+                            reading_order=timeline.reading_order,
                         )
                     else:
                         prev_shot_last_frame = None

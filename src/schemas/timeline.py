@@ -5,6 +5,12 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class WordTimestamp(BaseModel):
+    word: str
+    start_ms: int
+    end_ms: int
+
+
 class AudioBeatInfo(BaseModel):
     beat_id: str
     audio_path: str
@@ -13,6 +19,7 @@ class AudioBeatInfo(BaseModel):
     end_ms: int = 0
     pause_after_ms: int = 240
     sample_rate: int = 48000
+    word_timestamps: list[WordTimestamp] = Field(default_factory=list)
 
 
 class AudioManifest(BaseModel):
@@ -54,6 +61,7 @@ class VideoTimeline(BaseModel):
     width: int
     height: int
     fps: int
+    reading_order: str = "rtl"
     total_duration_ms: int
     voiceover_path: str
     bgm_path: str | None = None
