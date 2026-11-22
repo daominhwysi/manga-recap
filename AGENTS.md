@@ -1,6 +1,6 @@
 # AGENTS.md — Manga Recap Generator Architecture & Engineering Rules
 
-> Đặc tả kiến trúc, cấu trúc filesystem, luồng dữ liệu 6-Stage và quy tắc bất biến cho mọi AI Agent phát triển `manga_recap_generator`. (Giữ file `< 11 KB` để hệ thống nạp trọn vẹn 100% vào `<user_rules>` mỗi lượt mà không bị cắt đuôi).
+> Đặc tả kiến trúc, filesystem, luồng dữ liệu 6-Stage và quy tắc bất biến cho mọi AI Agent phát triển `manga_recap_generator`. (Giữ dung lượng `< 12 KB` để hệ thống nạp trọn 100% vào `<user_rules>` mỗi lượt mà không bị cắt đuôi).
 
 ---
 
@@ -16,10 +16,8 @@
 
 ## 2. Quy Tắc Kỹ Thuật Bắt Buộc (Mandatory Engineering Rules)
 
-> 🔴 **Đặt ở đầu file để mọi AI Agent luôn đọc thấy trước khi thực thi bất kỳ tác vụ nào.**
-
 ### Rule 1 — Đồng bộ `AGENTS.md` khi sửa Workflow hoặc Filesystem (`AGENTS.md` Sync Rule)
-- Bất kỳ khi nào thêm, xóa, đổi tên hoặc di chuyển file/thư mục trong `src/`, `configs/`, `tests/`, hoặc thay đổi kiến trúc Stage, schema dữ liệu hay file checkpoint trong `jobs/<job_id>/`, **BẮT BUỘC phải cập nhật Mục 4 (Filesystem) và Mục 5 (Workflow) của `AGENTS.md` ngay trong cùng tác vụ**.
+- Bất kỳ khi nào thêm, xóa, đổi tên hoặc di chuyển file/thư mục trong `src/`, `configs/`, `tests/`, hoặc thay đổi kiến trúc Stage, schema dữ liệu hay file checkpoint trong `jobs/<job_id>/`, **BẮT BUỘC cập nhật Mục 4 (Filesystem) và Mục 5 (Workflow) của `AGENTS.md` ngay trong cùng tác vụ**.
 
 ### Rule 2 — Cấm tuyệt đối Anti-Pattern Overfit & Hardcode thiếu tính tổng quát
 - **Cấm dữ liệu đặc thù bộ truyện**: Không đưa tên nhân vật, địa danh, tổ chức hay câu thoại mẫu của bất kỳ bộ truyện cụ thể nào (như *Pandora Hearts*) vào `src/`, `configs/` hay `config.yaml`.
@@ -30,30 +28,28 @@
 - Sau khi hoàn thành bất kỳ tính năng, cải tiến hoặc sửa lỗi nào:
   1. Chạy `uv run pytest -q` (bắt buộc 100% PASS; thêm unit test mới cho logic mới).
   2. Cập nhật `AGENTS.md` nếu có thay đổi file/workflow (Rule 1).
-  3. Commit ngay vào Git repository theo chuẩn Conventional Commits (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`). Không gộp nhiều tính năng rời rạc vào một commit.
+  3. Commit ngay vào Git repository theo chuẩn Conventional Commits (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`).
 
 ### Rule 4 — Không nạp `RULES.md` vào Context
-- File `RULES.md` (`110 KB`) ở thư mục gốc là tài liệu hướng dẫn viết bài báo học thuật Machine Learning tiếng Anh (LaTeX, p-value, abstract) không thuộc ngữ cảnh dự án này. **Tuyệt đối không đọc/nạp `RULES.md` vào context** để tránh lãng phí ~28.000 tokens. Các nguyên lý hữu ích (chỉ dẫn phủ định kèm ví dụ XẤU/TỐT, cấm cliché AI, giữ nhất quán `canonical_name`) đã được tích hợp trực tiếp vào `configs/personas.yaml` và `src/agents/critic.py`.
+- File `RULES.md` (`110 KB`) ở thư mục gốc là tài liệu viết báo học thuật ML tiếng Anh (LaTeX, p-value, abstract) ngoài ngữ cảnh dự án này. **Tuyệt đối không đọc/nạp `RULES.md` vào context** để tránh tốn ~28.000 tokens. Các nguyên lý hữu ích (chỉ dẫn phủ định kèm ví dụ XẤU/TỐT, cấm cliché AI, giữ nhất quán `canonical_name`) đã tích hợp vào `configs/personas.yaml` và `src/agents/critic.py`.
 
 ---
 
 ## 3. Lệnh Vận Hành, Kiểm Thử & Quản Lý Cache
 
 ```bash
-# 1. Chạy toàn bộ unit tests (bao gồm quét chống overfitting codebase)
+# Chạy toàn bộ unit tests (bao gồm quét chống overfitting codebase)
 uv run pytest -v
 
-# 2. Chạy pipeline đầy đủ cho 1 file CBZ hoặc thư mục truyện
-uv run manga-recap run <duong_dan_cbz_hoac_folder> --job-id <ten_job> --persona kich_tinh
+# Chạy pipeline đầy đủ hoặc xem thông tin job
+uv run manga-recap run <cbz_or_folder> --job-id <job_id> --persona kich_tinh
+uv run manga-recap inspect jobs/<job_id>
 
-# 3. Xem thống kê manifest / kịch bản của một job
-uv run manga-recap inspect jobs/<ten_job>
-
-# 4. Xóa cache từ Stage 2b trở đi để tái tạo Index + Script + Audio + Video (giữ lại cache Vision Stage 1 & 2a)
-rm -rf jobs/<ten_job>/02b_story_bible.json jobs/<ten_job>/repo/tree_index.json \
-       jobs/<ten_job>/repo/MEMORY.md jobs/<ten_job>/repo/notes \
-       jobs/<ten_job>/repo/OUTLINE.json jobs/<ten_job>/repo/script \
-       jobs/<ten_job>/03* jobs/<ten_job>/04* jobs/<ten_job>/05* jobs/<ten_job>/06*
+# Xóa cache từ Stage 2b trở đi để tái tạo Index + Script + Audio + Video (giữ cache Vision 01 & 02a)
+rm -rf jobs/<job_id>/02b_story_bible.json jobs/<job_id>/repo/tree_index.json \
+       jobs/<job_id>/repo/MEMORY.md jobs/<job_id>/repo/notes \
+       jobs/<job_id>/repo/OUTLINE.json jobs/<job_id>/repo/script \
+       jobs/<job_id>/03* jobs/<job_id>/04* jobs/<job_id>/05* jobs/<job_id>/06*
 ```
 
 ---
@@ -64,75 +60,55 @@ rm -rf jobs/<ten_job>/02b_story_bible.json jobs/<ten_job>/repo/tree_index.json \
 manga_recap_generator/
 ├── AGENTS.md                        # Đặc tả kiến trúc, filesystem, workflow và quy tắc bắt buộc cho AI Agents
 ├── config.yaml                      # Cấu hình trung tâm (LLM provider/models, CV, Script, TTS, Render, Exporters)
-├── pyproject.toml / uv.lock         # Khai báo dependencies Python (quản lý qua uv) và cấu hình pytest/ruff
-├── .env.example / .gitignore        # Mẫu biến môi trường API và quy tắc loại trừ file tạm/dữ liệu job lớn
-├── configs/
-│   └── personas.yaml                # Định nghĩa System Prompt và giọng kể (kich_tinh, hai_huoc, phan_tich)
-├── assets/bgm/
-│   └── default_dark_fantasy.wav     # Nhạc nền D-minor stereo 48kHz tự động tổng hợp (loop 64s không bản quyền)
-├── models/manga109_yolo/            # Model ONNX YOLOv11 nhận diện khung tranh (frame), mặt (face), người (body), chữ (text)
+├── pyproject.toml / uv.lock         # Dependencies Python (uv) và cấu hình pytest/ruff
+├── .env.example / .gitignore        # Mẫu biến môi trường API và quy tắc loại trừ dữ liệu job lớn
+├── configs/personas.yaml            # System Prompt và thông số giọng kể (kich_tinh, hai_huoc, phan_tich)
+├── assets/bgm/default_dark_fantasy.wav # Nhạc nền D-minor stereo 48kHz tự tổng hợp (loop 64s không bản quyền)
+├── models/manga109_yolo/            # Model ONNX YOLOv11 nhận diện frame, face, body, text
 ├── src/
-│   ├── cli.py                       # Giao diện dòng lệnh Typer CLI (`run`, `download`, `inspect`)
-│   ├── config.py                    # Pydantic schemas cho AppConfig; nạp config.yaml kết hợp ghi đè từ .env
+│   ├── cli.py                       # Typer CLI (`run`, `download`, `inspect`)
+│   ├── config.py                    # Pydantic schemas AppConfig; nạp config.yaml + ghi đè từ .env
 │   ├── pipeline.py                  # Bộ điều phối 6 Stage (MangaRecapPipeline) kèm checkpointing & telemetry
 │   ├── core/
 │   │   ├── protocols.py             # Typing Protocol cho Detector, TTSBackend, Renderer, Exporter
-│   │   ├── registry.py              # Lớp PluginRegistry quản lý đăng ký các backend theo tên
-│   │   └── telemetry.py             # Theo dõi thời gian chạy từng stage, lượng token, model fallback và cảnh báo
+│   │   ├── registry.py              # PluginRegistry quản lý đăng ký các backend theo tên
+│   │   └── telemetry.py             # Theo dõi thời gian chạy từng stage, lượng token, fallback và cảnh báo
 │   ├── schemas/
 │   │   ├── ingestion.py             # Schemas Stage 1: BBox, FocalPoint, PanelInfo, PageInfo, ChapterInfo, JobManifest
 │   │   ├── analysis.py              # Schemas Stage 2: PanelAnalysis, PageAnalysis, CharacterProfile, ChapterSummary, StoryBible
 │   │   ├── script.py                # Schemas Stage 3: ScriptBeat, RecapScript, CriticIssue, CriticReport
 │   │   └── timeline.py              # Schemas Stage 4-5: AudioBeatInfo, AudioManifest, TimelineShot, SubtitleCue, VideoTimeline
-│   ├── llm/
-│   │   └── client.py                # LLMClient chuẩn OpenAI API: tách provider text/vision (`extra_body`), circuit breaker, ép kiểu Pydantic JSON
+│   ├── llm/client.py                # LLMClient chuẩn OpenAI API: tách provider text/vision (`extra_body`), circuit breaker, Pydantic JSON
 │   ├── cv/
-│   │   ├── registry.py              # DETECTOR_REGISTRY quản lý các bộ cắt khung tranh
-│   │   ├── loader.py                # Giải nén .cbz/.zip hoặc quét thư mục ảnh theo thứ tự tự nhiên (`natural_sort_key`)
+│   │   ├── registry.py / loader.py  # DETECTOR_REGISTRY; giải nén .cbz/.zip hoặc đọc thư mục theo `natural_sort_key`
 │   │   ├── manga_detector.py        # MangaYoloDetector (ONNX): phát hiện frame/face/body/text, lọc mảnh rác, sắp xếp RTL/LTR
 │   │   ├── manhwa_slicer.py         # ManhwaStripSlicer: cắt dải ảnh dọc webtoon theo khoảng trắng ngang (`row_std < 6.0`)
-│   │   ├── som.py                   # Vẽ nhãn Set-of-Mark ([P1], [P2]...) lên trang truyện phục vụ Vision LLM
-│   │   └── stage.py                 # Điều phối Stage 1 (`run_stage1_ingest`), tự động chọn detector theo tỷ lệ `h/w >= 2.2`
+│   │   ├── som.py / stage.py        # Vẽ nhãn Set-of-Mark ([P1]..[Pn]) và điều phối Stage 1 (`run_stage1_ingest`, tự chọn theo `h/w >= 2.2`)
 │   ├── agents/
-│   │   ├── page_analyzer.py         # Stage 1.5 & 2a: Pre-Pass tìm nhân vật + ghép `cast_sheet.jpg`; lọc trang trắng (`np.std < 4.5`); đọc ảnh theo lô song song có gối ngữ cảnh (Chunked Parallel Rolling Vision)
+│   │   ├── page_analyzer.py         # Stage 1.5 & 2a: Pre-Pass tìm nhân vật + ghép `cast_sheet.jpg`; lọc trang trắng (`np.std < 4.5`); Chunked Parallel Rolling Vision
 │   │   ├── page_index.py            # Stage 2b: Chuẩn hóa bí danh (`scoped_map` chống spoiler); lọc trang đôi cắt trùng (`96x144` MAE); lọc front/backmatter theo trạng thái; dựng `PageIndexTree`, `StoryBible`, `MEMORY.md`
 │   │   ├── story_bible.py           # Tiện ích truy vấn và hợp nhất hồ sơ nhân vật StoryBible
-│   │   ├── scriptwriter.py          # Stage 3a: Biên kịch 3 tầng với phân hoạch `1 Scene = 1 Part` tách biệt, bảng phân bổ trang theo beat và bộ lọc khóa thứ tự panel đơn điệu (`<= 3` trang/beat)
-│   │   ├── critic.py                # Stage 3b: Kiểm định kịch bản (grounding, biên giới Part, khoảng trống trang, nhảy lùi trang, ôm >4 trang, lặp nội dung N-gram, từ sáo rỗng AI)
-│   │   └── choreographer.py         # Stage 5: Đạo diễn hình ảnh — ghép diptych cùng trang, mượn panel cùng trang (`beat_pages`), chia thời lượng shot theo độ dài câu đọc, tính quỹ đạo Ken Burns và chia phụ đề
+│   │   ├── scriptwriter.py          # Stage 3a: Biên kịch 3 tầng với phân hoạch `1 Scene = 1 Part` tách biệt, bảng phân bổ trang theo beat và khóa thứ tự panel đơn điệu (`<= 3` trang/beat)
+│   │   ├── critic.py                # Stage 3b: Kiểm định kịch bản (grounding, biên giới Part, khoảng trống >10 trang, nhảy lùi trang, ôm >4 trang, lặp nội dung N-gram, từ sáo rỗng AI)
+│   │   └── choreographer.py         # Stage 5: Đạo diễn hình ảnh — ghép diptych cùng trang, mượn panel cùng trang (`beat_pages`), chia thời lượng shot theo độ dài câu đọc, Ken Burns và chia phụ đề
 │   ├── audio/
-│   │   ├── registry.py / base.py    # TTS_REGISTRY, hash cache theo từng beat, đọc thời lượng WAV và nối file `04_voiceover.wav`
-│   │   ├── edge_tts_backend.py      # Backend Microsoft Edge TTS tiếng Việt (`vi-VN-NamMinhNeural`) xuất WAV PCM 48kHz
+│   │   ├── registry.py / base.py    # TTS_REGISTRY, hash cache theo từng beat, đọc thời lượng WAV và nối `04_voiceover.wav`
+│   │   ├── edge_tts_backend.py      # Microsoft Edge TTS tiếng Việt (`vi-VN-NamMinhNeural`) xuất WAV PCM 48kHz
 │   │   ├── vieneu_tts.py            # Backend VieNeu TTS nội bộ (tùy chọn)
-│   │   ├── bgm_generator.py         # Tự động tổng hợp nhạc nền Dark Fantasy D-minor stereo 48kHz (`ensure_default_bgm`)
-│   │   └── stage.py                 # Điều phối Stage 4 (`run_stage4_audio`)
+│   │   ├── bgm_generator.py / stage.py # Tự tổng hợp nhạc nền Dark Fantasy D-minor stereo 48kHz (`ensure_default_bgm`) & điều phối Stage 4
 │   ├── render/
-│   │   ├── registry.py              # RENDERER_REGISTRY quản lý các bộ kết xuất video
-│   │   ├── compositor.py            # Kết xuất từng frame OpenCV: nền mờ bokeh 1/4, bóng đổ, khung đôi diptych RTL, pan/zoom/shake
-│   │   ├── subtitles.py             # Xuất `.srt` và vẽ hộp phụ đề tiếng Việt UTF-8 bo góc có cache RGBA pre-multiplied
-│   │   ├── preview_html.py          # Tạo trình xem nhanh timeline trên trình duyệt
-│   │   └── ffmpeg_renderer.py       # Kết xuất MP4 đa luồng qua pipe FFmpeg (VAAPI hoặc libx264), tự cắt viền trắng thừa (`_trim_excess_white_border`) và trộn BGM sidechain ducking
-│   ├── exporters/
-│   │   ├── registry.py              # EXPORTER_REGISTRY quản lý các định dạng xuất phụ trợ
-│   │   ├── srt_exporter.py          # Xuất phụ đề chuẩn SubRip (`.srt`)
-│   │   ├── capcut_draft.py          # Xuất project `draft_content.json` cho CapCut Desktop
-│   │   └── html_preview.py          # Xuất bảng storyboard HTML tĩnh
-│   └── downloaders/
-│       └── nyaa.py                  # Tìm kiếm và tải torrent/magnet manga từ Nyaa
-└── tests/
-    ├── test_schemas_and_json.py     # Kiểm thử hình học BBox và tuần tự hóa Pydantic schemas
-    ├── test_config_and_registry.py  # Kiểm thử nạp config.yaml, personas.yaml, registries và BGM generator
-    ├── test_cv.py                   # Kiểm thử sắp xếp khung RTL/LTR, cắt dải Manhwa, YOLO detector và vẽ nhãn SoM
-    ├── test_page_index_and_agents.py# Kiểm thử circuit breaker, provider routing, lọc trang trắng/bìa/trang đôi trùng, PageIndex, Scriptwriter, Critic N-gram/backward jump và quét chống overfitting
-    ├── test_audio.py                # Kiểm thử ghép nối âm thanh WAV theo từng beat và tính thời lượng
-    ├── test_renderer_and_exporters.py# Kiểm thử cắt viền trắng inset panel, khóa diptych/borrow cùng trang, render MP4 stereo + ducked BGM và exporters
-    └── test_downloader.py           # Kiểm thử phân tích Nyaa ID, lọc tập truyện và giải nén CBZ
+│   │   ├── registry.py / compositor.py # RENDERER_REGISTRY; kết xuất frame OpenCV (nền mờ bokeh 1/4, bóng đổ, diptych RTL, pan/zoom/shake)
+│   │   ├── subtitles.py / preview_html.py # Xuất `.srt`, vẽ hộp phụ đề UTF-8 có cache RGBA pre-multiplied, xuất preview HTML
+│   │   └── ffmpeg_renderer.py       # Kết xuất MP4 đa luồng qua pipe FFmpeg (VAAPI/libx264), tự cắt viền trắng thừa (`_trim_excess_white_border`) và trộn BGM sidechain ducking
+│   ├── exporters/                   # `registry.py`, `srt_exporter.py`, `capcut_draft.py` (`draft_content.json`), `html_preview.py`
+│   └── downloaders/nyaa.py          # Tìm kiếm và tải torrent/magnet manga từ Nyaa
+└── tests/                           # 7 file pytest: `test_schemas_and_json.py`, `test_config_and_registry.py`, `test_cv.py`, `test_page_index_and_agents.py`, `test_audio.py`, `test_renderer_and_exporters.py`, `test_downloader.py`
 ```
 
 ### Cấu trúc Checkpoint trong `jobs/<job_id>/`
 - **Stage 1**: `extracted/` (ảnh trang gốc), `panels/*.jpg` (ảnh cắt từng khung), `som/*_som.jpg` (ảnh trang đóng dấu `[P1]..[Pn]`), `01_manifest.json` (`JobManifest`).
 - **Stage 1.5 & 2a**: `repo/seed_cast.json`, `repo/cast_sheet.jpg` (bảng ghép mặt nhân vật chuẩn), `02a_pages/*.json` (cache Vision từng trang), `02a_all_pages.json`.
-- **Stage 2b**: `repo/notes/scene_*.md` (ghi chú Markdown siêu gọn từng scene kèm `ar` và `face+text`), `repo/tree_index.json` (`PageIndexTree` + `skipped_pages`), `02b_story_bible.json` (`StoryBible`), `repo/MEMORY.md`.
+- **Stage 2b**: `repo/notes/scene_*.md` (ghi chú Markdown từng scene kèm `ar` và `face+text`), `repo/tree_index.json` (`PageIndexTree` + `skipped_pages`), `02b_story_bible.json` (`StoryBible`), `repo/MEMORY.md`.
 - **Stage 3a & 3b**: `repo/OUTLINE.json` (`1 Scene = 1 Part`), `repo/script/parts/part_*.json`, `repo/script/part_boundaries.json`, `03a_script_draft.json`, `03b_script_final.json`, `03b_critic_report.json`.
 - **Stage 4, 5 & 6**: `audio/beats/*.wav`, `04_voiceover.wav`, `04_audio_manifest.json`, `05_timeline.json` (`VideoTimeline`), `06_subtitles.srt`, `06_output.mp4`, `exports/`, `telemetry.json`.
 
@@ -160,4 +136,4 @@ manga_recap_generator/
 6. **Stage 4, 5 & 6 — Audio, Choreographer & FFmpeg Renderer (`src/audio/`, `src/agents/choreographer.py`, `src/render/`)**:
    - **Audio**: Tổng hợp WAV PCM 48kHz theo mã băm từng beat và nối thành `04_voiceover.wav` + `04_audio_manifest.json`.
    - **Choreographer**: Chỉ ghép diptych khi 2 panel dọc thuộc **cùng một trang (`p1.page_id == p2.page_id`)**; khi beat dài cần thêm hình, chỉ mượn panel chưa dùng thuộc **cùng các trang của beat đó (`cand.page_id in beat_pages`)**; chia thời lượng từng shot tỷ lệ thuận với độ dài câu đọc (`slot_durations`).
-   - **FFmpeg Renderer**: Tự động cắt viền trắng thừa cho các trang inset có `> 75%` diện tích trắng (`_trim_excess_white_border`), dựng frame bokeh + phụ đề đa luồng và đẩy qua FFmpeg (`h264_vaapi` hoặc `libx264`) kèm trộn nhạc nền `sidechaincompress` ducking.
+   - **FFmpeg Renderer**: Tự cắt viền trắng thừa cho các trang inset có `> 75%` diện tích trắng (`_trim_excess_white_border`), dựng frame bokeh + phụ đề đa luồng và đẩy qua FFmpeg (`h264_vaapi` hoặc `libx264`) kèm trộn nhạc nền `sidechaincompress` ducking.
