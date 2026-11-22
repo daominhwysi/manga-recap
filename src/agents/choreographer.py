@@ -33,7 +33,7 @@ def _split_caption_chunks(text: str, max_words: int = 8) -> list[str]:
     return chunks
 
 
-def _is_diptych_candidate(p1: PanelInfo, p2: PanelInfo) -> bool:
+def _is_diptych_candidate(p1: PanelInfo, p2: PanelInfo, page_short: int = 1000) -> bool:
     """Two consecutive distinct tall narrow panels on the same page pair cleanly side-by-side in 16:9."""
     if p1.panel_id == p2.panel_id or p1.page_id != p2.page_id:
         return False
@@ -41,16 +41,23 @@ def _is_diptych_candidate(p1: PanelInfo, p2: PanelInfo) -> bool:
     r2 = p2.width / max(1, p2.height)
     min_side1 = min(p1.width, p1.height)
     min_side2 = min(p2.width, p2.height)
-    return 0.18 <= r1 < 0.72 and 0.18 <= r2 < 0.72 and min_side1 >= 150 and min_side2 >= 150
+    min_diptych_side = max(48, int(page_short * 0.14))
+    return (
+        0.18 <= r1 < 0.72
+        and 0.18 <= r2 < 0.72
+        and min_side1 >= min_diptych_side
+        and min_side2 >= min_diptych_side
+    )
 
 
-def _is_good_visual_panel(p: PanelInfo) -> bool:
-    """Filter out extreme slivers or empty background/screentone strips lacking face/text."""
+def _is_good_visual_panel(p: PanelInfo, page_short: int = 1000) -> bool:
+    """Filter out extreme slivers or empty background/screentone strips using page-relative size."""
     min_side = min(p.width, p.height)
     ar = p.width / max(1, p.height)
     has_face = any(fp.kind == "face" for fp in p.focal_points)
     has_text = any(fp.kind == "text" for fp in p.focal_points)
-    if min_side < 110:
+    min_panel_side = max(36, int(page_short * 0.10))
+    if min_side < min_panel_side:
         return False
     if (ar < 0.18 or ar > 4.2) and not (has_face and has_text):
         return False
@@ -97,6 +104,11 @@ class ChoreographerAgent:
 
         panel_map: dict[str, PanelInfo] = {p.panel_id: p for p in all_panels}
         panel_pos: dict[str, int] = {p.panel_id: idx for idx, p in enumerate(all_panels)}
+        page_short_map: dict[str, int] = {
+            pg.page_id: max(1, min(pg.width, pg.height))
+            for ch in manifest.chapters
+            for pg in ch.pages
+        }
         audio_by_beat = {b.beat_id: b for b in audio_manifest.beats}
 
         shots: list[TimelineShot] = []
@@ -142,7 +154,13 @@ class ChoreographerAgent:
             raw_pids = [pid for pid in beat.panel_ids if pid in panel_map]
             pids = list(dict.fromkeys(raw_pids))
             # Drop low-quality empty slivers only if the beat still retains usable panels
-            good_pids = [pid for pid in pids if _is_good_visual_panel(panel_map[pid])]
+            good_pids = [
+                pid
+                for pid in pids
+                if _is_good_visual_panel(
+                    panel_map[pid], page_short_map.get(panel_map[pid].page_id, 1000)
+                )
+            ]
             if good_pids:
                 pids = good_pids
             # Avoid repeating the final panel of the preceding beat at the start of this beat
@@ -174,7 +192,7 @@ class ChoreographerAgent:
                         and cand.panel_id not in used_panel_ids
                         and cand.panel_id not in next_beat_pids
                         and cand.page_id not in skipped_pages
-                        and _is_good_visual_panel(cand)
+                        and _is_good_visual_panel(cand, page_short_map.get(cand.page_id, 1000))
                     ):
                         pids.append(cand.panel_id)
                         used_panel_ids.add(cand.panel_id)
@@ -189,7 +207,9 @@ class ChoreographerAgent:
                 if (
                     self.cfg.enable_diptych
                     and i + 1 < len(pids)
-                    and _is_diptych_candidate(p1, panel_map[pids[i + 1]])
+                    and _is_diptych_candidate(
+                        p1, panel_map[pids[i + 1]], page_short_map.get(p1.page_id, 1000)
+                    )
                     and (beat_span / max(1, len(groups) + len(pids) - i - 1)) <= max_shot_ms * 1.25
                 ):
                     groups.append((p1, panel_map[pids[i + 1]]))

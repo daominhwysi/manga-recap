@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -331,6 +332,8 @@ class ScriptwriterAgent:
         ordered_pages = list(dict.fromkeys(_panel_to_page_id(pid) for pid in allowed_panels))
         page_idx = {pg: i for i, pg in enumerate(ordered_pages)}
         total = len(beats)
+        avg_pages_per_beat = len(ordered_pages) / max(1, total)
+        max_beat_page_span = max(2, math.ceil(avg_pages_per_beat * 1.25))
         cursor_rank = 0
 
         for idx, b in enumerate(beats):
@@ -341,7 +344,11 @@ class ScriptwriterAgent:
                 kept = forward
             if kept:
                 first_pg_i = page_idx[_panel_to_page_id(kept[0])]
-                tight = [pid for pid in kept if page_idx[_panel_to_page_id(pid)] - first_pg_i <= 3]
+                tight = [
+                    pid
+                    for pid in kept
+                    if page_idx[_panel_to_page_id(pid)] - first_pg_i <= max_beat_page_span
+                ]
                 if tight:
                     kept = tight
                 b.panel_ids = kept

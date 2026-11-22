@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -196,6 +197,13 @@ class CriticAgent:
         issues: list[CriticIssue] = []
         cleaned_beats: list[ScriptBeat] = []
         total_beats = len(script.beats)
+        avg_pages_per_beat = (
+            len(all_pages) / max(1, total_beats)
+            if total_beats >= 6
+            else 2.5
+        )
+        max_single_beat_span = max(3, math.ceil(avg_pages_per_beat * 1.5))
+        max_coverage_gap = max(8, math.ceil(avg_pages_per_beat * 3.5))
 
         prev_page_pos: int | None = None
         flagged_notes: list[str] = []
@@ -226,12 +234,12 @@ class CriticAgent:
                     )
                     flagged_notes.append(msg)
 
-            # Check page coverage gaps (> 10 pages jump), wide single-beat spans (> 4 pages), and backward jumps
+            # Check page coverage gaps, wide single-beat spans, and backward jumps adaptively
             positions = [p for pid in kept if (p := _page_pos_from_panel(pid, page_order)) is not None]
             if positions:
                 cur_min = min(positions)
                 cur_max = max(positions)
-                if cur_max - cur_min > 4:
+                if cur_max - cur_min > max_single_beat_span:
                     span_msg = (
                         f"{beat.beat_id} spans {cur_max - cur_min} pages "
                         f"({all_pages[cur_min]}..{all_pages[cur_max]}), risking visual cramming."
@@ -248,7 +256,7 @@ class CriticAgent:
                         CriticIssue(beat_id=beat.beat_id, severity="warning", category="panel_sync", message=back_msg)
                     )
                     flagged_notes.append(back_msg)
-                if prev_page_pos is not None and (cur_min - prev_page_pos) > 10:
+                if prev_page_pos is not None and (cur_min - prev_page_pos) > max_coverage_gap:
                     gap_msg = (
                         f"Page coverage gap before {beat.beat_id}: jumped from {all_pages[prev_page_pos]} "
                         f"to {all_pages[cur_min]} ({cur_min - prev_page_pos} pages skipped)."

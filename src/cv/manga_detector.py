@@ -208,7 +208,10 @@ class MangaYoloDetector:
             for fb, fscore in dets.get(kind, []):
                 focal_candidates.append((kind, fb, fscore))
 
-        # Filter out extreme slivers / empty screentone strips lacking face, body, and dialogue
+        # Filter out extreme slivers / empty screentone strips using page-relative dimensions
+        page_short = max(1, min(w, h))
+        min_panel_side = max(32, int(page_short * 0.085))
+        min_unfocused_side = max(48, int(page_short * 0.12))
         usable_frames: list[BBox] = []
         for fb in frame_boxes:
             pw_b = max(1, fb.width)
@@ -230,9 +233,9 @@ class MangaYoloDetector:
             crop_test = img[fb.y1 : fb.y2, fb.x1 : fb.x2]
             crop_std = float(crop_test.std()) if crop_test.size else 0.0
 
-            if min(pw_b, ph_b) < 95:
+            if min(pw_b, ph_b) < min_panel_side:
                 continue
-            if min(pw_b, ph_b) < 130 and not (has_face or has_text):
+            if min(pw_b, ph_b) < min_unfocused_side and not (has_face or has_text):
                 continue
             if (ar_b < 0.19 or ar_b > 4.6) and not (has_face or has_text):
                 continue
