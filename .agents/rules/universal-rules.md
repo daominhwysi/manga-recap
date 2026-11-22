@@ -34,10 +34,10 @@ When user's prompt is NOT in English:
 
 ## 📐 Project Architecture, Generalization & Git Rules (MANDATORY)
 
-> 🔴 **Read `AGENTS.md` before modifying pipeline stages, prompts, or file layout.**
+> 🔴 **Read `AGENTS.md` and `docs/ARCHITECTURE.md` before modifying pipeline stages, prompts, or file layout.**
 
-1. **`AGENTS.md` Sync Rule**: Whenever you add, remove, rename, or move files/directories, or modify the pipeline workflow/schemas, you MUST update `AGENTS.md` (Filesystem Structure & Workflow sections) in the same task.
-2. **Zero Overfitting / No Hardcoded Heuristics Rule**: Never introduce series-specific names, quotes, regexes, or hardcoded page-index/beat-step cutoffs (e.g., `idx < 6`, `idx in (0, 2, 3, 4)`, single-word counters) into `src/` or `configs/`. All logic must be 100% general across any manga/manhwa and pass `uv run pytest`.
+1. **Architecture Check & `AGENTS.md` / `docs/ARCHITECTURE.md` Sync Rule**: Whenever you modify the architecture, stage logic, schemas, or add/remove/rename files, you MUST check the **Architecture Impact Checklist** in `docs/ARCHITECTURE.md` (Section 6) to verify what downstream components/invariants are affected, and update both `docs/ARCHITECTURE.md` and `AGENTS.md` in the same task.
+2. **Zero Overfitting / No Hardcoded Heuristics Rule**: Never introduce series-specific names, quotes, regexes, or hardcoded page-index/pixel/beat-step cutoffs (e.g., `idx < 6`, `idx in (0, 2, 3, 4)`, single-word counters) into `src/` or `configs/`. All logic must rely on structural state machines and adaptive relative formulas across any manga/manhwa and pass `uv run pytest`.
 3. **Atomic Feature Git Commit Rule**: After completing and verifying any feature, bugfix, or architectural change (with `uv run pytest` passing), immediately stage and commit the changes to the Git repository with a clear Conventional Commit message (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`).
 4. **Ignore `RULES.md`**: The root `RULES.md` file is an out-of-context 110 KB English academic ML paper writing guide; do not load it into agent context.
 

@@ -16,8 +16,9 @@
 
 ## 2. Quy Tắc Kỹ Thuật Bắt Buộc (Mandatory Engineering Rules)
 
-### Rule 1 — Đồng bộ `AGENTS.md` khi sửa Workflow hoặc Filesystem (`AGENTS.md` Sync Rule)
-- Bất kỳ khi nào thêm, xóa, đổi tên hoặc di chuyển file/thư mục trong `src/`, `configs/`, `tests/`, hoặc thay đổi kiến trúc Stage, schema dữ liệu hay file checkpoint trong `jobs/<job_id>/`, **BẮT BUỘC cập nhật Mục 4 (Filesystem) và Mục 5 (Workflow) của `AGENTS.md` ngay trong cùng tác vụ**.
+### Rule 1 — Kiểm tra `docs/ARCHITECTURE.md` & Đồng bộ `AGENTS.md` khi sửa Kiến trúc, Workflow hoặc Filesystem
+- Trước và sau khi sửa đổi kiến trúc, thuật toán hoặc cấu trúc dữ liệu của bất kỳ Stage nào, **BẮT BUỘC mở `docs/ARCHITECTURE.md` (Mục 6 — Bảng Kiểm Tra Tác Động Kiến Trúc) để kiểm tra các bất biến liên đới và xem cần cập nhật gì không**.
+- Bất kỳ khi nào thêm, xóa, đổi tên hoặc di chuyển file/thư mục trong `src/`, `configs/`, `docs/`, `tests/`, hoặc thay đổi kiến trúc Stage, schema dữ liệu hay file checkpoint trong `jobs/<job_id>/`, **BẮT BUỘC cập nhật đồng bộ cả `docs/ARCHITECTURE.md` và Mục 4 (Filesystem) + Mục 5 (Workflow) của `AGENTS.md` ngay trong cùng tác vụ**.
 
 ### Rule 2 — Cấm tuyệt đối Anti-Pattern Overfit & Hardcode thiếu tính tổng quát
 - **Cấm dữ liệu đặc thù bộ truyện**: Không đưa tên nhân vật, địa danh, tổ chức hay câu thoại mẫu của bất kỳ bộ truyện cụ thể nào vào `src/`, `configs/` hay `config.yaml`.
@@ -58,7 +59,10 @@ rm -rf jobs/<job_id>/02b_story_bible.json jobs/<job_id>/repo/tree_index.json \
 
 ```text
 manga_recap_generator/
-├── AGENTS.md                        # Đặc tả kiến trúc, filesystem, workflow và quy tắc bắt buộc cho AI Agents
+├── AGENTS.md                        # Đặc tả kiến trúc tóm tắt, filesystem, workflow và quy tắc bắt buộc cho AI Agents
+├── docs/
+│   ├── ARCHITECTURE.md              # Tài liệu kiến trúc chi tiết tiếng Việt (mục lục, giải thích 6 Stage, bất biến & bảng kiểm tra tác động)
+│   └── FINAL_REPORT.md              # Báo cáo tổng kết thực nghiệm pipeline
 ├── config.yaml                      # Cấu hình trung tâm (LLM provider/models, CV, Script, TTS, Render, Exporters)
 ├── pyproject.toml / uv.lock         # Dependencies Python (uv) và cấu hình pytest/ruff
 ├── .env.example / .gitignore        # Mẫu biến môi trường API và quy tắc loại trừ dữ liệu job lớn

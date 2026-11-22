@@ -1,7 +1,7 @@
 # Memory Index
 
 ## Project
-- [project] Read and keep `AGENTS.md` updated whenever workflow, architecture, or filesystem structure changes → AGENTS.md
+- [project] Before and after modifying architecture, workflow, or filesystem structure, check `docs/ARCHITECTURE.md` (Section 6 Impact Checklist) and keep both `docs/ARCHITECTURE.md` and `AGENTS.md` updated → docs/ARCHITECTURE.md
 - [project] Never build overfitted/hardcoded workflows, magic page-index cutoffs, or series-specific prompts/heuristics; enforce via `uv run pytest` → AGENTS.md
 - [project] Commit every completed and tested feature/fix to the local Git repository using Conventional Commits → AGENTS.md
 - [project] Do not load root `RULES.md` (out-of-context academic ML paper style guide) into context → AGENTS.md
