@@ -77,6 +77,8 @@ class RenderConfig(BaseModel):
     bgm_path: str | None = None
     bgm_volume: float = 0.14
     bgm_ducking: bool = True
+    music_library_dir: Path = Path("assets/music_library")
+    min_bgm_cue_sec: float = 28.0
 
 
 class ExportersConfig(BaseModel):
@@ -99,6 +101,9 @@ class ScriptConfig(BaseModel):
     vision_max_workers: int = 4
     words_per_minute: int = 225
     polish_seams: bool = True
+    decoupled_two_pass: bool = True
+    story_temperature: float = 0.72
+    align_temperature: float = 0.15
 
 
 class AppConfig(BaseModel):

@@ -167,12 +167,18 @@ class LLMClient:
         parse_raw: Callable[[str], R],
         image_paths: Sequence[Path | str] | None = None,
         model_override: str | None = None,
+        temperature_override: float | None = None,
     ) -> R:
         is_vision = bool(image_paths)
         model = model_override or (
             self.config.vision_model if is_vision else self.config.default_model
         )
         active_provider = self.config.vision_provider if is_vision else self.config.provider
+        active_temp = (
+            self.config.temperature
+            if temperature_override is None
+            else max(0.0, min(1.5, float(temperature_override)))
+        )
         client = self._make_client(vision=is_vision)
 
         user_content: Any
@@ -202,7 +208,7 @@ class LLMClient:
                 try:
                     create_kwargs: dict[str, Any] = {
                         "model": active_model,
-                        "temperature": self.config.temperature,
+                        "temperature": active_temp,
                         "max_tokens": self.config.max_tokens,
                         "messages": [
                             {"role": "system", "content": full_system_prompt},
@@ -265,6 +271,7 @@ class LLMClient:
         schema_cls: type[T],
         image_paths: Sequence[Path | str] | None = None,
         model_override: str | None = None,
+        temperature_override: float | None = None,
     ) -> T:
         """Invoke text or vision model and validate response against schema_cls."""
         schema_hint = json.dumps(
@@ -282,6 +289,7 @@ class LLMClient:
             parse_raw=lambda content: schema_cls.model_validate(self._extract_json(content or "{}")),
             image_paths=image_paths,
             model_override=model_override,
+            temperature_override=temperature_override,
         )
 
     def complete_xml(
@@ -293,6 +301,7 @@ class LLMClient:
         parse_fn: Callable[[str], R],
         image_paths: Sequence[Path | str] | None = None,
         model_override: str | None = None,
+        temperature_override: float | None = None,
     ) -> R:
         """Invoke text or vision model with resilient XML output parsing (immune to quote/colon escaping issues)."""
         full_system_prompt = (
@@ -308,4 +317,5 @@ class LLMClient:
             parse_raw=lambda content: parse_fn(_strip_code_fence(content)),
             image_paths=image_paths,
             model_override=model_override,
+            temperature_override=temperature_override,
         )

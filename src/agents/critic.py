@@ -115,9 +115,29 @@ _TEXT_FIXABLE_CATEGORIES = {
     "budget",
     "pacing",
     "opener_repeat",
+    "tic_repeat",
     "seam_echo",
     "semantic_repeat",
 }
+
+# General Vietnamese conversational filler tics/particles (capped globally across any position in beat)
+_GLOBAL_DISCOURSE_TICS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("nha", re.compile(r"(?<!\w)nha(?:[,.:;!?…—–]|\s|$)", flags=re.IGNORECASE | re.UNICODE)),
+    ("nhé", re.compile(r"(?<!\w)nhé(?:[,.:;!?…—–]|\s|$)", flags=re.IGNORECASE | re.UNICODE)),
+    ("kìa", re.compile(r"(?<!\w)kìa(?:[,.:;!?…—–]|\s|$)", flags=re.IGNORECASE | re.UNICODE)),
+    ("để ý", re.compile(r"(?<!\w)để ý(?!\w)", flags=re.IGNORECASE | re.UNICODE)),
+    ("nghe kỹ", re.compile(r"(?<!\w)nghe kỹ(?!\w)", flags=re.IGNORECASE | re.UNICODE)),
+    ("anh em", re.compile(r"(?<!\w)anh em(?!\w)", flags=re.IGNORECASE | re.UNICODE)),
+    ("khoan", re.compile(r"(?<!\w)khoan(?:[,.:;!?…—–]|\s|$)", flags=re.IGNORECASE | re.UNICODE)),
+    ("ai ngờ", re.compile(r"(?<!\w)ai ngờ(?!\w)", flags=re.IGNORECASE | re.UNICODE)),
+    ("cứ tưởng", re.compile(r"(?<!\w)cứ tưởng(?!\w)", flags=re.IGNORECASE | re.UNICODE)),
+    ("tới lúc này", re.compile(r"(?<!\w)tới lúc này(?!\w)", flags=re.IGNORECASE | re.UNICODE)),
+)
+
+
+def _strip_quoted_dialogue(text: str) -> str:
+    """Remove direct quoted character dialogue so character speech isn't penalized as narrator tics."""
+    return re.sub(r'["“][^"”]*["”]', " ", text)
 
 
 def _page_pos_from_panel(panel_id: str, page_order: dict[str, int]) -> int | None:
@@ -320,6 +340,9 @@ class CriticAgent:
         beat_ngrams: list[tuple[str, set[str]]] = []
         word_counts: list[int] = []
         opener_hits: dict[str, list[int]] = {}
+        tic_hits: dict[str, list[int]] = {}
+        colon_beats = 0
+        staccato_beats = 0
 
         for idx, beat in enumerate(beats):
             kept = beat.panel_ids
@@ -417,9 +440,19 @@ class CriticAgent:
                     flagged_indices.add(idx)
                     flagged_notes.append(echo_msg)
 
-            # Collect openers/catchphrases across the volume
+            # Collect openers/catchphrases & mid/end-sentence discourse tics (excluding quoted character dialogue)
             for op in extract_beat_openers(beat.narration_vi, name_tokens=name_tokens):
                 opener_hits.setdefault(op, []).append(idx)
+
+            narrator_only = _strip_quoted_dialogue(beat.narration_vi)
+            for tic_label, tic_pat in _GLOBAL_DISCOURSE_TICS:
+                if tic_pat.search(narrator_only):
+                    tic_hits.setdefault(tic_label, []).append(idx)
+            if ":" in narrator_only:
+                colon_beats += 1
+            b_sents = [s.strip() for s in re.split(r"(?<=[.!?…])\s+", beat.narration_vi.strip()) if s.strip()]
+            if len(b_sents) >= 3 and (len(beat.narration_vi.split()) / len(b_sents)) <= 9.0:
+                staccato_beats += 1
 
             words = len(beat.narration_vi.split())
             word_counts.append(words)
@@ -461,7 +494,22 @@ class CriticAgent:
             flagged_indices.add(b_idx)
             flagged_notes.append(op_msg)
 
-        # Macro Distribution Critique (Rule 5): check volume-level pacing variance & total word budget
+        # Global Discourse Tic Cap (Critic V3.5): catch overused particles/fillers at ANY position (3rd+ occurrence)
+        for tic_label, hit_indices in sorted(tic_hits.items()):
+            uniq_hits = list(dict.fromkeys(hit_indices))
+            if len(uniq_hits) >= 3:
+                for occ_num, b_idx in enumerate(uniq_hits[2:], start=3):
+                    t_msg = (
+                        f"{beats[b_idx].beat_id} lạm dụng từ đệm/khẩu ngữ '{tic_label}' (lần thứ {occ_num} trong tập) "
+                        f"— hãy bỏ từ đệm này và nối câu tự nhiên hơn (giữ nguyên ý và thoại gốc)."
+                    )
+                    issues.append(
+                        CriticIssue(beat_id=beats[b_idx].beat_id, severity="warning", category="tic_repeat", message=t_msg)
+                    )
+                    flagged_indices.add(b_idx)
+                    flagged_notes.append(t_msg)
+
+        # Macro Distribution Critique (Rule 5): check volume-level pacing variance, staccato/colon overuse & budget
         if len(word_counts) >= 12:
             mean_wc = sum(word_counts) / len(word_counts)
             std_wc = math.sqrt(sum((w - mean_wc) ** 2 for w in word_counts) / len(word_counts))
@@ -472,6 +520,24 @@ class CriticAgent:
                         severity="warning",
                         category="macro_rhythm",
                         message=f"Beat rhythm is overly uniform (std={std_wc:.1f} words); vary short/long beats.",
+                    )
+                )
+            if (colon_beats / len(word_counts)) > 0.30:
+                issues.append(
+                    CriticIssue(
+                        beat_id="global",
+                        severity="warning",
+                        category="macro_rhythm",
+                        message=f"Overused report-style colons ({colon_beats}/{len(word_counts)} beats); weave clauses naturally.",
+                    )
+                )
+            if (staccato_beats / len(word_counts)) > 0.25:
+                issues.append(
+                    CriticIssue(
+                        beat_id="global",
+                        severity="warning",
+                        category="macro_rhythm",
+                        message=f"Excessive choppy staccato beats ({staccato_beats}/{len(word_counts)} beats); connect sentences smoothly.",
                     )
                 )
 
@@ -563,9 +629,10 @@ class CriticAgent:
         if any(phrase in low for phrase in _BANNED_CLICHES):
             return False
 
-        # Reject if rewrite still keeps the exact overused opener it was supposed to replace
-        if "opener_repeat" in beat_issue_cats and repeated_phrases:
-            if any(p in low for p in repeated_phrases):
+        # Reject if rewrite still keeps the exact overused opener/tic it was supposed to replace
+        if (beat_issue_cats & {"opener_repeat", "tic_repeat"}) and repeated_phrases:
+            narrator_low = _strip_quoted_dialogue(txt).lower()
+            if any(re.search(rf"(?<!\w){re.escape(p)}(?!\w)", narrator_low, flags=re.UNICODE) for p in repeated_phrases):
                 return False
 
         # Reject if rewrite introduces a new character name spoiler before first_named_page_id
@@ -710,7 +777,7 @@ class CriticAgent:
                 cats = {iss.category for iss in b_issues}
                 rep_phrases: set[str] = set()
                 for iss in b_issues:
-                    if iss.category == "opener_repeat":
+                    if iss.category in ("opener_repeat", "tic_repeat"):
                         m = re.search(r"'([^']+)'", iss.message)
                         if m:
                             rep_phrases.add(m.group(1).lower())

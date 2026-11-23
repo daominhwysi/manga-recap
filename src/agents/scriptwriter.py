@@ -189,6 +189,106 @@ class PartScriptResponse(BaseModel):
     beats: list[ScriptBeat] = Field(default_factory=list)
 
 
+class _ActProseResponse(BaseModel):
+    parts: dict[str, str] = Field(default_factory=dict)
+
+
+_ACT_PROSE_XML_TEMPLATE = """<act_prose>
+  <part id="part_01">Đoạn văn kể chuyện kết hợp phân tích liền mạch, giàu nhịp điệu tự nhiên cho hồi này...</part>
+  <part id="part_02">Đoạn văn nối tiếp mạch cảm xúc cho hồi kế tiếp...</part>
+</act_prose>"""
+
+
+def _parse_act_prose_xml(xml_text: str) -> _ActProseResponse:
+    parts: dict[str, str] = {}
+    for attrs, body in iter_xml_blocks(xml_text, "part"):
+        pid = extract_xml_attr(attrs, "id") or extract_xml_attr(attrs, "part_id")
+        txt = re.sub(r"<[^>]+>", "", body).strip()
+        if pid and txt:
+            parts[pid] = txt
+    return _ActProseResponse(parts=parts)
+
+
+def _strip_cv_metadata_for_prose(raw_scene_md: str) -> str:
+    """Convert raw scene markdown into clean readable story prose digest (no panel_ids or CV aspect tags)."""
+    clean_lines: list[str] = []
+    for raw_line in raw_scene_md.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("# "):
+            continue
+        if line.startswith("### "):
+            # Keep compact page tag [p005] and readable summary/quotes/visuals
+            line = re.sub(r"^###\s+(?:[a-zA-Z0-9]+_)?(p\d+):", r"[\1]", line)
+            line = line.replace("⚡Thoại:", "Thoại nổi bật:").replace("👁️Hình:", "Hình ảnh đắt:")
+            clean_lines.append(line)
+            continue
+        if line.startswith("- ["):
+            # Strip "- [ch01_p005_P1] (tense|i3|ar=0.26|face+text) " prefix so writer focuses purely on story
+            stripped = re.sub(r"^-\s+\[[^\]]+\]\s*(?:\([^)]*\)\s*)?", "- ", line)
+            # Remove noisy "[Không có nhân vật]" or empty dialogue markers
+            stripped = stripped.replace("[Không có nhân vật]", "").replace('| "Không có thoại."', "").strip()
+            if len(stripped) > 4:
+                clean_lines.append(stripped)
+            continue
+        clean_lines.append(line)
+    return "\n".join(clean_lines)
+
+
+def _group_parts_into_acts(
+    parts: list[OutlinePart],
+    target_words_per_act: int = 720,
+    max_parts_per_act: int = 5,
+) -> list[list[OutlinePart]]:
+    """Group sequential OutlineParts into 3-4 cohesive narrative Acts for uninterrupted prose drafting."""
+    if len(parts) <= 2:
+        return [parts] if parts else []
+    acts: list[list[OutlinePart]] = []
+    cur: list[OutlinePart] = []
+    cur_w = 0
+    for idx, p in enumerate(parts):
+        remaining = len(parts) - idx
+        if (
+            cur
+            and (
+                (cur_w + p.target_words > target_words_per_act * 1.15 and cur_w >= target_words_per_act * 0.55)
+                or len(cur) >= max_parts_per_act
+            )
+            and remaining >= 2
+        ):
+            acts.append(cur)
+            cur = []
+            cur_w = 0
+        cur.append(p)
+        cur_w += max(40, p.target_words)
+    if cur:
+        # Avoid a tiny orphan trailing act
+        if len(acts) >= 1 and len(cur) == 1 and cur_w < target_words_per_act * 0.35:
+            acts[-1].extend(cur)
+        else:
+            acts.append(cur)
+    return acts
+
+
+def _prose_preservation_ratio(source_prose: str, beats: list[ScriptBeat]) -> float:
+    """Measure how faithfully Pass 2 preserved Pass 1's words without rewriting or truncating."""
+    src_words = re.findall(r"[^\W\d_]+", source_prose.lower(), flags=re.UNICODE)
+    if not src_words:
+        return 1.0
+    beat_words = re.findall(
+        r"[^\W\d_]+",
+        " ".join(b.narration_vi for b in beats).lower(),
+        flags=re.UNICODE,
+    )
+    if not beat_words:
+        return 0.0
+    src_cnt = Counter(src_words)
+    beat_cnt = Counter(beat_words)
+    overlap = sum(min(src_cnt[w], beat_cnt[w]) for w in src_cnt)
+    return overlap / max(1, len(src_words))
+
+
 _PART_SCRIPT_XML_TEMPLATE = """<part_script>
   <need_nodes></need_nodes>
   <need_panels></need_panels>
@@ -665,6 +765,291 @@ class ScriptwriterAgent:
 
         return best_beats
 
+    def _draft_acts_prose(
+        self,
+        outline: ScriptOutline,
+        bible: StoryBible,
+        tree: PageIndexTree,
+        system_prompt: str,
+        story_temperature: float,
+        job_dir: Path,
+        force: bool = False,
+    ) -> dict[str, str]:
+        """Pass 1 (Decoupled Pure Storyteller): Write flowing multi-scene Acts with ZERO panel_id/XML beat tax."""
+        acts_dir = job_dir / "repo" / "script" / "acts"
+        acts_dir.mkdir(parents=True, exist_ok=True)
+        prose_md_path = job_dir / "repo" / "script" / "prose_draft.md"
+
+        all_tree_pages = [pg for sc in tree.scenes for pg in sc.page_ids]
+        page_idx_map = {pg: i for i, pg in enumerate(all_tree_pages)}
+        part_index_lookup = {p.part_id: i + 1 for i, p in enumerate(outline.parts)}
+        total_parts = len(outline.parts)
+        acts = _group_parts_into_acts(outline.parts)
+
+        part_prose_map: dict[str, str] = {}
+        prev_tail_paragraphs = ""
+        name_tokens = _extract_bible_name_tokens(bible)
+        opener_counts: Counter[str] = Counter()
+
+        for act_idx, act_parts in enumerate(acts, start=1):
+            act_cache = acts_dir / f"act_{act_idx:02d}.json"
+            if act_cache.exists() and not force:
+                try:
+                    cached_dict = json.loads(act_cache.read_text(encoding="utf-8"))
+                    if isinstance(cached_dict, dict) and all(p.part_id in cached_dict for p in act_parts):
+                        for p in act_parts:
+                            txt = str(cached_dict[p.part_id]).strip()
+                            part_prose_map[p.part_id] = txt
+                            for op in extract_beat_openers(txt, name_tokens=name_tokens):
+                                opener_counts[op] += 1
+                        last_txt = part_prose_map.get(act_parts[-1].part_id, "")
+                        prev_tail_paragraphs = " ".join(last_txt.split()[-95:])
+                        continue
+                except Exception:
+                    pass
+
+            act_scene_ids = [sid for p in act_parts for sid in p.scene_ids]
+            scoped_memory = render_scoped_memory_md(bible, tree, act_scene_ids, window=1)
+
+            part_blocks: list[str] = []
+            for p in act_parts:
+                p_num = part_index_lookup[p.part_id]
+                _, first_pg, last_pg = _collect_part_panels(tree, p.scene_ids)
+                part_end_idx = page_idx_map.get(last_pg, len(all_tree_pages) - 1)
+                unrevealed = [
+                    ch.canonical_name
+                    for ch in bible.characters
+                    if ch.first_named_page_id
+                    and ch.first_named_page_id in page_idx_map
+                    and page_idx_map[ch.first_named_page_id] > part_end_idx
+                ]
+                spoiler_note = (
+                    f"\n  - CHỐNG SPOIL TÊN: KHÔNG gọi tên thật của {unrevealed} trong {p.part_id} (chưa lộ tên tới hết {last_pg}); chỉ tả ngoại hình/vai trò."
+                    if unrevealed
+                    else ""
+                )
+                hook_note = (
+                    f"\n  - MỞ ĐẦU VIDEO (hook_strategy={outline.hook_strategy}): Bắt đầu thật cuốn từ nghịch lý/câu hỏi cốt lõi. Gợi ý: {outline.hook_summary}"
+                    if p_num == 1
+                    else ""
+                )
+                outro_note = (
+                    "\n  - KẾT TẬP: Khép lại đoạn cuối bằng suy ngẫm lắng đọng hoặc câu hỏi mở tự nhiên nối sang tập sau."
+                    if p_num == total_parts
+                    else ""
+                )
+                digest_chunks = [
+                    _strip_cv_metadata_for_prose(tree.get_scene_text(sid))
+                    for sid in p.scene_ids
+                    if tree.get_scene_text(sid)
+                ]
+                part_blocks.append(
+                    f"=== {p.part_id} (Hồi {p_num}/{total_parts}: {p.title} | section={p.section} | mode={p.pacing_mode} | ~{p.target_words} từ | {first_pg}..{last_pg}) ===\n"
+                    f"Định hướng đạo diễn: {p.focus_notes}{hook_note}{outro_note}{spoiler_note}\n"
+                    f"Diễn biến gốc:\n" + "\n".join(digest_chunks)
+                )
+
+            overused = [ph for ph, c in opener_counts.most_common(10) if c >= 2]
+            avoid_line = (
+                f"\n- Tránh lặp lại các cụm mở câu đã dùng nhiều ở Chương trước: {overused}."
+                if overused
+                else ""
+            )
+            prev_line = (
+                f"### ĐOẠN VỪA KẾT Ở CHƯƠNG TRƯỚC (chỉ để giữ liền mạch giọng văn — TUYỆT ĐỐI KHÔNG nhắc lại hành động cũ):\n{prev_tail_paragraphs}\n\n"
+                if prev_tail_paragraphs
+                else ""
+            )
+
+            expected_ids = [p.part_id for p in act_parts]
+            act_target_words = sum(p.target_words for p in act_parts)
+            user_prompt = (
+                f"### HỒ SƠ NHÂN VẬT & MẠCH BÍ ẨN:\n{scoped_memory}\n\n"
+                f"{prev_line}"
+                f"### NHIỆM VỤ VIẾT KỊCH BẢN LIỀN MẠCH — CHƯƠNG {act_idx}/{len(acts)} (gồm các hồi {expected_ids}, tổng khoảng ~{act_target_words} từ):\n\n"
+                + "\n\n".join(part_blocks)
+                + "\n\n"
+                "YÊU CẦU VIẾT VĂN (BẠN CHỈ CẦN VIẾT VĂN THẬT HAY — KHÔNG CẦN GẮN PANEL_ID HAY CHIA BEAT):\n"
+                "1) Hãy viết liền mạch một mạch truyện thống nhất xuyên suốt các hồi trên như một kịch bản Video Essay / Review truyện tranh xuất sắc để đọc thành tiếng.\n"
+                "2) Mỗi hồi đặt trong đúng 1 thẻ `<part id=\"part_XX\">...</part>` với độ dài xấp xỉ ngân sách từ gợi ý (co giãn linh hoạt +-20% theo độ nặng tình tiết). Giữa các hồi nối tiếp phải chuyển mạch tự nhiên, tuyệt đối không lặp lại câu kết của hồi trước.\n"
+                "3) Viết câu tiếng Việt có nhạc tính, liên kết nhân-quả mượt mà (đa phần câu 16–32 từ, chỉ dùng câu ngắn 7–12 từ ở đúng cú twist/cao trào). Hạn chế tối đa dấu hai chấm (:), KHÔNG viết kiểu liệt kê cụt lủn, KHÔNG rắc khẩu ngữ giả tạo ('nha', 'nhé', 'kìa', 'để ý nha', 'nghe kỹ nha', 'anh em ơi').\n"
+                "4) Giữ chính xác sự thật & lồng ghép câu thoại gốc đắt giá trong ngoặc kép (\"...\"). Tuân thủ tuyệt đối quy tắc CHỐNG SPOIL TÊN ở từng hồi."
+                + avoid_line
+            )
+
+            try:
+                res = self.llm.complete_xml(
+                    agent_name="ProseWriterAgent",
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    xml_template=_ACT_PROSE_XML_TEMPLATE,
+                    parse_fn=_parse_act_prose_xml,
+                    temperature_override=story_temperature,
+                )
+            except Exception:
+                return {}
+
+            if not isinstance(res, _ActProseResponse) or not res.parts:
+                # Compatible with legacy unit-test mocks that return PartScriptResponse directly
+                return {}
+
+            act_saved: dict[str, str] = {}
+            for p in act_parts:
+                txt = res.parts.get(p.part_id, "").strip()
+                if txt:
+                    part_prose_map[p.part_id] = txt
+                    act_saved[p.part_id] = txt
+                    for op in extract_beat_openers(txt, name_tokens=name_tokens):
+                        opener_counts[op] += 1
+            if act_saved:
+                act_cache.write_text(
+                    json.dumps(act_saved, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                last_txt = act_saved.get(act_parts[-1].part_id, "")
+                prev_tail_paragraphs = " ".join(last_txt.split()[-95:])
+
+        if part_prose_map:
+            md_sections = [
+                f"## {p.part_id} — {p.title} ({p.section})\n\n{part_prose_map[p.part_id]}"
+                for p in outline.parts
+                if p.part_id in part_prose_map
+            ]
+            prose_md_path.write_text("\n\n---\n\n".join(md_sections), encoding="utf-8")
+
+        return part_prose_map
+
+    def _align_part_prose_to_beats(
+        self,
+        part: OutlinePart,
+        part_idx: int,
+        total_parts: int,
+        source_prose: str,
+        tree: PageIndexTree,
+    ) -> list[ScriptBeat]:
+        """Pass 2 (Panel Aligner): Slice Pass 1 prose into natural beats & bind monotonic panel_ids WITHOUT rewriting."""
+        allowed_panels, first_pg, last_pg = _collect_part_panels(tree, part.scene_ids)
+        allowed_set = set(allowed_panels)
+        part_pages: list[str] = []
+        for sid in part.scene_ids:
+            sc = tree.get_scene(sid)
+            if sc:
+                for pg_id in sc.page_ids:
+                    if pg_id not in part_pages:
+                        part_pages.append(pg_id)
+        part_page_pos = {pg: i for i, pg in enumerate(part_pages)}
+
+        current_texts = "\n\n".join(
+            f"--- {sid} ---\n{tree.get_scene_text(sid)}"
+            for sid in part.scene_ids
+            if tree.get_scene_text(sid)
+        )
+        moods_txt = ", ".join(VALID_MOODS)
+        sample_panels_hint = ", ".join(allowed_panels[:8])
+        outro_rule = (
+            "Beat cuối cùng của hồi cuối đặt `beat_type='outro'`."
+            if part_idx == total_parts
+            else "Hồi giữa tập CHỈ dùng `beat_type='narrative'` hoặc `'commentary'` (KHÔNG dùng `outro`)."
+        )
+        align_sys = (
+            "Bạn là Kỹ Sư Đồng Bộ Hình-Tiếng (Panel Aligner & Beat Director). "
+            "Nhiệm vụ DUY NHẤT của bạn là cắt một đoạn kịch bản văn chương đã viết sẵn thành các `<beat>` theo nhịp thở tự nhiên "
+            "và gán chính xác `panel_id`, `mood`, `beat_type`, `pause_ms` khớp tuyệt đối với trang truyện.\n"
+            "LUẬT BẤT BIẾN:\n"
+            "1) GIỮ NGUYÊN 100% CÂU CHỮ của `<source_prose>` — CHỈ chia ranh giới câu/đoạn vào từng `<beat>`, "
+            "TUYỆT ĐỐI KHÔNG tóm tắt lại, KHÔNG cắt cụt câu phức thành câu điện báo, KHÔNG thêm từ đệm ('nha', 'kìa', 'anh em'), KHÔNG bỏ sót câu nào.\n"
+            "2) Gắn 1-4 `panel_id` hợp lệ cho mỗi beat, tiến đơn điệu từ trang đầu tới trang cuối của hồi, ưu tiên khung `[face]`/`[text]`, phủ đều trọn phạm vi trang."
+        )
+
+        feedback = ""
+        best_beats: list[ScriptBeat] = []
+        best_score = -1.0
+
+        def _postprocess(raw_beats: list[ScriptBeat]) -> list[ScriptBeat]:
+            if part_idx < total_parts:
+                for b in raw_beats:
+                    if b.beat_type == "outro":
+                        b.beat_type = "narrative"
+            elif raw_beats and raw_beats[-1].beat_type != "outro":
+                raw_beats[-1].beat_type = "outro"
+            if part_idx == 1 and raw_beats:
+                raw_beats[0].section = "hook"
+            return raw_beats
+
+        for turn in range(3):
+            user_prompt = (
+                f"### THÔNG TIN HỒI {part_idx}/{total_parts}: {part.part_id} — {part.title} "
+                f"(section={part.section} | phạm vi trang: {first_pg}..{last_pg}, {len(part_pages)} trang)\n"
+                f"Gợi ý số beat: khoảng {max(1, part.target_beats - 2)}..{part.target_beats + 3} beats (mỗi beat 1–3 câu trọn vẹn, ~18–52 từ; câu twist ngắn có thể đứng riêng 1 beat).\n"
+                f"{outro_rule}\n"
+                f"`mood` CHỈ chọn đúng 1 trong 7 giá trị: `{moods_txt}`. `pause_ms`: 140-220 cho mạch gấp, 240-340 cho mạch thường, 400-560 cho điểm dừng phân tích/twist.\n\n"
+                f"<source_prose>\n{source_prose}\n</source_prose>\n\n"
+                f"### DANH SÁCH PANEL GỐC CỦA HỒI NÀY (ví dụ mã: {sample_panels_hint} ... {allowed_panels[-1] if allowed_panels else ''}):\n"
+                f"{current_texts}"
+                f"{feedback}\n\n"
+                "Hãy chia toàn bộ `<source_prose>` thành các `<beat>` liên tiếp (GIỮ NGUYÊN 100% VĂN BẢN GỐC, không sửa lời văn!) "
+                "và gán đúng `panel_id` tiến đơn điệu phủ tới hết trang "
+                f"{last_pg}. Trả về XML `<part_script>`."
+            )
+
+            resp = self.llm.complete_xml(
+                agent_name="PanelAlignerAgent",
+                system_prompt=align_sys,
+                user_prompt=user_prompt,
+                xml_template=_PART_SCRIPT_XML_TEMPLATE,
+                parse_fn=_parse_part_script_xml,
+                temperature_override=self.cfg.align_temperature,
+            )
+
+            if resp.beats:
+                sanitized, fallback_count = self._sanitize_part_beats(resp.beats, allowed_panels, allowed_set)
+                sanitized = _postprocess(sanitized)
+                fidelity = _prose_preservation_ratio(source_prose, sanitized)
+
+                last_cov_idx = max(
+                    (part_page_pos.get(_panel_to_page_id(pid), -1) for b in sanitized for pid in b.panel_ids),
+                    default=-1,
+                )
+                trailing_gap = (len(part_pages) - 1 - last_cov_idx) if last_cov_idx >= 0 else len(part_pages)
+                incomplete_cov = len(part_pages) >= 8 and (
+                    len(sanitized) < 2 or trailing_gap >= max(6, len(part_pages) // 2)
+                )
+
+                score = fidelity - 0.15 * fallback_count - (0.35 if incomplete_cov else 0.0)
+                if score > best_score:
+                    best_score = score
+                    best_beats = sanitized
+
+                if fallback_count == 0 and not incomplete_cov and fidelity >= 0.78:
+                    return sanitized
+
+                if turn < 2:
+                    notes: list[str] = []
+                    if fidelity < 0.78:
+                        notes.append(
+                            f"Phản hồi trước mới giữ được {int(fidelity * 100)}% từ gốc của `<source_prose>`. "
+                            "HÃY COPY NGUYÊN VĂN 100% từng câu trong `<source_prose>`, tuyệt đối không viết lại hay lược bỏ câu."
+                        )
+                    if fallback_count > 0:
+                        notes.append(
+                            f"{fallback_count} beat bị sai/thiếu mã `panel_id` hợp lệ; hãy dùng đúng mã đầy đủ dạng `{sample_panels_hint}`."
+                        )
+                    if incomplete_cov:
+                        cur_end_pg = part_pages[last_cov_idx] if last_cov_idx >= 0 else first_pg
+                        notes.append(
+                            f"Phản hồi trước mới phủ tới {cur_end_pg}, bỏ sót {trailing_gap} trang tới {last_pg}; hãy rải `panel_id` phủ trọn tới hết {last_pg}."
+                        )
+                    feedback = f"\n\n### SỬA LỖI ĐỒNG BỘ (LẦN {turn + 1}): " + " ".join(notes)
+                    continue
+                return best_beats or sanitized
+            elif turn < 2:
+                feedback = (
+                    f"\n\n### LỖI XML (LẦN {turn + 1}): Phản hồi trước không chứa thẻ `<beat>` hợp lệ. "
+                    "Hãy xuất đầy đủ `<part_script><beats>...</beats></part_script>` giữ nguyên văn bản `<source_prose>`."
+                )
+
+        return best_beats
+
     @staticmethod
     def _sanitize_part_beats(
         beats: list[ScriptBeat],
@@ -799,6 +1184,20 @@ class ScriptwriterAgent:
         name_tokens = _extract_bible_name_tokens(bible)
         opener_counts: Counter[str] = Counter()
 
+        # Pass 1 (Decoupled Pure Storyteller): draft flowing multi-scene Acts before panel binding
+        part_prose_map: dict[str, str] = {}
+        if self.cfg.decoupled_two_pass:
+            story_temp = float(p_cfg.get("story_temperature", self.cfg.story_temperature))
+            part_prose_map = self._draft_acts_prose(
+                outline=outline,
+                bible=bible,
+                tree=tree,
+                system_prompt=system_prompt,
+                story_temperature=story_temp,
+                job_dir=job_dir,
+                force=force,
+            )
+
         for idx, part in enumerate(outline.parts, start=1):
             allowed_panels, first_pg, last_pg = _collect_part_panels(tree, part.scene_ids)
             overused_phrases = [p for p, c in opener_counts.most_common(12) if c >= 2]
@@ -814,20 +1213,30 @@ class ScriptwriterAgent:
                         if b.beat_type == "outro":
                             b.beat_type = "narrative"
             else:
-                part_beats = self._write_part_with_lookup(
-                    part=part,
-                    part_idx=idx,
-                    total_parts=total_parts,
-                    system_prompt=system_prompt,
-                    bible=bible,
-                    tree=tree,
-                    prev_tail=all_beats[-2:],
-                    panel_images=panel_images,
-                    prev_scene_id=prev_scene_id,
-                    hook_strategy=outline.hook_strategy,
-                    hook_summary=outline.hook_summary,
-                    avoid_phrases=overused_phrases,
-                )
+                part_beats = []
+                if part.part_id in part_prose_map:
+                    part_beats = self._align_part_prose_to_beats(
+                        part=part,
+                        part_idx=idx,
+                        total_parts=total_parts,
+                        source_prose=part_prose_map[part.part_id],
+                        tree=tree,
+                    )
+                if not part_beats:
+                    part_beats = self._write_part_with_lookup(
+                        part=part,
+                        part_idx=idx,
+                        total_parts=total_parts,
+                        system_prompt=system_prompt,
+                        bible=bible,
+                        tree=tree,
+                        prev_tail=all_beats[-2:],
+                        panel_images=panel_images,
+                        prev_scene_id=prev_scene_id,
+                        hook_strategy=outline.hook_strategy,
+                        hook_summary=outline.hook_summary,
+                        avoid_phrases=overused_phrases,
+                    )
                 part_file.write_text(
                     json.dumps([b.model_dump() for b in part_beats], indent=2, ensure_ascii=False),
                     encoding="utf-8",

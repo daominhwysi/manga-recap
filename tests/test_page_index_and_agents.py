@@ -895,3 +895,92 @@ def test_critic_v3_opener_seam_allowlist_rollback_and_auditor(tmp_path: Path) ->
     assert final_s.beats[4].narration_vi == "Cánh cửa sắt bật mở ngay trước mắt cậu."
     assert final_s.beats[6].narration_vi == "Ngọn đèn dầu chập chờn rồi tắt hẳn trong hầm đá."
     assert not any(i.beat_id == "b005" and i.category == "seam_echo" for i in rep.issues)
+
+
+def test_decoupled_two_pass_storyteller_aligner_and_critic_v35_tics(tmp_path: Path) -> None:
+    from src.agents.scriptwriter import (
+        _ActProseResponse,
+        _group_parts_into_acts,
+        _prose_preservation_ratio,
+        _strip_cv_metadata_for_prose,
+    )
+
+    # 1) CV metadata stripper produces clean prose digest without panel_ids or ar/i tags
+    raw_md = (
+        "# scene_001 (ch01, ch01_p001..ch01_p002)\n"
+        "### ch01_p001: Nhân vật mở cửa. | ⚡Thoại: \"Ai đó?\" | 👁️Hình: Ánh mắt sắc lạnh.\n"
+        "- [ch01_p001_P1] (tense|i4|ar=0.45|face+text) [Minh] Minh đẩy cửa bước vào.\n"
+    )
+    digest = _strip_cv_metadata_for_prose(raw_md)
+    assert "ch01_p001_P1" not in digest
+    assert "ar=0.45" not in digest
+    assert "[p001]" in digest and "Minh đẩy cửa bước vào." in digest
+
+    # 2) Grouping parts into cohesive Acts
+    sample_parts = [OutlinePart(part_id=f"part_{i:02d}", title=f"P{i}", target_words=180) for i in range(1, 10)]
+    acts = _group_parts_into_acts(sample_parts, target_words_per_act=720)
+    assert 2 <= len(acts) <= 4
+    assert sum(len(a) for a in acts) == 9
+
+    # 3) Decoupled 2-Pass: Pass 1 (ProseWriterAgent @ high temp) -> Pass 2 (PanelAlignerAgent @ low temp)
+    manifest, analyses = _make_dummy_manifest(10, panels_per_page=2)
+    llm_off = LLMClient(LLMConfig(offline_fallback=True))
+    tree, bible = PageIndexBuilder(llm_off, pages_per_scene=5).build(manifest, analyses, tmp_path / "j_2p")
+
+    llm = LLMClient(LLMConfig(api_key="dummy"))
+    recorded_calls: list[tuple[str, float | None]] = []
+
+    def fake_json(agent_name, system_prompt, user_prompt, schema_cls, **kw):
+        recorded_calls.append((agent_name, kw.get("temperature_override")))
+        return ScriptOutline(
+            title_vi="Essay Test",
+            hook_summary="Mở đầu cuốn hút",
+            parts=[
+                OutlinePart(part_id="part_01", title="P1", section="hook", scene_ids=["scene_001"], target_words=80),
+                OutlinePart(part_id="part_02", title="P2", section="cliffhanger", scene_ids=["scene_002"], target_words=80),
+            ],
+        )
+
+    p1_prose = "Cánh cửa cũ khẽ mở ra giữa hành lang tối, để lộ một bí mật bị chôn vùi suốt nhiều năm."
+    p2_prose = "Trước khi kịp quay bước, tiếng chuông đồng hồ chợt vang lên, đặt ra câu hỏi chưa có lời đáp."
+
+    def fake_xml(agent_name, system_prompt, user_prompt, xml_template, parse_fn, **kw):
+        recorded_calls.append((agent_name, kw.get("temperature_override")))
+        if agent_name == "ProseWriterAgent":
+            return _ActProseResponse(parts={"part_01": p1_prose, "part_02": p2_prose})
+        if "part_01" in user_prompt:
+            return PartScriptResponse(
+                beats=[ScriptBeat(beat_id="b1", section="hook", narration_vi=p1_prose, panel_ids=["ch01_p001_P1", "ch01_p005_P1"])]
+            )
+        return PartScriptResponse(
+            beats=[ScriptBeat(beat_id="b2", section="cliffhanger", beat_type="outro", narration_vi=p2_prose, panel_ids=["ch01_p006_P1", "ch01_p010_P1"])]
+        )
+
+    llm.complete_json = fake_json  # type: ignore
+    llm.complete_xml = fake_xml  # type: ignore
+
+    script = ScriptwriterAgent(llm, ScriptConfig(fast_path_max_pages=2, decoupled_two_pass=True)).write_script(
+        bible, analyses, "phan_tich", tmp_path / "j_2p", tree=tree
+    )
+    assert any(ag == "ProseWriterAgent" and (t or 0) >= 0.7 for ag, t in recorded_calls)
+    assert any(ag == "PanelAlignerAgent" and (t or 1) <= 0.2 for ag, t in recorded_calls)
+    assert (tmp_path / "j_2p" / "repo" / "script" / "prose_draft.md").exists()
+    assert _prose_preservation_ratio(p1_prose, [script.beats[0]]) >= 0.95
+
+    # 4) Critic V3.5 catches mid/end-sentence 'nha' on 3rd+ occurrence while ignoring quoted dialogue
+    tic_beats = [
+        ScriptBeat(beat_id="b001", narration_vi='Nhân vật cười nói: "Đi nha!" rồi bước ra sân.', panel_ids=["ch01_p001_P1"]),
+        ScriptBeat(beat_id="b002", narration_vi="Tình huống này rất đáng chú ý nha.", panel_ids=["ch01_p002_P1"]),
+        ScriptBeat(beat_id="b003", narration_vi="Chi tiết ánh mắt đó khá lạ nha.", panel_ids=["ch01_p003_P1"]),
+        ScriptBeat(beat_id="b004", narration_vi="Đoạn này bắt đầu căng thẳng hơn rồi nha.", panel_ids=["ch01_p004_P1"]),
+    ]
+    all_pages = [p.page_id for p in manifest.chapters[0].pages]
+    page_order = {pg: i for i, pg in enumerate(all_pages)}
+    issues, flagged, _ = CriticAgent._evaluate_issues(
+        tic_beats, all_pages=all_pages, page_order=page_order, beat_to_allowed={}, bible=bible
+    )
+    tic_cats = {(i.beat_id, i.category) for i in issues}
+    assert ("b004", "tic_repeat") in tic_cats
+    assert ("b001", "tic_repeat") not in tic_cats  # Quoted dialogue ignored
+    assert ("b002", "tic_repeat") not in tic_cats
+    assert 3 in flagged
