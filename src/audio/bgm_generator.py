@@ -300,10 +300,37 @@ def build_dynamic_timeline_bgm(
     output_wav: Path,
     sample_rate: int = 48000,
     custom_bgm_dir: Path | None = None,
+    music_library_dir: Path | None = None,
+    tone_summary: str = "",
+    title: str = "",
+    min_cue_duration_ms: int = 28000,
+    credits_path: Path | None = None,
+    cues_json_path: Path | None = None,
 ) -> Path:
-    """Build continuous multi-mood musical BGM (external assets if provided, else rich 4-bar synth) + layered SFX."""
+    """Build continuous multi-mood musical BGM (Smart Music Director if library exists, else custom/4-bar synth) + SFX."""
     output_wav = Path(output_wav)
     output_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    # Prefer Smart Music Director backed by assets/music_library/catalog.json when populated
+    if music_library_dir is not None:
+        from src.audio.music_director import mix_directed_bgm
+
+        directed = mix_directed_bgm(
+            timeline=timeline,
+            output_wav=output_wav,
+            library_dir=music_library_dir,
+            tone_summary=tone_summary,
+            title=title,
+            min_cue_duration_ms=min_cue_duration_ms,
+            sample_rate=sample_rate,
+            credits_path=credits_path,
+            cues_json_path=cues_json_path,
+        )
+        if directed is not None:
+            return directed
+
+    from src.audio.music_director import plan_music_cues
+
     dur_sec = max(1.0, timeline.total_duration_ms / 1000.0)
     n_samples = int(round(dur_sec * sample_rate))
     t = np.linspace(0.0, dur_sec, n_samples, endpoint=False, dtype=np.float64)
@@ -312,14 +339,13 @@ def build_dynamic_timeline_bgm(
     left = np.zeros(n_samples, dtype=np.float64)
     right = np.zeros(n_samples, dtype=np.float64)
 
-    segments: list[tuple[int, int, str]] = []
-    for shot in timeline.shots:
-        mood = shot.mood if shot.mood in _MOOD_PROGRESSIONS else "tense"
-        if segments and segments[-1][2] == mood:
-            s0, _, m0 = segments[-1]
-            segments[-1] = (s0, shot.end_ms, m0)
-        else:
-            segments.append((shot.start_ms, shot.end_ms, mood))
+    # Use scene-level cue spotting even on fallback path (scaled for short test timelines)
+    eff_min_cue = min(min_cue_duration_ms, max(500, timeline.total_duration_ms // 4))
+    cues = plan_music_cues(timeline, min_cue_duration_ms=eff_min_cue)
+    segments = [
+        (c.start_ms, c.end_ms, c.mood if c.mood in _MOOD_PROGRESSIONS else "tense")
+        for c in cues
+    ]
     if not segments:
         segments = [(0, timeline.total_duration_ms, "tense")]
 

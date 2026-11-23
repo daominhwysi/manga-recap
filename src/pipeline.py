@@ -156,6 +156,8 @@ class MangaRecapPipeline:
                     bgm_volume=self.config.render.bgm_volume,
                     bgm_ducking=self.config.render.bgm_ducking,
                     subtitle_font_ratio=self.config.render.subtitle_font_ratio,
+                    music_library_dir=self.config.render.music_library_dir,
+                    min_bgm_cue_sec=self.config.render.min_bgm_cue_sec,
                 )
                 renderer.render(timeline, output_mp4, subtitles_path=srt_path)
                 d["renderer"] = self.config.render.backend

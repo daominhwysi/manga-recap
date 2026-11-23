@@ -76,7 +76,7 @@ manga_recap_generator/
 ├── assets/bgm/default_dark_fantasy.wav # Nhạc nền D-minor stereo tự tổng hợp (loop không bản quyền)
 ├── models/manga109_yolo/            # Model ONNX YOLOv11 nhận diện frame, face, body, text
 ├── src/
-│   ├── cli.py                       # Typer CLI (`run`, `download`, `inspect`)
+│   ├── cli.py                       # Typer CLI (`run`, `download`, `inspect`, `music fetch|index|list`)
 │   ├── config.py                    # Pydantic schemas AppConfig; nạp config.yaml + ghi đè từ .env (`default_model=gpt-6.2-sol`)
 │   ├── pipeline.py                  # Bộ điều phối 6 Stage (MangaRecapPipeline) kèm checkpointing, `--prev-job` & telemetry
 │   ├── core/
@@ -88,7 +88,7 @@ manga_recap_generator/
 │   │   ├── analysis.py              # Schemas Stage 2: PanelAnalysis, PageAnalysis (+`visual_verify_code`, `verbatim_quote_vi`, `visual_punch`), CharacterProfile (+`first_named_page_id`), StoryBible
 │   │   ├── script.py                # Schemas Stage 3: `VALID_MOODS`, `normalize_mood`, ScriptBeat (+`beat_type`, `tts_text`), RecapScript (+`hook_strategy`), CriticIssue, CriticReport
 │   │   └── timeline.py              # Schemas Stage 4-5: WordTimestamp, AudioBeatInfo, AudioManifest, TimelineShot, SubtitleCue, VideoTimeline (+`reading_order`)
-│   ├── llm/client.py                # LLMClient chuẩn OpenAI API: `complete_json` & `complete_xml` chống vỡ ngoặc kép, data-URL ảnh, circuit breaker (ngưỡng 2 lần lỗi)
+│   ├── llm/client.py                # LLMClient chuẩn OpenAI API: `complete_json` & `complete_xml` (+`temperature_override`), data-URL ảnh, circuit breaker (ngưỡng 2 lần lỗi)
 │   ├── cv/
 │   │   ├── registry.py / loader.py  # DETECTOR_REGISTRY; giải nén .cbz/.zip hoặc đọc thư mục theo `natural_sort_key`
 │   │   ├── manga_detector.py        # MangaYoloDetector (ONNX): Recursive XY-Cut RTL/LTR (chuẩn L-shape), cắt viền trắng inset đồng bộ `focal_points` ngay Stage 1
@@ -97,14 +97,16 @@ manga_recap_generator/
 │   ├── agents/
 │   │   ├── page_analyzer.py         # Stage 1.5 & 2a (XML): Pre-Pass cast sheet UTF-8; đóng dấu Visual Verify Code (RAM) chống rơi ảnh/lệch trang; khử spread trùng CV; Adaptive Batching; `verbatim_quote_vi` & `visual_punch`
 │   │   ├── page_index.py            # Stage 2b (Summarizer XML): Chuẩn hóa bí danh (`scoped_map`); tính `first_named_page_id` chống spoil tên; lọc spread 2 chiều; Semantic Scene Segmentation; StoryBible (`pronunciation_map` mặc định trống); `scoped_outline_view` O(N)
-│   │   ├── scriptwriter.py          # Stage 3a (XML): Phân hoạch `1 Scene = 1 Part`, O(N) Scoped Memory + cầu nối 2 trang, chuẩn hóa + retry khi lệch `panel_id`, cấm gọi tên nhân vật trước `first_named_page_id`
-│   │   ├── critic.py                # Stage 3b: Closed-Loop Critic (chốt chặn `spoiler_name`, ngân sách từ, nhịp toàn tập), Auto-Repair khóa cứng `panel_ids` & giữ nguyên văn bản TTS gốc (trừ glossary thủ công)
+│   │   ├── scriptwriter.py          # Stage 3a (Decoupled 2-Pass XML): Pass 1 (`ProseWriterAgent`, `temperature=0.72`) viết văn Video Essay liền mạch theo 3-4 Chương lớn từ bản tóm tắt sạch không rác CV/panel_id; Pass 2 (`PanelAlignerAgent`, `temperature=0.15`) chia beat giữ nguyên văn bản gốc & gán `panel_ids` tiến đơn điệu
+│   │   ├── critic.py                # Stage 3b (Critic V3.5): Deterministic Gate + Opener/Global Discourse Tic Scanner (`tic_repeat` mọi vị trí) + Read-Only Auditor + Allowlisted Surgical Repairer có Per-Beat Rollback Guard
 │   │   └── choreographer.py         # Stage 5: Đạo diễn hình ảnh — word-timestamp sync, tách 2 nhịp sub-shot (`Wide -> Focus Face`), LTR/RTL & 9:16 vertical, đồng bộ 7 `mood`
 │   ├── audio/
 │   │   ├── registry.py / base.py    # TTS_REGISTRY, `apply_pronunciation_glossary`, `beat_cache_key` (gồm `rate`), anti-aliased Fourier resampling & word timestamp alignment
 │   │   ├── edge_tts_backend.py      # Microsoft Edge TTS tiếng Việt kèm `WordBoundary` timestamps & tổng hợp song song
 │   │   ├── vieneu_tts.py            # Backend VieNeu TTS nội bộ kèm fallback tự động sang Edge-TTS
-│   │   ├── bgm_generator.py / stage.py # Nhạc nền động đa `mood` + SFX tinh tế (`build_dynamic_timeline_bgm`) & điều phối Stage 4
+│   │   ├── music_library.py         # Tự động hóa Dataset Âm Nhạc & SFX (`assets/music_library/catalog.json`): tải bộ starter CC-BY 4.0 (Incompetech), phân tích DSP (LUFS, BPM, brightness, intro-skip) & auto-tag custom folder
+│   │   ├── music_director.py        # Smart Music Director: chọn bảng màu thể loại theo `StoryBible`, gom cue nhạc theo Scene (>=28s), chuẩn hóa -16 LUFS, equal-power crossfade 2.5s, SFX cooldown & xuất `music_credits.txt`
+│   │   ├── bgm_generator.py / stage.py # Điều phối BGM (ưu tiên `music_director` nếu có catalog, fallback 4-bar synth) & điều phối Stage 4
 │   ├── render/
 │   │   ├── registry.py / compositor.py # RENDERER_REGISTRY; kết xuất frame OpenCV (bokeh, shadow, diptych RTL/LTR, Ken Burns/shake)
 │   │   ├── subtitles.py / preview_html.py # Xuất `.srt`, phụ đề word-wrap UTF-8 (9:16/16:9) có `subtitle_font_ratio`, HTML preview kèm ảnh thumbnail & audio player
@@ -118,8 +120,8 @@ manga_recap_generator/
 - **Stage 1**: `extracted/` (ảnh trang gốc), `panels/*.jpg` (ảnh cắt từng khung), `som/*_som.jpg` (ảnh trang đóng dấu `[P1]..[Pn]`), `01_manifest.json` (`JobManifest`).
 - **Stage 1.5 & 2a**: `repo/seed_cast.json`, `repo/cast_sheet.jpg` (bảng ghép mặt nhân vật chuẩn), `02a_pages/*.json` (cache Vision từng trang), `02a_all_pages.json`.
 - **Stage 2b**: `repo/notes/scene_*.md` (ghi chú Markdown từng scene kèm tỷ lệ `ar` và cờ `face+text`), `repo/tree_index.json` (`PageIndexTree` + `skipped_pages`), `02b_story_bible.json` (`StoryBible`), `repo/MEMORY.md`.
-- **Stage 3a & 3b**: `repo/OUTLINE.json` (`1 Scene = 1 Part`), `repo/script/parts/part_*.json`, `repo/script/part_boundaries.json`, `03a_script_draft.json`, `03b_script_final.json`, `03b_critic_report.json`.
-- **Stage 4, 5 & 6**: `audio/beats/*.wav`, `04_voiceover.wav`, `04_audio_manifest.json`, `05_timeline.json` (`VideoTimeline`), `06_subtitles.srt`, `06_output.mp4`, `exports/`, `telemetry.json`.
+- **Stage 3a & 3b**: `repo/OUTLINE.json` (`1 Scene = 1 Part`), `repo/script/acts/act_*.json` & `repo/script/prose_draft.md` (Pass 1 thuần văn), `repo/script/parts/part_*.json` (Pass 2 đã gắn panel), `repo/script/part_boundaries.json`, `03a_script_draft.json`, `03b_script_final.json`, `03b_critic_report.json`.
+- **Stage 4, 5 & 6**: `audio/beats/*.wav`, `04_voiceover.wav`, `04_audio_manifest.json`, `audio/04b_bgm_dynamic.wav`, `audio/04b_music_cues.json`, `05_timeline.json` (`VideoTimeline`), `06_subtitles.srt`, `06_output.mp4`, `exports/` (+`music_credits.txt`), `telemetry.json`.
 
 ---
 
@@ -135,13 +137,14 @@ manga_recap_generator/
 3. **Stage 2b — PageIndex Tree & StoryBible (`src/agents/page_index.py`)**:
    - **Scoped Alias Resolution Toàn Văn Bản**: Chuẩn hóa tên trong `characters_present`, `page_summary`, `action_summary` và `dialogue_summary`. Mọi nhãn vô danh giữ cục bộ trong `scoped_map` chống lộ spoiler.
    - **Semantic Scene Segmentation + Nén Notes**: Tách cảnh tự nhiên kèm `narrative_weight` (1–5) & `transition_type` (có kiểm tra phủ rời rạc 100% trang), nén cú pháp `scene_*.md` (bỏ giới hạn 24k), gom batch 3 scenes/call có cache từng scene và nạp `seed_cast.json` + sinh `pronunciation_map` (`repo/pronunciation.json`).
-4. **Stage 3a — Disjoint Multi-Part Scriptwriter (`src/agents/scriptwriter.py`)**:
-   - **Phân hoạch `1 Scene = 1 Part`, Semantic Pacing & Water-Filling**: Mỗi `SceneNode` ánh xạ thành `OutlinePart` kèm `pacing_mode` (`skim`/`steady`/`spotlight`) và ngân sách đề xuất theo độ nặng nội dung, hòa trộn mềm qua `_allocate_part_budgets` (Water-filling + Largest Remainder, tổng khớp ngân sách và không dồn lỗi trừ vào 1 cảnh cao trào). Xóa chia xô trang tuyến tính từng beat để LLM tự do lướt nhanh/dừng phân tích, dùng `scoped_outline_view()` + `render_scoped_memory_md()` + cầu nối 2 trang cuối scene trước + **Phrase Memory (`opener_counts`)** truyền cụm mở câu đã dùng sang Part sau chống lặp từ gốc.
-   - **Storytelling Affordances & Contract `mood`**: Mở quyền chọn `hook_strategy` (dùng `hook_summary` ở Beat 1), `beat_type` (`narrative`/`commentary`/`outro`, ép chỉ hồi cuối dùng `outro`), `mood` chuẩn hóa về 7 giá trị (`calm`, `warm`, `comedic`, `mysterious`, `tense`, `action`, `tragic`), và khóa `cursor_rank` đơn điệu kèm retry khi XML rỗng/thiếu phủ trang.
-5. **Stage 3b — Critic V3: Deterministic Gate, Read-Only Auditor & Allowlisted Surgical Repair (`src/agents/critic.py`)**:
-   - **Tầng 1 (Python)**: Kiểm định hard invariants (`grounding`, biên giới Part, lùi trang, `coverage_gap`, `spoiler_name`, N-gram `duplication`, cliché AI, `budget > +30%`) + bộ quét lặp thống kê (`opener_repeat` từ lần thứ 3+, `seam_echo` giáp ranh giữa 2 beat kề).
-   - **Tầng 2 (Read-Only `CriticSemanticAuditor`)**: Đọc liền mạch toàn tập trong 1 context để chỉ điểm tối đa 8 beat lặp ý khác chữ hoặc sượng điểm chuyển hồi (không sửa văn phong beat sạch).
-   - **Tầng 3 (Surgical Repairer `CriticSeamPolisher`)**: Khóa cứng **allowlist `editable_ids`** trong Python (beat kề chỉ là `readonly="true"`), luôn truyền `grounded_facts` + `persona` gốc, và áp **Per-Beat Rollback Guard** (từ chối rewrite nếu phát sinh spoiler, cliché, lặp mới hoặc làm mất trích dẫn thoại gốc), sau đó điền `tts_text` theo `pronunciation_map`.
-6. **Stage 4, 5 & 6 — Audio, Choreographer & FFmpeg Renderer (`src/audio/`, `src/agents/choreographer.py`, `src/render/`)**:
-   - **Audio**: Tổng hợp `tts_text` song song qua Edge-TTS (kèm `WordBoundary` timestamps) hoặc VieNeu (fallback sang Edge-TTS khi lỗi), dùng Fourier anti-aliased resampling, `beat_cache_key` tính cả `rate`, và `build_dynamic_timeline_bgm` hỗ trợ nạp track thật theo `assets/bgm/<mood>.*` hoặc tổng hợp vòng hợp âm 4 nhịp theo `mood` + SFX nhiều lớp (`shake_impact`, `flash_white`, `fade_black`).
+4. **Stage 3a — Decoupled 2-Pass Scriptwriter (`src/agents/scriptwriter.py`)**:
+   - **Phân hoạch `1 Scene = 1 Part` & Water-Filling**: `OutlinePlannerAgent` lập dàn ý ngữ nghĩa (`skim`/`steady`/`spotlight`) hòa trộn qua `_allocate_part_budgets` (Water-filling + Largest Remainder).
+   - **Pass 1 — Pure Storyteller (`ProseWriterAgent`, `temperature=0.72`)**: Gom các hồi nối tiếp thành **3–4 Chương lớn (`_group_parts_into_acts`)**, nạp bản tóm tắt sạch không rác CV/panel_id (`_strip_cv_metadata_for_prose`), viết văn **Video Essay tiếng Việt liền mạch, giàu nhạc tính** (ZERO `panel_id`/XML beat tax, bỏ bệnh ép rắc `"nha/kìa/anh em"`, vẫn khóa chống spoil tên theo `first_named_page_id`), lưu `repo/script/prose_draft.md`.
+   - **Pass 2 — Panel Aligner (`PanelAlignerAgent`, `temperature=0.15`)**: Chỉ cắt nguyên văn từng câu của Pass 1 vào các `<beat>` đúng nhịp thở và gán `1–4 panel_id` tiến đơn điệu, có kiểm tra độ bảo toàn chữ `_prose_preservation_ratio >= 0.78` và `_sanitize_part_beats` chống lệch/thiếu phủ trang.
+5. **Stage 3b — Critic V3.5: Deterministic Gate, Global Tic Scanner, Read-Only Auditor & Surgical Repair (`src/agents/critic.py`)**:
+   - **Tầng 1 (Python)**: Kiểm định hard invariants (`grounding`, biên giới Part, lùi trang, `coverage_gap`, `spoiler_name`, N-gram `duplication`, cliché AI, `budget > +30%`) + quét lặp thống kê (`opener_repeat`, **`tic_repeat`** bắt khẩu ngữ thừa ở *mọi vị trí* trong câu trừ lời thoại trích dẫn, `seam_echo`, và cảnh báo vĩ mô mật độ dấu `:` / câu cụt staccato).
+   - **Tầng 2 (Read-Only `CriticSemanticAuditor`)**: Đọc liền mạch toàn tập trong 1 context để chỉ điểm tối đa 8 beat lặp ý khác chữ hoặc sượng điểm chuyển hồi.
+   - **Tầng 3 (Surgical Repairer `CriticSeamPolisher`)**: Khóa cứng **allowlist `editable_ids`** trong Python, kèm **Per-Beat Rollback Guard**, sau đó điền `tts_text` theo `pronunciation_map`.
+6. **Stage 4, 5 & 6 — Audio, Smart Music Director, Choreographer & FFmpeg Renderer (`src/audio/`, `src/agents/choreographer.py`, `src/render/`)**:
+   - **Audio & Music Dataset**: `manga-recap music fetch/index/list` quản lý kho nhạc CC-BY/custom tại `assets/music_library/catalog.json` (tự đo DSP: LUFS, BPM, brightness, intro-skip). **`Smart Music Director` (`music_director.py`)** chọn bảng màu thể loại theo `StoryBible.tone_summary`, gom nhạc thành các **Music Cues dài >= 28s** tránh nhảy bài mỗi beat, chuẩn hóa `-16 LUFS`, trộn **2.5s equal-power crossfade** + SFX thật (cooldown 6s) + tự xuất `exports/music_credits.txt` (fallback mượt về 4-bar synth nếu chưa có thư viện).
    - **Choreographer & Renderer**: Word-timestamp subtitle sync, word-wrap phụ đề cho cả `16:9` & `9:16`, tách 2 nhịp sub-shot (`Wide -> Focus Face`) trên slot dài giàu chi tiết, hỗ trợ RTL/LTR ở `compositor.py`, HTML preview có `<img>` + `<audio>`, và CapCut draft đầy đủ diptych + BGM + subtitles.

@@ -15,6 +15,8 @@ from src.downloaders.nyaa import NyaaDownloader
 from src.pipeline import MangaRecapPipeline
 
 app = typer.Typer(help="Automated multi-agent Manga & Manhwa Recap Video Generator")
+music_app = typer.Typer(help="Manage automated royalty-free BGM & SFX music dataset")
+app.add_typer(music_app, name="music")
 console = Console()
 
 
@@ -132,6 +134,78 @@ def download(
     console.print(f"[bold cyan]Downloading from Nyaa:[/] {source} (volume={volume or 'all'})")
     res_path = dl.download(source, out, volume_filter=volume, extract=not no_extract)
     console.print(f"[bold green]Downloaded & ready at:[/] {res_path}")
+
+
+@music_app.command("fetch")
+def music_fetch(
+    per_mood: int = typer.Option(3, "--per-mood", "-n", help="Number of starter CC-BY tracks to fetch per canonical mood"),
+    library_dir: Optional[Path] = typer.Option(None, "--library-dir", "-d", help="Music library root directory"),
+    config_path: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="Path to config.yaml"),
+) -> None:
+    """Download a curated CC-BY 4.0 starter BGM dataset + SFX pack and auto-index catalog.json."""
+    from src.audio.music_library import fetch_starter_music_library
+
+    cfg = load_config(config_path)
+    lib_dir = library_dir or cfg.render.music_library_dir
+    console.print(f"[bold cyan]Fetching starter CC-BY music dataset[/] ({per_mood} tracks/mood) -> {lib_dir} ...")
+    cat = fetch_starter_music_library(lib_dir, per_mood=per_mood)
+    console.print(
+        f"[bold green]Ready![/] Indexed {len(cat.tracks)} BGM tracks & {len(cat.sfx)} SFX clips at {lib_dir / 'catalog.json'}"
+    )
+
+
+@music_app.command("index")
+def music_index(
+    import_dir: Optional[Path] = typer.Argument(None, help="Optional folder of custom MP3/WAV tracks to import & auto-tag"),
+    library_dir: Optional[Path] = typer.Option(None, "--library-dir", "-d", help="Music library root directory"),
+    force: bool = typer.Option(False, "--force", "-f", help="Re-run DSP acoustic analysis on all tracks"),
+    config_path: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="Path to config.yaml"),
+) -> None:
+    """Analyze DSP acoustics (LUFS, BPM, brightness, intro-skip) and auto-tag BGM/SFX into catalog.json."""
+    from src.audio.music_library import index_music_library
+
+    cfg = load_config(config_path)
+    lib_dir = library_dir or cfg.render.music_library_dir
+    console.print(f"[bold cyan]Indexing music library:[/] {lib_dir}" + (f" (importing {import_dir})" if import_dir else ""))
+    cat = index_music_library(lib_dir, import_dir=import_dir, force_reanalyze=force)
+    console.print(
+        f"[bold green]Indexed![/] {len(cat.tracks)} BGM tracks & {len(cat.sfx)} SFX clips -> {lib_dir / 'catalog.json'}"
+    )
+
+
+@music_app.command("list")
+def music_list(
+    library_dir: Optional[Path] = typer.Option(None, "--library-dir", "-d", help="Music library root directory"),
+    config_path: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="Path to config.yaml"),
+) -> None:
+    """Display indexed BGM tracks, moods, genres, BPM, energy, and LUFS loudness."""
+    from src.audio.music_library import load_music_catalog
+
+    cfg = load_config(config_path)
+    lib_dir = library_dir or cfg.render.music_library_dir
+    cat = load_music_catalog(lib_dir)
+    if not cat or not cat.tracks:
+        console.print(f"[bold yellow]No tracks indexed in {lib_dir}.[/] Run `uv run manga-recap music fetch` first.")
+        return
+    tbl = Table(title=f"Music Library ({len(cat.tracks)} BGM | {len(cat.sfx)} SFX)")
+    tbl.add_column("Title")
+    tbl.add_column("Moods")
+    tbl.add_column("Genres")
+    tbl.add_column("BPM", justify="right")
+    tbl.add_column("Energy", justify="right")
+    tbl.add_column("LUFS", justify="right")
+    tbl.add_column("Dur(s)", justify="right")
+    for tr in cat.tracks:
+        tbl.add_row(
+            tr.title[:34],
+            ", ".join(tr.moods),
+            ", ".join(tr.genres[:2]),
+            f"{tr.bpm:.0f}",
+            str(tr.energy),
+            f"{tr.measured_lufs:.1f}",
+            f"{tr.duration_sec:.0f}",
+        )
+    console.print(tbl)
 
 
 if __name__ == "__main__":

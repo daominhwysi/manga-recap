@@ -101,6 +101,8 @@ class FFmpegOpenCVRenderer:
         bgm_ducking: bool = True,
         subtitle_font_ratio: float = 0.036,
         use_hw_accel: bool = True,
+        music_library_dir: Path | str | None = Path("assets/music_library"),
+        min_bgm_cue_sec: float = 28.0,
     ) -> None:
         self.crf = crf
         self.preset = preset
@@ -113,6 +115,8 @@ class FFmpegOpenCVRenderer:
         self.bgm_ducking = bgm_ducking
         self.subtitle_font_ratio = subtitle_font_ratio
         self.use_hw_accel = use_hw_accel
+        self.music_library_dir = Path(music_library_dir) if music_library_dir else None
+        self.min_bgm_cue_sec = max(5.0, float(min_bgm_cue_sec))
 
     def render(
         self,
@@ -127,15 +131,44 @@ class FFmpegOpenCVRenderer:
         total_frames = max(1, int(round(timeline.total_duration_ms / 1000.0 * timeline.fps)))
         has_audio = bool(timeline.voiceover_path and Path(timeline.voiceover_path).exists())
         active_bgm_path: str | None = timeline.bgm_path
-        if timeline.bgm_path:
-            bgm_file = Path(timeline.bgm_path)
-            if has_audio and bgm_file.name == "default_dark_fantasy.wav":
-                from src.audio.bgm_generator import build_dynamic_timeline_bgm
+        lib_has_catalog = bool(
+            self.music_library_dir and (self.music_library_dir / "catalog.json").exists()
+        )
+        if has_audio and (
+            (timeline.bgm_path and Path(timeline.bgm_path).name == "default_dark_fantasy.wav")
+            or (timeline.bgm_path is None and lib_has_catalog)
+        ):
+            import json
+            from src.audio.bgm_generator import build_dynamic_timeline_bgm
 
-                dyn_bgm = output_path.parent / "audio" / "04b_bgm_dynamic.wav"
-                build_dynamic_timeline_bgm(timeline, dyn_bgm, custom_bgm_dir=bgm_file.parent)
-                active_bgm_path = str(dyn_bgm.resolve())
-            elif not bgm_file.exists() and bgm_file.suffix.lower() == ".wav":
+            tone_summary = ""
+            series_title = ""
+            bible_p = output_path.parent / "02b_story_bible.json"
+            if bible_p.exists():
+                try:
+                    bdata = json.loads(bible_p.read_text(encoding="utf-8"))
+                    tone_summary = str(bdata.get("tone_summary") or "")
+                    series_title = str(bdata.get("series_title_guess") or "")
+                except Exception:
+                    pass
+
+            dyn_bgm = output_path.parent / "audio" / "04b_bgm_dynamic.wav"
+            custom_dir = Path(timeline.bgm_path).parent if timeline.bgm_path else None
+            build_dynamic_timeline_bgm(
+                timeline,
+                dyn_bgm,
+                custom_bgm_dir=custom_dir,
+                music_library_dir=self.music_library_dir,
+                tone_summary=tone_summary,
+                title=series_title,
+                min_cue_duration_ms=int(round(self.min_bgm_cue_sec * 1000)),
+                credits_path=output_path.parent / "exports" / "music_credits.txt",
+                cues_json_path=output_path.parent / "audio" / "04b_music_cues.json",
+            )
+            active_bgm_path = str(dyn_bgm.resolve())
+        elif timeline.bgm_path:
+            bgm_file = Path(timeline.bgm_path)
+            if not bgm_file.exists() and bgm_file.suffix.lower() == ".wav":
                 from src.audio.bgm_generator import ensure_default_bgm
 
                 ensure_default_bgm(bgm_file)

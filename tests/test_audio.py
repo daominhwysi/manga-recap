@@ -86,3 +86,78 @@ def test_pronunciation_cache_rate_antialias_and_dynamic_bgm(tmp_path: Path) -> N
     )
     bgm_out = build_dynamic_timeline_bgm(tl, tmp_path / "dyn_bgm.wav", custom_bgm_dir=custom_dir)
     assert bgm_out.exists() and bgm_out.stat().st_size > 10000
+
+
+def test_music_library_indexer_and_smart_music_director(tmp_path: Path) -> None:
+    from src.audio.music_director import (
+        infer_genre_preferences,
+        mix_directed_bgm,
+        plan_music_cues,
+        select_tracks_for_cues,
+    )
+    from src.audio.music_library import index_music_library
+
+    lib_dir = tmp_path / "music_lib"
+    sr = 22050
+    t = np.linspace(0.0, 6.0, sr * 6, endpoint=False)
+
+    # Create synthetic mood tracks in subfolders with different loudness & spectra
+    for mood, freq, amp, fn in [
+        ("mysterious", 220.0, 0.12, "gothic_clockwork_mystery.wav"),
+        ("action", 520.0, 0.35, "epic_battle_drums.wav"),
+        ("tragic", 196.0, 0.10, "somber_cello_lament.wav"),
+    ]:
+        p = lib_dir / "bgm" / mood / fn
+        p.parent.mkdir(parents=True, exist_ok=True)
+        sig = (amp * np.sin(2.0 * np.pi * freq * t)).astype(np.float32)
+        sf.write(str(p), np.stack([sig, sig], axis=1), sr, subtype="PCM_16")
+
+    catalog = index_music_library(lib_dir)
+    assert len(catalog.tracks) == 3
+    assert len(catalog.sfx) >= 3
+    assert (lib_dir / "catalog.json").exists()
+
+    # Genre preference inference from Vietnamese dark fantasy tone
+    prefs = infer_genre_preferences("Tông màu gothic huyền bí, ma thuật và bi kịch gia tộc.")
+    assert prefs.get("dark_fantasy", 0.0) > 0.5
+    assert prefs.get("tragedy", 0.0) > 0.0
+
+    # Scene-level cue spotting merges frantic 5-second mood flickers into smooth >= 28s cues
+    shots = [
+        TimelineShot(shot_id="s1", beat_id="b1", panel_id="p1", panel_path="p1.jpg", start_ms=0, end_ms=20000, mood="mysterious"),
+        TimelineShot(shot_id="s2", beat_id="b2", panel_id="p2", panel_path="p2.jpg", start_ms=20000, end_ms=25000, mood="comedic"),  # 5s flicker -> merged!
+        TimelineShot(shot_id="s3", beat_id="b3", panel_id="p3", panel_path="p3.jpg", start_ms=25000, end_ms=42000, mood="mysterious"),
+        TimelineShot(shot_id="s4", beat_id="b4", panel_id="p4", panel_path="p4.jpg", start_ms=42000, end_ms=76000, camera_move="shake_impact", transition_in="fade_black", mood="action"),
+    ]
+    tl = VideoTimeline(
+        job_id="dir_test",
+        width=1280,
+        height=720,
+        fps=24,
+        total_duration_ms=76000,
+        voiceover_path="vo.wav",
+        shots=shots,
+    )
+    cues = plan_music_cues(tl, min_cue_duration_ms=28000)
+    assert len(cues) == 2
+    assert cues[0].mood == "mysterious" and cues[0].end_ms == 42000
+    assert cues[1].mood == "action" and cues[1].start_ms == 42000
+
+    planned = select_tracks_for_cues(cues, catalog, genre_prefs=prefs)
+    assert planned[0].track_id != planned[1].track_id
+
+    out_wav = tmp_path / "directed.wav"
+    credits_p = tmp_path / "music_credits.txt"
+    cues_p = tmp_path / "music_cues.json"
+    res = mix_directed_bgm(
+        tl,
+        out_wav,
+        library_dir=lib_dir,
+        tone_summary="Tông màu gothic huyền bí và chiến đấu kịch tính.",
+        min_cue_duration_ms=28000,
+        credits_path=credits_p,
+        cues_json_path=cues_p,
+    )
+    assert res is not None and out_wav.exists() and out_wav.stat().st_size > 100000
+    assert credits_p.exists() and "Music Credits" in credits_p.read_text(encoding="utf-8")
+    assert cues_p.exists()

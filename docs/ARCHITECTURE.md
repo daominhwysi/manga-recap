@@ -184,33 +184,33 @@ flowchart TD
 
 ---
 
-### 4.4. Stage 3a — Biên Kịch Phân Đoạn Tách Biệt (`src/agents/scriptwriter.py`)
-- **Mục đích**: Chuyển các ghi chú phân cảnh thành kịch bản thuyết minh tiếng Việt (`03a_script_draft.json`) mang giọng kể YouTuber gần gũi, phân tích, mỗi nhịp (`ScriptBeat`) gắn `panel_ids` khớp tuyệt đối với lời nói.
-- **Kiến trúc chống lặp và bảo toàn nhịp ngữ nghĩa (Semantic Pacing + Guardrails)**:
-  1. **Phân hoạch `1 Scene = 1 Part` tách biệt tuyệt đối**: Mỗi phân cảnh (`SceneNode`) tương ứng chính xác với 1 hồi viết kịch bản (`OutlinePart`). Không có trang nào nằm chung ở 2 Part.
-  2. **Phân bổ ngân sách ngữ nghĩa + Water-filling (`_allocate_part_budgets`)**: `OutlinePlannerAgent` chọn `pacing_mode` (`skim` / `steady` / `spotlight`) và đề xuất từ theo độ nặng nội dung; Python hòa trộn với lan can Water-filling + Largest Remainder để giữ tổng thời lượng mà không bao giờ trừ dồn vào cảnh cao trào. Bỏ chia xô trang đều từng beat để người kể tự do lướt nhanh đoạn ít chữ hoặc phanh lại phân tích ở twist/thoại đắt.
-  3. **Khóa con trỏ Panel tiến đơn điệu (`_sanitize_part_beats`)**: Sau khi LLM viết xong mỗi Part, bộ lọc hậu kiểm chuẩn hóa hậu tố `panel_id`, buộc tiến về phía trước theo chiều đọc (`cursor_rank`) và kích hoạt retry nếu thiếu mã hợp lệ.
-- **Đầu ra**: `repo/OUTLINE.json`, `repo/script/parts/part_*.json`, `repo/script/part_boundaries.json` và `03a_script_draft.json`.
+### 4.4. Stage 3a — Biên Kịch Tách Lớp 2-Pass (`src/agents/scriptwriter.py`)
+- **Mục đích**: Giải phóng hoàn toàn chất lượng văn chương của LLM khỏi gánh nặng cú pháp kỹ thuật (`panel_id`, thuộc tính XML), tạo ra kịch bản thuyết minh tiếng Việt (`03a_script_draft.json`) mượt mà chuẩn Video Essay.
+- **Kiến trúc Decoupled 2-Pass ("Tách Nhà văn khỏi Kỹ sư gán mã")**:
+  1. **Phân hoạch `1 Scene = 1 Part` & Water-Filling (`_allocate_part_budgets`)**: `OutlinePlannerAgent` lập dàn ý ngữ nghĩa (`skim` / `steady` / `spotlight`), phân bổ ngân sách từ qua thuật toán Water-filling + Largest Remainder để không bỏ đói cao trào.
+  2. **Pass 1 — Pure Storyteller (`ProseWriterAgent`, `temperature=0.72`)**: Gom các hồi liên tiếp thành **3–4 Chương lớn** (`_group_parts_into_acts`), đọc bản tóm tắt câu chuyện sạch đã gột bỏ toàn bộ rác CV (`_strip_cv_metadata_for_prose`, không chứa `panel_id` hay `ar=...`), chỉ tập trung viết văn Video Essay liền mạch (lưu bản đọc thử tại `repo/script/prose_draft.md`), tuân thủ chốt chặn chống spoil tên (`first_named_page_id`).
+  3. **Pass 2 — Beat Slicer & Panel Aligner (`PanelAlignerAgent`, `temperature=0.15`)**: Nhận nguyên văn đoạn văn Pass 1 từng hồi + danh sách panel gốc, **chỉ chia nhịp `<beat>` và gán `panel_ids`, `mood`, `pause_ms` tiến đơn điệu** mà không viết lại câu chữ (kiểm chứng độ bảo toàn văn bản `_prose_preservation_ratio >= 0.78` và `_sanitize_part_beats`).
+- **Đầu ra**: `repo/OUTLINE.json`, `repo/script/acts/act_*.json`, `repo/script/prose_draft.md`, `repo/script/parts/part_*.json`, `repo/script/part_boundaries.json` và `03a_script_draft.json`.
 
 ---
 
-### 4.5. Stage 3b — Kiểm Định Viên Kịch Bản Critic V3 (`src/agents/critic.py`)
-- **Mục đích**: Kiểm định 4 tầng đảm bảo sạch lỗi sự thật, sạch lặp cụm/lặp ý mà **tuyệt đối không làm phẳng cá tính giọng kể của persona**.
-- **4 Tầng xử lý của `CriticAgent` V3**:
-  1. **Tầng 1 — Deterministic Gate & Repetition Scanner (Python thuần)**: Kiểm định `grounding`, biên giới Part, độ rộng trang 1 beat, chiều tiến đơn điệu, `coverage_gap`, `spoiler_name` (theo `first_named_page_id`), N-gram `duplication`, cliché AI, `budget` (`> +30%`), cộng thêm 2 bộ quét lặp thống kê **`opener_repeat`** (cụm mở đầu/cửa miệng lặp từ lần thứ 3 trở đi) và **`seam_echo`** (lặp từ/ý giữa đuôi beat `k-1` và đầu beat `k`).
-  2. **Tầng 2 — Read-Only Semantic Auditor (`CriticSemanticAuditor`)**: Đọc toàn bộ kịch bản trong 1 context duy nhất để chỉ điểm tối đa 8 beat bị lặp ý diễn đạt khác chữ (paraphrase) hoặc sượng điểm chuyển hồi; không tự ý gắn cờ câu hỏi giao lưu hay beat ngắn.
-  3. **Tầng 3 — Allowlisted Surgical Repairer (`CriticSeamPolisher`)**: Chỉ cho phép sửa các `beat_id` thuộc **allowlist `editable_ids`** (beat kề trước/sau gắn `readonly="true"` chỉ để giữ mạch), luôn gửi kèm `<grounded_facts>` và giọng của đúng `persona` đang chạy, và chặn bằng **Per-Beat Rollback Guard** (tự động giữ nguyên bản `03a` nếu rewrite làm phát sinh spoiler, cliché, lặp mới hoặc xóa trích dẫn thoại gốc).
+### 4.5. Stage 3b — Kiểm Định Viên Kịch Bản Critic V3.5 (`src/agents/critic.py`)
+- **Mục đích**: Kiểm định 4 tầng đảm bảo sạch lỗi sự thật, sạch lặp cụm/lặp khẩu ngữ mà **tuyệt đối không làm phẳng chất văn Video Essay của Pass 1**.
+- **4 Tầng xử lý của `CriticAgent` V3.5**:
+  1. **Tầng 1 — Deterministic Gate & Global Tic Scanner (Python thuần)**: Kiểm định `grounding`, biên giới Part, độ rộng trang 1 beat, chiều tiến đơn điệu, `coverage_gap`, `spoiler_name` (theo `first_named_page_id`), N-gram `duplication`, cliché AI, `budget` (`> +30%`), cộng thêm 3 bộ quét lặp thống kê: **`opener_repeat`** (đầu câu), **`tic_repeat`** (từ đệm/khẩu ngữ như `nha`, `nhé`, `kìa`, `để ý`, `nghe kỹ`, `khoan` ở *mọi vị trí* ngoài ngoặc kép thoại), **`seam_echo`** (lặp đuôi-đầu giữa 2 beat kề) và kiểm định vĩ mô mật độ dấu `:` / câu cụt staccato.
+  2. **Tầng 2 — Read-Only Semantic Auditor (`CriticSemanticAuditor`)**: Đọc toàn bộ kịch bản trong 1 context duy nhất để chỉ điểm tối đa 8 beat lặp ý diễn đạt khác chữ hoặc sượng điểm chuyển hồi.
+  3. **Tầng 3 — Allowlisted Surgical Repairer (`CriticSeamPolisher`)**: Khóa cứng **allowlist `editable_ids`** trong Python (beat kề chỉ là `readonly="true"`), kèm `<grounded_facts>` và **Per-Beat Rollback Guard** (từ chối rewrite nếu phát sinh spoiler, cliché, giữ lại tic bị cấm hoặc làm mất trích dẫn thoại gốc).
   4. **Tầng 4 — Re-Validate & Pronunciation Prep**: Chấm lại `CriticReport` và điền `tts_text` từ `pronunciation_map`.
 - **Đầu ra**: `03b_script_final.json` và `03b_critic_report.json`.
 
 ---
 
-### 4.6. Stage 4 — Phòng Thu Giọng Đọc & Nhạc Nền (`src/audio/`)
-- **Mục đích**: Chuyển văn bản `narration_vi` của từng beat thành file âm thanh giọng đọc tiếng Việt và ghép lại thành bản thu hoàn chỉnh.
+### 4.6. Stage 4 — Phòng Thu Giọng Đọc, Dataset Âm Nhạc & Smart Music Director (`src/audio/`)
+- **Mục đích**: Chuyển `tts_text` của từng beat thành giọng đọc tiếng Việt chuẩn xác và tự động hòa âm nhạc nền + SFX thật phù hợp thể loại bộ truyện.
 - **Cách hoạt động**:
-  1. Mỗi beat được tính một mã băm (`beat_cache_key`) dựa trên nội dung chữ + tên giọng đọc (`vi-VN-NamMinhNeural` của `EdgeTTSBackend` hoặc `VieNeuTTSBackend`). Nếu sửa 1 beat trong kịch bản, chỉ đúng beat đó cần thu âm lại, 59 beats còn lại lấy tức thì từ cache `audio/beats/*.wav`.
-  2. Ghép nối tất cả các beat theo thứ tự kèm khoảng nghỉ ngắt nhịp (`pause_after_ms`) thành file `04_voiceover.wav` chuẩn PCM 48kHz và ghi lại mốc thời gian chính xác tới từng mili-giây vào `04_audio_manifest.json`.
-  3. `build_dynamic_timeline_bgm()` hỗ trợ nạp track thật theo từng `mood` trong `assets/bgm/<mood>.*` (nếu có), hoặc tự động tổng hợp nhạc nền động với vòng hòa âm 4 nhịp + nhịp trống/tích tắc theo 7 `mood` (`warm`, `calm`, `comedic`, `mysterious`, `tense`, `action`, `tragic`) kèm 3 lớp SFX (`shake_impact`, `flash_white`, `fade_black`).
+  1. **TTS Cache & Đồng bộ từ (`stage.py`, `base.py`)**: Mỗi beat băm `beat_cache_key` (gồm text, voice, backend, `rate`), ghép thành `04_voiceover.wav` (48kHz PCM) kèm mốc thời gian từng từ trong `04_audio_manifest.json`.
+  2. **Automated Music & SFX Dataset (`music_library.py`, CLI `manga-recap music fetch|index|list`)**: Quản lý kho nhạc thật tại `assets/music_library/catalog.json`. Hỗ trợ tự động tải bộ starter CC-BY 4.0 (Incompetech) phủ đều 7 `mood`, hoặc nhập bất kỳ thư mục MP3/WAV tự sưu tầm; bộ phân tích DSP thuần NumPy tự đo **LUFS**, **BPM**, **brightness**, **energy**, và điểm bắt đầu thực **active_start_sec** (tự bỏ qua đoạn intro im lặng đầu bài).
+  3. **Smart Music Director (`music_director.py`, `bgm_generator.py`)**: Đọc `StoryBible.tone_summary` để chọn **bảng màu thể loại nhạc**, gom timeline thành các **Music Cues dài tối thiểu 28 giây** (chống nhảy bài liên tục mỗi 5s), chuẩn hóa mọi track về đúng **`-16 LUFS`**, chống lặp bài kề nhau, trộn mượt bằng **equal-power crossfade 2.5s**, chèn SFX thật có **cooldown 6 giây**, lưu kế hoạch vào `audio/04b_music_cues.json` và xuất bản quyền CC-BY sẵn cho YouTube tại `exports/music_credits.txt` (tự động fallback về nhạc tổng hợp 4 nhịp nếu chưa nạp kho nhạc).
 
 ---
 

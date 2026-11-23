@@ -19,6 +19,7 @@ downloads/
 models/
 samples/
 assets/bgm/*.wav
+assets/music_library/
 
 # OS & Editor temporary files
 .DS_Store
