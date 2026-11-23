@@ -863,42 +863,67 @@ class ScriptwriterAgent:
 
             expected_ids = [p.part_id for p in act_parts]
             act_target_words = sum(p.target_words for p in act_parts)
-            user_prompt = (
+            act_max_words = int(round(act_target_words * 1.28))
+            base_prompt = (
                 f"### HỒ SƠ NHÂN VẬT & MẠCH BÍ ẨN:\n{scoped_memory}\n\n"
                 f"{prev_line}"
-                f"### NHIỆM VỤ VIẾT KỊCH BẢN LIỀN MẠCH — CHƯƠNG {act_idx}/{len(acts)} (gồm các hồi {expected_ids}, tổng khoảng ~{act_target_words} từ):\n\n"
+                f"### NHIỆM VỤ VIẾT KỊCH BẢN LIỀN MẠCH — CHƯƠNG {act_idx}/{len(acts)} (gồm các hồi {expected_ids}, TỔNG TỐI ĐA ~{act_target_words} chữ tiếng Việt / âm tiết tách bởi dấu cách):\n\n"
                 + "\n\n".join(part_blocks)
                 + "\n\n"
                 "YÊU CẦU VIẾT VĂN (BẠN CHỈ CẦN VIẾT VĂN THẬT HAY — KHÔNG CẦN GẮN PANEL_ID HAY CHIA BEAT):\n"
-                "1) Hãy viết liền mạch một mạch truyện thống nhất xuyên suốt các hồi trên như một kịch bản Video Essay / Review truyện tranh xuất sắc để đọc thành tiếng.\n"
-                "2) Mỗi hồi đặt trong đúng 1 thẻ `<part id=\"part_XX\">...</part>` với độ dài xấp xỉ ngân sách từ gợi ý (co giãn linh hoạt +-20% theo độ nặng tình tiết). Giữa các hồi nối tiếp phải chuyển mạch tự nhiên, tuyệt đối không lặp lại câu kết của hồi trước.\n"
-                "3) Viết câu tiếng Việt có nhạc tính, liên kết nhân-quả mượt mà (đa phần câu 16–32 từ, chỉ dùng câu ngắn 7–12 từ ở đúng cú twist/cao trào). Hạn chế tối đa dấu hai chấm (:), KHÔNG viết kiểu liệt kê cụt lủn, KHÔNG rắc khẩu ngữ giả tạo ('nha', 'nhé', 'kìa', 'để ý nha', 'nghe kỹ nha', 'anh em ơi').\n"
+                "1) Viết liền mạch như một kịch bản Video Essay / Review truyện tranh xuất sắc để đọc thành tiếng.\n"
+                f"2) Mỗi hồi đặt trong đúng 1 thẻ `<part id=\"part_XX\">...</part>`. ĐỘ DÀI CÔ ĐỌNG ĐÚNG NGÂN SÁCH: tổng cả Chương {act_idx} nằm gọn quanh ~{act_target_words} chữ (âm tiết tiếng Việt tách bằng dấu cách, TUYỆT ĐỐI không vượt quá {act_max_words} chữ — hãy chắt lọc tình tiết đắt, đừng kể lan man mọi khung tranh nhỏ). Giữa các hồi nối tiếp chuyển mạch tự nhiên, không lặp lại ý vừa kết.\n"
+                "3) Viết câu tiếng Việt có nhạc tính, liên kết nhân-quả mượt mà (đa phần câu 16–30 chữ, chỉ dùng câu ngắn 7–12 chữ ở đúng cú twist/cao trào). Hạn chế tối đa dấu hai chấm (:), KHÔNG viết kiểu liệt kê cụt lủn, KHÔNG rắc khẩu ngữ giả tạo ('nha', 'nhé', 'kìa', 'để ý nha', 'nghe kỹ nha', 'anh em ơi'), KHÔNG dùng ký tự biểu tượng (♡, ♪, ★).\n"
                 "4) Giữ chính xác sự thật & lồng ghép câu thoại gốc đắt giá trong ngoặc kép (\"...\"). Tuân thủ tuyệt đối quy tắc CHỐNG SPOIL TÊN ở từng hồi."
                 + avoid_line
             )
 
-            try:
-                res = self.llm.complete_xml(
-                    agent_name="ProseWriterAgent",
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    xml_template=_ACT_PROSE_XML_TEMPLATE,
-                    parse_fn=_parse_act_prose_xml,
-                    temperature_override=story_temperature,
-                )
-            except Exception:
-                return {}
-
-            if not isinstance(res, _ActProseResponse) or not res.parts:
-                # Compatible with legacy unit-test mocks that return PartScriptResponse directly
-                return {}
-
             act_saved: dict[str, str] = {}
+            prompt_cur = base_prompt
+            for prose_turn in range(2):
+                try:
+                    res = self.llm.complete_xml(
+                        agent_name="ProseWriterAgent",
+                        system_prompt=system_prompt,
+                        user_prompt=prompt_cur,
+                        xml_template=_ACT_PROSE_XML_TEMPLATE,
+                        parse_fn=_parse_act_prose_xml,
+                        temperature_override=story_temperature,
+                    )
+                except Exception:
+                    return {}
+
+                if not isinstance(res, _ActProseResponse) or not res.parts:
+                    # Compatible with legacy unit-test mocks that return PartScriptResponse directly
+                    return {}
+
+                cand_saved = {
+                    p.part_id: res.parts[p.part_id].strip()
+                    for p in act_parts
+                    if p.part_id in res.parts and res.parts[p.part_id].strip()
+                }
+                if not cand_saved:
+                    return {}
+                act_saved = cand_saved
+                actual_act_words = sum(len(v.split()) for v in act_saved.values())
+                if actual_act_words <= act_max_words or prose_turn == 1:
+                    break
+                # Tighten once if Act significantly overshot target duration budget
+                per_part_actual = ", ".join(
+                    f"{p.part_id}: {len(act_saved.get(p.part_id, '').split())}/{p.target_words}"
+                    for p in act_parts
+                )
+                prompt_cur = (
+                    f"{base_prompt}\n\n"
+                    f"### ĐIỀU CHỈNH ĐỘ DÀI: Bản nháp vừa rồi dài {actual_act_words} chữ ({per_part_actual}), "
+                    f"vượt ngưỡng tối đa {act_max_words} chữ của Chương này. "
+                    f"Hãy viết lại cô đọng hơn về sát ~{act_target_words} chữ (giữ nguyên chất văn Video Essay mượt mà, các câu thoại đắt và nhận định sắc sảo; chỉ lược bớt mô tả rườm rà)."
+                )
+
             for p in act_parts:
-                txt = res.parts.get(p.part_id, "").strip()
+                txt = act_saved.get(p.part_id, "").strip()
                 if txt:
                     part_prose_map[p.part_id] = txt
-                    act_saved[p.part_id] = txt
                     for op in extract_beat_openers(txt, name_tokens=name_tokens):
                         opener_counts[op] += 1
             if act_saved:
@@ -1098,6 +1123,10 @@ class ScriptwriterAgent:
             forward = [pid for pid in kept if panel_rank[pid] >= cursor_rank]
             if forward:
                 kept = forward
+            elif kept:
+                # Strictly prevent backward page jumps: advance monotonically from cursor_rank
+                kept = [allowed_panels[min(len(allowed_panels) - 1, cursor_rank)]]
+                fallback_count += 1
             if kept:
                 first_pg_i = page_idx[_panel_to_page_id(kept[0])]
                 tight = [

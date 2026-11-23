@@ -13,10 +13,12 @@ from src.schemas.timeline import AudioBeatInfo, WordTimestamp
 
 
 def apply_pronunciation_glossary(text: str, pronunciation_map: dict[str, str] | None) -> str:
-    """Normalize foreign terms/names using pronunciation_map for TTS while preserving display subtitles."""
-    if not text or not pronunciation_map:
-        return text
-    out = text
+    """Normalize foreign terms/names using pronunciation_map for TTS while stripping decorative non-spoken symbols."""
+    cleaned = re.sub(r"[♡♥❤♪♫★☆◆◇■□●○※]+", "", text or "")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    if not cleaned or not pronunciation_map:
+        return cleaned
+    out = cleaned
     for term, spoken in sorted(pronunciation_map.items(), key=lambda kv: -len(kv[0])):
         clean_t = term.strip()
         clean_s = spoken.strip()
