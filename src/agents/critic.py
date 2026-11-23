@@ -11,6 +11,10 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from src.agents.alignment import (
+    page_analyses_to_alignment_records,
+    verify_beats_alignment,
+)
 from src.agents.page_index import extract_distinctive_char_patterns
 from src.audio.base import apply_pronunciation_glossary
 from src.config import load_personas
@@ -323,14 +327,16 @@ class CriticAgent:
         beat_to_allowed: dict[int, set[str]],
         target_total_words: int | None = None,
         bible: StoryBible | None = None,
+        page_analyses: list[PageAnalysis] | None = None,
+        part_bounds: list[dict] | None = None,
     ) -> tuple[list[CriticIssue], set[int], list[str]]:
-        """Layer 1: Evaluate hard invariants + statistical opener/seam repetition without mutating panel_ids."""
+        """Layer 1: Evaluate hard invariants + semantic panel alignment + statistical opener/seam repetition."""
         issues: list[CriticIssue] = []
         flagged_indices: set[int] = set()
         flagged_notes: list[str] = []
         total_beats = len(beats)
         avg_pages_per_beat = (len(all_pages) / max(1, total_beats)) if total_beats >= 6 else 2.5
-        max_single_beat_span = max(3, math.ceil(avg_pages_per_beat * 1.5))
+        max_single_beat_span = max(4, math.ceil(avg_pages_per_beat * 2.0))
         max_coverage_gap = max(8, math.ceil(avg_pages_per_beat * 3.5))
 
         reveal_checks = CriticAgent._build_reveal_checks(bible, page_order)
@@ -508,6 +514,39 @@ class CriticAgent:
                     )
                     flagged_indices.add(b_idx)
                     flagged_notes.append(t_msg)
+
+        # Semantic Visual-Audio Alignment Gate (Quote Pinning + Content Phase-Lag Detection)
+        if page_analyses:
+            align_groups: list[tuple[list[ScriptBeat], list[str]]] = []
+            if part_bounds:
+                for pmeta in part_bounds:
+                    s_i = int(pmeta.get("start_beat_idx", 0))
+                    e_i = int(pmeta.get("end_beat_idx", -1))
+                    if 0 <= s_i <= e_i < len(beats):
+                        part_pages = list(
+                            dict.fromkeys(
+                                re.sub(r"_P\d+$", "", pid)
+                                for pid in pmeta.get("allowed_panels", [])
+                                if pid
+                            )
+                        )
+                        if len(part_pages) >= 3:
+                            align_groups.append((beats[s_i : e_i + 1], part_pages))
+            elif len(all_pages) >= 3:
+                align_groups.append((beats, all_pages))
+
+            for grp_beats, grp_pages in align_groups:
+                recs = page_analyses_to_alignment_records(page_analyses, grp_pages)
+                for a_iss in verify_beats_alignment(grp_beats, recs):
+                    issues.append(
+                        CriticIssue(
+                            beat_id=a_iss.beat_id,
+                            severity="error",
+                            category="panel_sync",
+                            message=a_iss.message,
+                        )
+                    )
+                    flagged_notes.append(a_iss.message)
 
         # Macro Distribution Critique (Rule 5): check volume-level pacing variance, staccato/colon overuse & budget
         if len(word_counts) >= 12:
@@ -748,7 +787,7 @@ class CriticAgent:
                     "QUY TẮC TUYỆT ĐỐI:\n"
                     "1) CHỈ trả về `<rewrite beat_id='...'>` cho những beat có thuộc tính `editable=\"true\"`. TUYỆT ĐỐI KHÔNG sửa beat `readonly=\"true\"`.\n"
                     "2) CHỈ sửa đúng lỗi nêu trong `<fix_reason>` / danh sách lỗi (đổi cụm mở đầu bị lặp, bỏ vế lặp đuôi beat trước, bỏ tên gọi sớm trước `lộ từ ...`, khử cliché AI, hoặc cắt ngắn khi vượt budget).\n"
-                    "3) GIỮ NGUYÊN 100% sự thật từ `<grounded_facts>`, câu thoại trích dẫn trong ngoặc kép (\"...\"), giọng kể YouTuber gần gũi ('mình', 'anh em', câu hỏi tương tác) và nhịp ngắn-dài của bản gốc."
+                    "3) GIỮ NGUYÊN 100% sự thật từ `<grounded_facts>`, câu thoại trích dẫn trong ngoặc kép (\"...\"), đúng giọng kể tự nhiên của persona (KHÔNG ép khẩu ngữ thừa) và nhịp ngắn-dài của bản gốc."
                 ),
                 user_prompt=(
                     f"Nhân vật chuẩn: {cast_names}\n"
@@ -834,13 +873,15 @@ class CriticAgent:
 
         seam_indices: list[int] = []
         beat_to_allowed: dict[int, set[str]] = {}
+        part_bounds: list[dict] = []
         boundaries_path = job_dir / "repo" / "script" / "part_boundaries.json"
         if boundaries_path.exists():
             try:
                 bounds = json.loads(boundaries_path.read_text(encoding="utf-8"))
-                for b_idx, part_meta in enumerate(bounds):
+                part_bounds = bounds if isinstance(bounds, list) else []
+                for b_idx, part_meta in enumerate(part_bounds):
                     end_i = int(part_meta.get("end_beat_idx", -1))
-                    if b_idx < len(bounds) - 1 and end_i >= 0:
+                    if b_idx < len(part_bounds) - 1 and end_i >= 0:
                         seam_indices.extend([end_i, end_i + 1])
                     allowed = set(part_meta.get("allowed_panels", []))
                     if allowed:
@@ -851,6 +892,7 @@ class CriticAgent:
                             beat_to_allowed[idx_in] = allowed
             except Exception:
                 seam_indices = []
+                part_bounds = []
         seam_indices = sorted(set(seam_indices))
 
         # Step 1: Deterministic Panel Grounding repair (guaranteed valid panel_ids)
@@ -880,7 +922,7 @@ class CriticAgent:
             else None
         )
 
-        # Layer 1: Deterministic Gate + Repetition Scanner
+        # Layer 1: Deterministic Gate + Semantic Visual-Audio Alignment + Repetition Scanner
         issues_eval, flagged_indices, flagged_notes = self._evaluate_issues(
             cleaned_beats,
             all_pages=all_pages,
@@ -888,6 +930,8 @@ class CriticAgent:
             beat_to_allowed=beat_to_allowed,
             target_total_words=target_total_words,
             bible=bible,
+            page_analyses=page_analyses,
+            part_bounds=part_bounds,
         )
 
         # Layer 2 (Read-Only Semantic Auditor) + Layer 3 (Allowlisted Surgical Repairer, up to 2 rounds)
@@ -932,6 +976,8 @@ class CriticAgent:
                     beat_to_allowed=beat_to_allowed,
                     target_total_words=target_total_words,
                     bible=bible,
+                    page_analyses=page_analyses,
+                    part_bounds=part_bounds,
                 )
 
                 # Round 2: ONLY if text-fixable severity="error" remains (never waste LLM calls on structural errors)
@@ -971,6 +1017,8 @@ class CriticAgent:
                             beat_to_allowed=beat_to_allowed,
                             target_total_words=target_total_words,
                             bible=bible,
+                            page_analyses=page_analyses,
+                            part_bounds=part_bounds,
                         )
 
         # Step 3: Populate TTS pronunciation-normalized strings without mutating display subtitles

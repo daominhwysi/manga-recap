@@ -984,3 +984,157 @@ def test_decoupled_two_pass_storyteller_aligner_and_critic_v35_tics(tmp_path: Pa
     assert ("b001", "tic_repeat") not in tic_cats  # Quoted dialogue ignored
     assert ("b002", "tic_repeat") not in tic_cats
     assert 3 in flagged
+
+
+def test_semantic_panel_alignment_anchors_verifier_and_pass2_retry(tmp_path: Path) -> None:
+    from src.agents.alignment import (
+        PageAlignmentRecord,
+        build_alignment_anchors,
+        pin_missing_quote_panels,
+        verify_beats_alignment,
+    )
+    from src.agents.scriptwriter import _ActProseResponse
+    from src.schemas.analysis import PageAnalysis, PanelAnalysis
+
+    pages = [
+        PageAlignmentRecord(
+            page_id="ch01_p001",
+            full_text="Cậu bé bước vào vườn hoa hồng đi theo giai điệu hộp nhạc.",
+            panels=[("ch01_p001_P1", "Bước vào vườn hoa hồng tìm hộp nhạc.")],
+        ),
+        PageAlignmentRecord(
+            page_id="ch01_p002",
+            full_text="Nền đá dưới chân rạn nứt dữ dội khiến cả hai rơi xuống hố sâu.",
+            panels=[("ch01_p002_P1", "Nền đá sụp đổ tạo thành hố sâu rơi tự do.")],
+        ),
+        PageAlignmentRecord(
+            page_id="ch01_p003",
+            full_text="Dưới phế tích cổ có một cây thánh giá đá phủ rêu và chiếc đồng hồ quả quýt.",
+            panels=[("ch01_p003_P1", "Chiếc đồng hồ quả quýt treo trên bia mộ thánh giá phủ rêu.")],
+        ),
+        PageAlignmentRecord(
+            page_id="ch01_p004",
+            full_text="Một căn phòng đầy búp bê sứ với ánh mắt vô hồn vây quanh cậu.",
+            panels=[("ch01_p004_P1", "Căn phòng sàn caro đầy búp bê sứ kỳ dị vây quanh.")],
+        ),
+        PageAlignmentRecord(
+            page_id="ch01_p005",
+            full_text="Con búp bê đột ngột bùng cháy dữ dội giữa luồng lửa đen.",
+            panels=[("ch01_p005_P1", "Con búp bê rơi xuống nền rồi bùng cháy dữ dội.")],
+        ),
+        PageAlignmentRecord(
+            page_id="ch01_p006",
+            full_text='Cô gái siết cổ cậu và rỉ tai: "Ta sẽ không bao giờ tha thứ cho ngươi đâu!"',
+            panels=[
+                ("ch01_p006_P1", "Bàn tay bóp nghẹt lấy cổ khiến cậu nghẹt thở."),
+                ("ch01_p006_P2", 'Cô gái lạnh lùng cảnh cáo: "Ta sẽ không bao giờ tha thứ cho ngươi đâu!"'),
+            ],
+        ),
+    ]
+
+    prose = (
+        "Cậu bé đi qua vườn hoa hồng theo tiếng hộp nhạc, rồi bất ngờ rơi xuống hố sâu. "
+        "Dưới phế tích, chiếc đồng hồ quả quýt treo trên thánh giá phủ rêu. "
+        "Vừa chạm vào, cậu bị kéo vào căn phòng đầy búp bê sứ vô hồn. "
+        'Khi một con búp bê bùng cháy, cô gái siết cổ cậu và nói: "Ta sẽ không bao giờ tha thứ cho ngươi đâu!"'
+    )
+    anchor_md = build_alignment_anchors(prose, pages)
+    assert "ch01_p006_P2" in anchor_md
+    assert "ch01_p003" in anchor_md
+
+    # Phase-lagged beats: narration already at doll room / burning doll / quote, while panels lag on p001..p003
+    lagged_beats = [
+        ScriptBeat(beat_id="b01", narration_vi="Cậu bé đi qua vườn hoa hồng theo tiếng hộp nhạc.", panel_ids=["ch01_p001_P1"]),
+        ScriptBeat(beat_id="b02", narration_vi="Vừa chạm vào, cậu bị kéo vào căn phòng đầy búp bê sứ vô hồn.", panel_ids=["ch01_p002_P1"]),
+        ScriptBeat(beat_id="b03", narration_vi="Con búp bê bùng cháy dữ dội giữa luồng lửa đen.", panel_ids=["ch01_p003_P1"]),
+        ScriptBeat(beat_id="b04", narration_vi='Cô gái siết cổ và rỉ tai: "Ta sẽ không bao giờ tha thứ cho ngươi đâu!"', panel_ids=["ch01_p004_P1"]),
+        # Short abstract commentary beat must NOT false-positive
+        ScriptBeat(beat_id="b05", narration_vi="Nhưng mọi chuyện thật sự chỉ mới bắt đầu từ đây.", panel_ids=["ch01_p006_P1"]),
+    ]
+    a_issues = verify_beats_alignment(lagged_beats, pages)
+    kinds_by_bid = {(i.beat_id, i.kind) for i in a_issues}
+    assert ("b02", "visual_desync") in kinds_by_bid
+    assert ("b03", "visual_desync") in kinds_by_bid
+    assert ("b04", "quote_mismatch") in kinds_by_bid
+    assert all(i.beat_id != "b05" for i in a_issues)
+
+    # Safety-net quote pinner fixes monotonic missing quote panel
+    allowed_p = [pid for pg in pages for pid, _ in pg.panels]
+    fixed_cnt = pin_missing_quote_panels(lagged_beats, pages, allowed_p)
+    assert fixed_cnt == 1
+    assert "ch01_p006_P2" in lagged_beats[3].panel_ids
+
+    # Critic Layer 1 also catches alignment issues when PageAnalysis is provided
+    pa_list = [
+        PageAnalysis(
+            page_id=pg.page_id,
+            chapter_id="ch01",
+            page_index=i,
+            page_summary=pg.full_text,
+            panels=[PanelAnalysis(panel_id=pid, action_summary=txt, dialogue_summary=txt) for pid, txt in pg.panels],
+        )
+        for i, pg in enumerate(pages)
+    ]
+    all_pg_ids = [pg.page_id for pg in pages]
+    pg_order = {pg: i for i, pg in enumerate(all_pg_ids)}
+    bad_for_critic = [
+        ScriptBeat(beat_id="b01", narration_vi="Cậu bé đi qua vườn hoa hồng theo tiếng hộp nhạc.", panel_ids=["ch01_p001_P1"]),
+        ScriptBeat(beat_id="b02", narration_vi="Con búp bê đột ngột bùng cháy dữ dội giữa luồng lửa đen.", panel_ids=["ch01_p002_P1"]),
+        ScriptBeat(beat_id="b03", narration_vi='Cô gái siết cổ: "Ta sẽ không bao giờ tha thứ cho ngươi đâu!"', panel_ids=["ch01_p004_P1"]),
+    ]
+    c_issues, _, _ = CriticAgent._evaluate_issues(
+        bad_for_critic,
+        all_pages=all_pg_ids,
+        page_order=pg_order,
+        beat_to_allowed={},
+        page_analyses=pa_list,
+    )
+    assert any(i.beat_id == "b02" and i.category == "panel_sync" for i in c_issues)
+    assert any(i.beat_id == "b03" and i.category == "panel_sync" for i in c_issues)
+
+    # PanelAlignerAgent auto-retries when turn 1 is phase-lagged and accepts aligned turn 2
+    manifest, _ = _make_dummy_manifest(6, panels_per_page=2)
+    llm_off = LLMClient(LLMConfig(offline_fallback=True))
+    tree, bible = PageIndexBuilder(llm_off, pages_per_scene=6).build(manifest, pa_list, tmp_path / "j_align")
+    llm = LLMClient(LLMConfig(api_key="dummy"))
+    align_turns = {"n": 0, "saw_feedback": False}
+
+    def fake_json(agent_name, system_prompt, user_prompt, schema_cls, **kw):
+        return ScriptOutline(
+            title_vi="Align Test",
+            hook_summary="Hook",
+            parts=[OutlinePart(part_id="part_01", title="P1", section="rising", scene_ids=["scene_001"], target_words=80)],
+        )
+
+    def fake_xml(agent_name, system_prompt, user_prompt, xml_template, parse_fn, **kw):
+        if agent_name == "ProseWriterAgent":
+            return _ActProseResponse(parts={"part_01": prose})
+        align_turns["n"] += 1
+        if align_turns["n"] == 1:
+            assert "BẢN ĐỒ NEO TRANG THAM KHẢO" in user_prompt
+            # Return phase-lagged beats on turn 1
+            return PartScriptResponse(
+                beats=[
+                    ScriptBeat(beat_id="b1", narration_vi="Cậu bé đi qua vườn hoa hồng theo tiếng hộp nhạc, rồi bất ngờ rơi xuống hố sâu.", panel_ids=["ch01_p001_P1"]),
+                    ScriptBeat(beat_id="b2", narration_vi="Dưới phế tích, chiếc đồng hồ quả quýt treo trên thánh giá phủ rêu. Vừa chạm vào, cậu bị kéo vào căn phòng đầy búp bê sứ vô hồn.", panel_ids=["ch01_p002_P1"]),
+                    ScriptBeat(beat_id="b3", beat_type="outro", narration_vi='Khi một con búp bê bùng cháy, cô gái siết cổ cậu và nói: "Ta sẽ không bao giờ tha thứ cho ngươi đâu!"', panel_ids=["ch01_p003_P1"]),
+                ]
+            )
+        if "LỆCH HÌNH–CHỮ" in user_prompt:
+            align_turns["saw_feedback"] = True
+        return PartScriptResponse(
+            beats=[
+                ScriptBeat(beat_id="b1", narration_vi="Cậu bé đi qua vườn hoa hồng theo tiếng hộp nhạc, rồi bất ngờ rơi xuống hố sâu.", panel_ids=["ch01_p001_P1", "ch01_p002_P1"]),
+                ScriptBeat(beat_id="b2", narration_vi="Dưới phế tích, chiếc đồng hồ quả quýt treo trên thánh giá phủ rêu. Vừa chạm vào, cậu bị kéo vào căn phòng đầy búp bê sứ vô hồn.", panel_ids=["ch01_p003_P1", "ch01_p004_P1"]),
+                ScriptBeat(beat_id="b3", beat_type="outro", narration_vi='Khi một con búp bê bùng cháy, cô gái siết cổ cậu và nói: "Ta sẽ không bao giờ tha thứ cho ngươi đâu!"', panel_ids=["ch01_p005_P1", "ch01_p006_P2"]),
+            ]
+        )
+
+    llm.complete_json = fake_json  # type: ignore
+    llm.complete_xml = fake_xml  # type: ignore
+    script = ScriptwriterAgent(llm, ScriptConfig(fast_path_max_pages=2, decoupled_two_pass=True)).write_script(
+        bible, pa_list, "phan_tich", tmp_path / "j_align", tree=tree
+    )
+    assert align_turns["n"] == 2
+    assert align_turns["saw_feedback"] is True
+    assert "ch01_p006_P2" in script.beats[-1].panel_ids

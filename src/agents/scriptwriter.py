@@ -10,6 +10,12 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from src.agents.alignment import (
+    build_alignment_anchors,
+    parse_scene_pages_for_alignment,
+    pin_missing_quote_panels,
+    verify_beats_alignment,
+)
 from src.agents.critic import _extract_bible_name_tokens, extract_beat_openers
 from src.agents.page_index import (
     PageIndexTree,
@@ -874,7 +880,7 @@ class ScriptwriterAgent:
                 "1) Viết liền mạch như một kịch bản Video Essay / Review truyện tranh xuất sắc để đọc thành tiếng.\n"
                 f"2) Mỗi hồi đặt trong đúng 1 thẻ `<part id=\"part_XX\">...</part>`. ĐỘ DÀI CÔ ĐỌNG ĐÚNG NGÂN SÁCH: tổng cả Chương {act_idx} nằm gọn quanh ~{act_target_words} chữ (âm tiết tiếng Việt tách bằng dấu cách, TUYỆT ĐỐI không vượt quá {act_max_words} chữ — hãy chắt lọc tình tiết đắt, đừng kể lan man mọi khung tranh nhỏ). Giữa các hồi nối tiếp chuyển mạch tự nhiên, không lặp lại ý vừa kết.\n"
                 "3) Viết câu tiếng Việt có nhạc tính, liên kết nhân-quả mượt mà (đa phần câu 16–30 chữ, chỉ dùng câu ngắn 7–12 chữ ở đúng cú twist/cao trào). Hạn chế tối đa dấu hai chấm (:), KHÔNG viết kiểu liệt kê cụt lủn, KHÔNG rắc khẩu ngữ giả tạo ('nha', 'nhé', 'kìa', 'để ý nha', 'nghe kỹ nha', 'anh em ơi'), KHÔNG dùng ký tự biểu tượng (♡, ♪, ★).\n"
-                "4) Giữ chính xác sự thật & lồng ghép câu thoại gốc đắt giá trong ngoặc kép (\"...\"). Tuân thủ tuyệt đối quy tắc CHỐNG SPOIL TÊN ở từng hồi."
+                "4) Giữ chính xác sự thật, kể theo đúng trình tự thời gian các trang `[pXXX]` (mỗi khi chuyển sang địa điểm, đối tượng hoặc bước ngoặt mới, hãy tách câu tự nhiên thay vì dồn 2–3 cảnh xa nhau vào một câu) & lồng ghép câu thoại gốc đắt giá trong ngoặc kép (\"...\"). Tuân thủ tuyệt đối quy tắc CHỐNG SPOIL TÊN ở từng hồi."
                 + avoid_line
             )
 
@@ -969,6 +975,19 @@ class ScriptwriterAgent:
             for sid in part.scene_ids
             if tree.get_scene_text(sid)
         )
+        part_page_records = [
+            rec
+            for sid in part.scene_ids
+            if tree.get_scene_text(sid)
+            for rec in parse_scene_pages_for_alignment(tree.get_scene_text(sid))
+        ]
+        anchor_map_md = build_alignment_anchors(source_prose, part_page_records)
+        anchor_block = (
+            f"\n### BẢN ĐỒ NEO TRANG THAM KHẢO (ĐỐI CHIẾU TỰ ĐỘNG THOẠI & SỰ KIỆN — BÁM SÁT ĐỂ KHÔNG TRƯỢT PHA):\n"
+            f"{anchor_map_md}\n"
+            if anchor_map_md
+            else ""
+        )
         moods_txt = ", ".join(VALID_MOODS)
         sample_panels_hint = ", ".join(allowed_panels[:8])
         outro_rule = (
@@ -980,15 +999,19 @@ class ScriptwriterAgent:
             "Bạn là Kỹ Sư Đồng Bộ Hình-Tiếng (Panel Aligner & Beat Director). "
             "Nhiệm vụ DUY NHẤT của bạn là cắt một đoạn kịch bản văn chương đã viết sẵn thành các `<beat>` theo nhịp thở tự nhiên "
             "và gán chính xác `panel_id`, `mood`, `beat_type`, `pause_ms` khớp tuyệt đối với trang truyện.\n"
-            "LUẬT BẤT BIẾN:\n"
-            "1) GIỮ NGUYÊN 100% CÂU CHỮ của `<source_prose>` — CHỈ chia ranh giới câu/đoạn vào từng `<beat>`, "
+            "LUẬT BẤT BIẾN (THEO THỨ TỰ ƯU TIÊN TUYỆT ĐỐI):\n"
+            "1) ĐỒNG BỘ HÌNH–CHỮ TUYỆT ĐỐI (QUAN TRỌNG NHẤT): Mỗi `<beat>` PHẢI gắn đúng 1–4 `panel_id` của ĐÚNG TRANG vẽ hành động/cảnh tượng/lời thoại mà beat đó đang nói! "
+            "Nếu một beat trích câu thoại trong ngoặc kép (\"...\"), BẮT BUỘC gắn đúng `panel_id` chứa câu thoại đó. "
+            "Nếu câu văn nhảy qua vài trang sang cảnh mới, PHẢI nhảy thẳng `panel_id` sang trang của cảnh mới — "
+            "TUYỆT ĐỐI CẤM rải đều cơ học từ đầu danh sách hay nhồi panel của cảnh cũ vào câu của cảnh mới gây trượt pha (phase-lag)!\n"
+            "2) GIỮ NGUYÊN 100% CÂU CHỮ của `<source_prose>` — CHỈ chia ranh giới câu/đoạn vào từng `<beat>`, "
             "TUYỆT ĐỐI KHÔNG tóm tắt lại, KHÔNG cắt cụt câu phức thành câu điện báo, KHÔNG thêm từ đệm ('nha', 'kìa', 'anh em'), KHÔNG bỏ sót câu nào.\n"
-            "2) Gắn 1-4 `panel_id` hợp lệ cho mỗi beat, tiến đơn điệu từ trang đầu tới trang cuối của hồi, ưu tiên khung `[face]`/`[text]`, phủ đều trọn phạm vi trang."
+            "3) `panel_id` giữa các beat nối tiếp PHẢI tiến đơn điệu (không nhảy lùi trang), ưu tiên khung `[face]`/`[text]`, và đi trọn tới trang cuối của hồi."
         )
 
         feedback = ""
         best_beats: list[ScriptBeat] = []
-        best_score = -1.0
+        best_score = -1e9
 
         def _postprocess(raw_beats: list[ScriptBeat]) -> list[ScriptBeat]:
             if part_idx < total_parts:
@@ -1008,12 +1031,13 @@ class ScriptwriterAgent:
                 f"Gợi ý số beat: khoảng {max(1, part.target_beats - 2)}..{part.target_beats + 3} beats (mỗi beat 1–3 câu trọn vẹn, ~18–52 từ; câu twist ngắn có thể đứng riêng 1 beat).\n"
                 f"{outro_rule}\n"
                 f"`mood` CHỈ chọn đúng 1 trong 7 giá trị: `{moods_txt}`. `pause_ms`: 140-220 cho mạch gấp, 240-340 cho mạch thường, 400-560 cho điểm dừng phân tích/twist.\n\n"
-                f"<source_prose>\n{source_prose}\n</source_prose>\n\n"
+                f"<source_prose>\n{source_prose}\n</source_prose>\n"
+                f"{anchor_block}\n"
                 f"### DANH SÁCH PANEL GỐC CỦA HỒI NÀY (ví dụ mã: {sample_panels_hint} ... {allowed_panels[-1] if allowed_panels else ''}):\n"
                 f"{current_texts}"
                 f"{feedback}\n\n"
                 "Hãy chia toàn bộ `<source_prose>` thành các `<beat>` liên tiếp (GIỮ NGUYÊN 100% VĂN BẢN GỐC, không sửa lời văn!) "
-                "và gán đúng `panel_id` tiến đơn điệu phủ tới hết trang "
+                "và gán đúng `panel_id` KHỚP CHÍNH XÁC NỘI DUNG TỪNG BEAT (bám Bản đồ Neo Trang & các panel thoại bắt buộc), tiến đơn điệu tới hết trang "
                 f"{last_pg}. Trả về XML `<part_script>`."
             )
 
@@ -1030,6 +1054,7 @@ class ScriptwriterAgent:
                 sanitized, fallback_count = self._sanitize_part_beats(resp.beats, allowed_panels, allowed_set)
                 sanitized = _postprocess(sanitized)
                 fidelity = _prose_preservation_ratio(source_prose, sanitized)
+                align_issues = verify_beats_alignment(sanitized, part_page_records)
 
                 last_cov_idx = max(
                     (part_page_pos.get(_panel_to_page_id(pid), -1) for b in sanitized for pid in b.panel_ids),
@@ -1040,16 +1065,27 @@ class ScriptwriterAgent:
                     len(sanitized) < 2 or trailing_gap >= max(6, len(part_pages) // 2)
                 )
 
-                score = fidelity - 0.15 * fallback_count - (0.35 if incomplete_cov else 0.0)
+                score = (
+                    fidelity
+                    - 0.15 * fallback_count
+                    - 0.28 * len(align_issues)
+                    - (0.35 if incomplete_cov else 0.0)
+                )
                 if score > best_score:
                     best_score = score
                     best_beats = sanitized
 
-                if fallback_count == 0 and not incomplete_cov and fidelity >= 0.78:
+                if fallback_count == 0 and not incomplete_cov and not align_issues and fidelity >= 0.78:
                     return sanitized
 
                 if turn < 2:
                     notes: list[str] = []
+                    if align_issues:
+                        align_detail = " ; ".join(iss.message for iss in align_issues[:6])
+                        notes.append(
+                            f"LỆCH HÌNH–CHỮ ({len(align_issues)} beat bị trượt pha so với tranh): {align_detail}. "
+                            "HÃY GẮN LẠI `panel_id` CỦA ĐÚNG TRANG ĐANG ĐƯỢC KỂ (nhảy tới đúng trang sự kiện/thoại, không rải panel cũ gây trượt pha)!"
+                        )
                     if fidelity < 0.78:
                         notes.append(
                             f"Phản hồi trước mới giữ được {int(fidelity * 100)}% từ gốc của `<source_prose>`. "
@@ -1066,13 +1102,17 @@ class ScriptwriterAgent:
                         )
                     feedback = f"\n\n### SỬA LỖI ĐỒNG BỘ (LẦN {turn + 1}): " + " ".join(notes)
                     continue
-                return best_beats or sanitized
+                chosen = best_beats or sanitized
+                pin_missing_quote_panels(chosen, part_page_records, allowed_panels)
+                return chosen
             elif turn < 2:
                 feedback = (
                     f"\n\n### LỖI XML (LẦN {turn + 1}): Phản hồi trước không chứa thẻ `<beat>` hợp lệ. "
                     "Hãy xuất đầy đủ `<part_script><beats>...</beats></part_script>` giữ nguyên văn bản `<source_prose>`."
                 )
 
+        if best_beats:
+            pin_missing_quote_panels(best_beats, part_page_records, allowed_panels)
         return best_beats
 
     @staticmethod
@@ -1113,7 +1153,10 @@ class ScriptwriterAgent:
         page_idx = {pg: i for i, pg in enumerate(ordered_pages)}
         total = len(beats)
         avg_pages_per_beat = len(ordered_pages) / max(1, total)
-        max_beat_page_span = max(2, math.ceil(avg_pages_per_beat * 1.25))
+        max_beat_page_span = min(
+            max(5, len(ordered_pages) // 2 + 1),
+            max(4, math.ceil(avg_pages_per_beat * 2.2)),
+        )
         cursor_rank = 0
         fallback_count = 0
 
