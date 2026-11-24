@@ -306,6 +306,8 @@ def build_dynamic_timeline_bgm(
     min_cue_duration_ms: int = 28000,
     credits_path: Path | None = None,
     cues_json_path: Path | None = None,
+    genre_prefs_override: dict[str, float] | None = None,
+    avoid_initial_track_ids: list[str] | None = None,
 ) -> Path:
     """Build continuous multi-mood musical BGM (Smart Music Director if library exists, else custom/4-bar synth) + SFX."""
     output_wav = Path(output_wav)
@@ -325,6 +327,8 @@ def build_dynamic_timeline_bgm(
             sample_rate=sample_rate,
             credits_path=credits_path,
             cues_json_path=cues_json_path,
+            genre_prefs_override=genre_prefs_override,
+            avoid_initial_track_ids=avoid_initial_track_ids,
         )
         if directed is not None:
             return directed

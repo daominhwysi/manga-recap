@@ -5,6 +5,7 @@
 project:
   name: manga_recap_generator
   jobs_dir: jobs
+  series_dir: series
   downloads_dir: downloads
   default_language: vi                  # vi | en
   default_persona: kich_tinh            # kich_tinh | hai_huoc | phan_tich (xem configs/personas.yaml)

@@ -47,9 +47,13 @@
 # Chạy toàn bộ unit tests (bao gồm quét chống overfitting codebase)
 uv run pytest -v
 
-# Chạy pipeline đầy đủ hoặc xem thông tin job
+# Chạy pipeline đầy đủ (đơn tập hoặc theo chuỗi Series nhiều tập) và xem thông tin job/series
 uv run manga-recap run <cbz_or_folder> --job-id <job_id> --persona kich_tinh
 uv run manga-recap inspect jobs/<job_id>
+uv run manga-recap series run <folder_24_vols> --series-id <series_id> --mode episodic --compile-every 4 --compile-all
+uv run manga-recap series compile <series_id> --volumes 1-6
+uv run manga-recap series status <series_id>
+uv run manga-recap series glossary <series_id>
 
 # Xóa cache từ Stage 2b trở đi để tái tạo Index + Script + Audio + Video (giữ cache Vision 01 & 02a)
 rm -rf jobs/<job_id>/02b_story_bible.json jobs/<job_id>/repo/tree_index.json \
@@ -76,9 +80,9 @@ manga_recap_generator/
 ├── assets/bgm/default_dark_fantasy.wav # Nhạc nền D-minor stereo tự tổng hợp (loop không bản quyền)
 ├── models/manga109_yolo/            # Model ONNX YOLOv11 nhận diện frame, face, body, text
 ├── src/
-│   ├── cli.py                       # Typer CLI (`run`, `download`, `inspect`, `music fetch|index|list`)
-│   ├── config.py                    # Pydantic schemas AppConfig; nạp config.yaml + ghi đè từ .env (`default_model=gpt-6.2-sol`)
-│   ├── pipeline.py                  # Bộ điều phối 6 Stage (MangaRecapPipeline) kèm checkpointing, `--prev-job` & telemetry
+│   ├── cli.py                       # Typer CLI (`run`, `download`, `inspect`, `music fetch|index|list`, `series run|compile|status|glossary`)
+│   ├── config.py                    # Pydantic schemas AppConfig (+`project.series_dir`); nạp config.yaml + ghi đè từ .env (`default_model=gpt-6.2-sol`)
+│   ├── pipeline.py                  # Bộ điều phối 6 Stage (MangaRecapPipeline) kèm checkpointing, `--prev-job`, `series_ctx` (Series Memory) & telemetry
 │   ├── core/
 │   │   ├── protocols.py             # Typing Protocol cho Detector, TTSBackend, Renderer, Exporter
 │   │   ├── registry.py              # PluginRegistry quản lý đăng ký các backend theo tên
@@ -87,7 +91,12 @@ manga_recap_generator/
 │   │   ├── ingestion.py             # Schemas Stage 1: BBox, FocalPoint, PanelInfo, PageInfo, ChapterInfo, JobManifest
 │   │   ├── analysis.py              # Schemas Stage 2: PanelAnalysis, PageAnalysis (+`visual_verify_code`, `verbatim_quote_vi`, `visual_punch`), CharacterProfile (+`first_named_page_id`), StoryBible
 │   │   ├── script.py                # Schemas Stage 3: `VALID_MOODS`, `normalize_mood`, ScriptBeat (+`beat_type`, `tts_text`), RecapScript (+`hook_strategy`), CriticIssue, CriticReport
+│   │   ├── series.py                # Schemas Multi-Volume Series Continuity: `SeriesCharacter`, `VolumeHandoff`, `VolumeLedgerEntry`, `SeriesGlossary`, `SeriesState`, `SeriesContext`
 │   │   └── timeline.py              # Schemas Stage 4-5: WordTimestamp, AudioBeatInfo, AudioManifest, TimelineShot, SubtitleCue, VideoTimeline (+`reading_order`)
+│   ├── series/
+│   │   ├── memory.py                # `SeriesStore`: Persistent Portrait Vault (`portraits/`), chọn cast động theo tập (`select_active_cast_for_volume`), Bộ nhớ 3 tầng O(1) (`Hot/Warm/Cold`), `glossary.yaml` sửa tay & `update_after_volume`
+│   │   ├── compiler.py              # `compile_series_videos`: ghép MP4 nhiều tập theo Arc/Full-Series + dịch mốc thời gian `.srt` + xuất YouTube Chapters + gộp `music_credits.txt`
+│   │   └── orchestrator.py          # `SeriesOrchestrator` & `discover_series_volumes`: tự quét Vol 1..N theo `natural_sort_key`, chạy nối tiếp có checkpoint từng tập, tự nạp `glossary.yaml` giữa các tập & tùy chọn `--compile-every`/`--compile-all`
 │   ├── llm/client.py                # LLMClient chuẩn OpenAI API: `complete_json` & `complete_xml` (+`temperature_override`), data-URL ảnh, circuit breaker (ngưỡng 2 lần lỗi)
 │   ├── cv/
 │   │   ├── registry.py / loader.py  # DETECTOR_REGISTRY; giải nén .cbz/.zip hoặc đọc thư mục theo `natural_sort_key`
@@ -114,15 +123,16 @@ manga_recap_generator/
 │   │   └── ffmpeg_renderer.py       # Kết xuất MP4 đa luồng (VAAPI/libx264), tự nạp dynamic multi-mood BGM + sidechaincompress ducking
 │   ├── exporters/                   # `registry.py`, `srt_exporter.py`, `capcut_draft.py` (đủ diptych + BGM + subtitles), `html_preview.py`
 │   └── downloaders/nyaa.py          # Tìm kiếm và tải torrent/magnet manga từ Nyaa
-└── tests/                           # 7 file pytest: `test_schemas_and_json.py`, `test_config_and_registry.py`, `test_cv.py`, `test_page_index_and_agents.py`, `test_audio.py`, `test_renderer_and_exporters.py`, `test_downloader.py`
+└── tests/                           # 8 file pytest: `test_schemas_and_json.py`, `test_config_and_registry.py`, `test_cv.py`, `test_page_index_and_agents.py`, `test_series_continuity.py`, `test_audio.py`, `test_renderer_and_exporters.py`, `test_downloader.py`
 ```
 
-### Cấu trúc Checkpoint trong `jobs/<job_id>/`
+### Cấu trúc Checkpoint trong `jobs/<job_id>/` & Bộ nhớ Chuỗi Tập `series/<series_id>/`
 - **Stage 1**: `extracted/` (ảnh trang gốc), `panels/*.jpg` (ảnh cắt từng khung), `som/*_som.jpg` (ảnh trang đóng dấu `[P1]..[Pn]`), `01_manifest.json` (`JobManifest`).
-- **Stage 1.5 & 2a**: `repo/seed_cast.json`, `repo/cast_sheet.jpg` (bảng ghép mặt nhân vật chuẩn), `02a_pages/*.json` (cache Vision từng trang), `02a_all_pages.json`.
+- **Stage 1.5 & 2a**: `repo/seed_cast.json` (+`portrait_path`), `repo/cast_sheet.jpg` (bảng ghép mặt nhân vật chuẩn động 16 ô), `02a_pages/*.json` (cache Vision từng trang), `02a_all_pages.json`.
 - **Stage 2b**: `repo/notes/scene_*.md` (ghi chú Markdown từng scene kèm tỷ lệ `ar` và cờ `face+text`), `repo/tree_index.json` (`PageIndexTree` + `skipped_pages`), `02b_story_bible.json` (`StoryBible`), `repo/MEMORY.md`.
 - **Stage 3a & 3b**: `repo/OUTLINE.json` (`1 Scene = 1 Part`), `repo/script/acts/act_*.json` & `repo/script/prose_draft.md` (Pass 1 thuần văn), `repo/script/parts/part_*.json` (Pass 2 đã gắn panel), `repo/script/part_boundaries.json`, `03a_script_draft.json`, `03b_script_final.json`, `03b_critic_report.json`.
-- **Stage 4, 5 & 6**: `audio/beats/*.wav`, `04_voiceover.wav`, `04_audio_manifest.json`, `audio/04b_bgm_dynamic.wav`, `audio/04b_music_cues.json`, `05_timeline.json` (`VideoTimeline`), `06_subtitles.srt`, `06_output.mp4`, `exports/` (+`music_credits.txt`), `telemetry.json`.
+- **Stage 4, 5 & 6**: `audio/beats/*.wav`, `04_voiceover.wav`, `04_audio_manifest.json`, `audio/series_music_context.json`, `audio/04b_bgm_dynamic.wav`, `audio/04b_music_cues.json`, `05_timeline.json` (`VideoTimeline`), `06_subtitles.srt`, `06_output.mp4`, `exports/` (+`music_credits.txt`), `telemetry.json`.
+- **Series Continuity (`series/<series_id>/`)**: `series_state.json` (`SeriesState`: cast xuyên tập, `ledger` 24+ tập, `last_handoff`, `active_plot_threads`, `music_genre_prefs`), `glossary.yaml` (file YAML cho phép người dùng sửa tay thuật ngữ/xưng hô/tên nhân vật giữa các tập), `portraits/<char_id>.jpg` (Portrait Vault bền vững), `compilations/*.mp4|*.srt|*_chapters.txt|*_music_credits.txt` (video gộp Arc/Full-Series).
 
 ---
 
@@ -149,3 +159,7 @@ manga_recap_generator/
 6. **Stage 4, 5 & 6 — Audio, Smart Music Director, Choreographer & FFmpeg Renderer (`src/audio/`, `src/agents/choreographer.py`, `src/render/`)**:
    - **Audio & Music Dataset**: `manga-recap music fetch/index/list` quản lý kho nhạc CC-BY/custom tại `assets/music_library/catalog.json` (tự đo DSP: LUFS, BPM, brightness, intro-skip). **`Smart Music Director` (`music_director.py`)** chọn bảng màu thể loại theo `StoryBible.tone_summary`, gom nhạc thành các **Music Cues dài >= 28s** tránh nhảy bài mỗi beat, chuẩn hóa `-16 LUFS`, trộn **2.5s equal-power crossfade** + SFX thật (cooldown 6s) + tự xuất `exports/music_credits.txt` (fallback mượt về 4-bar synth nếu chưa có thư viện).
    - **Choreographer & Renderer**: Word-timestamp subtitle sync, word-wrap phụ đề cho cả `16:9` & `9:16`, tách 2 nhịp sub-shot (`Wide -> Focus Face`) trên slot dài giàu chi tiết, hỗ trợ RTL/LTR ở `compositor.py`, HTML preview có `<img>` + `<audio>`, và CapCut draft đầy đủ diptych + BGM + subtitles.
+7. **Multi-Volume Series Continuity Engine (`src/series/`, `src/schemas/series.py`)**:
+   - **Portrait Vault & Dynamic Active Cast**: Lưu ảnh mặt nhân vật chuẩn (`series/<id>/portraits/<char_id>.jpg`), chọn động tối đa 16 nhân vật hoạt động của Vol $k$ (ưu tiên nhân vật cục bộ + `last_handoff` + hoạt động gần đây, loại nhân vật đã chết/rời sân lâu) và mở khóa `first_named_page_id` cho nhân vật đã lộ tên ở Vol $< k$.
+   - **Bộ Nhớ 3 Tầng $O(1)$ (`Hot / Warm / Cold`) + Human-Editable `glossary.yaml`**: Nạp `last_handoff` (Vol $k-1$), `active_plot_threads` + `terminology`/`pronoun_pairs` cố định, và truy xuất có chọn lọc tối đa 3 mốc `ledger` tập cũ liên quan để gọi callback mà không phình token qua 24+ tập.
+   - **2 Chế Độ Nối Tập (`episodic` vs `seamless`) & Series Compiler**: `episodic` tạo video riêng lẻ có cầu nối gọn 1–2 câu từ tập trước; `seamless` tắt lời chào mở/kết giữa các tập để ghép liền mạch qua `manga-recap series compile` thành 1 video Arc / Full-Series kèm `.srt` dịch mốc thời gian, YouTube Chapters và `music_credits.txt` hợp nhất. Khóa bảng màu nhạc `music_genre_prefs` và tránh lặp lại track mở đầu vừa dùng ở tập trước.

@@ -13,8 +13,9 @@ __pycache__/
 .env
 .env.local
 
-# Runtime Job Artifacts, Downloads, Samples & Large Binary Weights
+# Runtime Job Artifacts, Series Memory, Downloads, Samples & Large Binary Weights
 jobs/
+/series/
 downloads/
 models/
 samples/
