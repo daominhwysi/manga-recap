@@ -635,9 +635,14 @@ class CriticAgent:
             gl = getattr(series_ctx, "glossary", None)
             if gl is not None:
                 deprecated_map: dict[str, str] = {}
-                for raw_k, canon_v in {**gl.character_name_overrides, **gl.terminology}.items():
+                for raw_k, canon_v in gl.character_name_overrides.items():
                     rk, cv = raw_k.strip(), canon_v.strip()
                     if rk and cv and rk.lower() != cv.lower() and len(rk) >= 2:
+                        deprecated_map[rk] = cv
+                for raw_k, canon_v in gl.terminology.items():
+                    rk, cv = raw_k.strip(), canon_v.strip()
+                    # Skip explanatory expansions where canonical form already contains the source term (e.g. "X" -> "X (explanation)")
+                    if rk and cv and rk.lower() not in cv.lower() and len(rk) >= 2:
                         deprecated_map[rk] = cv
                 for rk, cv in deprecated_map.items():
                     pat = re.compile(rf"(?<!\w){re.escape(rk)}(?!\w)", flags=re.IGNORECASE | re.UNICODE)
