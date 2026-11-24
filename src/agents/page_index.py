@@ -1288,7 +1288,10 @@ class PageIndexBuilder:
                 system_prompt=(
                     "Bạn là StoryBibleAgent quản lý hồ sơ nhân vật chuẩn (canonical_name, aliases, role, "
                     "appearance, personality_notes, relationships) và mạch cốt truyện. "
-                    "Để trống `pronunciation_map` ({})."
+                    "VIẾT CÔ ĐỌNG, CHÍNH XÁC: chỉ giữ tối đa 16 nhân vật thực sự xuất hiện trong tập này "
+                    "(mỗi mô tả appearance/personality_notes tối đa 1 câu ngắn, relationships tối đa 3 mục), "
+                    "chapter_summaries ngắn gọn 2 câu (để trống important_panel_ids: []), ongoing_plot_threads tối đa 8 mục, "
+                    "và để trống `pronunciation_map` ({})."
                 ),
                 user_prompt=(
                     f"Series: {manifest.job_id}\n"

@@ -18,7 +18,7 @@ llm:
   vision_model: gemini-3.8-flash-medium-vision  # Model đọc trang manga Set-of-Mark + Cast Sheet
   temperature: 0.4
   max_tokens: 32768                     # Thả phanh theo trần model proxy để không cắt cụt JSON
-  timeout_sec: 150
+  timeout_sec: 240
   max_retries: 2
   offline_fallback: true                # true: dùng fallback mẫu nếu thiếu API key
   base_url: http://127.0.0.1:8765/v1    # unified-llm-proxy (hoặc ghi đè bằng OPENAI_BASE_URL)
