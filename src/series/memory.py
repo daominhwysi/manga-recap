@@ -656,3 +656,52 @@ class SeriesStore:
         self.save_state(state)
         self.save_glossary(glossary)
         return state, glossary
+
+    def import_completed_job(
+        self,
+        job_dir: Path,
+        volume_index: int = 1,
+        llm: LLMClient | None = None,
+    ) -> tuple[SeriesState, SeriesGlossary]:
+        """Bootstrap or backfill Series Memory & Portrait Vault from an already-completed volume job directory."""
+        from src.agents.page_analyzer import PrePassCastResult
+
+        jdir = Path(job_dir)
+        manifest = JobManifest.model_validate_json((jdir / "01_manifest.json").read_text(encoding="utf-8"))
+        bible = StoryBible.model_validate_json((jdir / "02b_story_bible.json").read_text(encoding="utf-8"))
+        script = RecapScript.model_validate_json((jdir / "03b_script_final.json").read_text(encoding="utf-8"))
+
+        audio_manifest: AudioManifest | None = None
+        am_path = jdir / "04_audio_manifest.json"
+        if am_path.exists():
+            audio_manifest = AudioManifest.model_validate_json(am_path.read_text(encoding="utf-8"))
+
+        seed_cast = []
+        seed_path = jdir / "repo" / "seed_cast.json"
+        if seed_path.exists():
+            try:
+                seed_cast = PrePassCastResult.model_validate_json(seed_path.read_text(encoding="utf-8")).characters
+            except Exception:
+                seed_cast = []
+
+        state, glossary = self.load_or_init(
+            persona=script.persona or "kich_tinh",
+            tts_voice=audio_manifest.voice if audio_manifest else "",
+        )
+        out_mp4 = jdir / "06_output.mp4"
+        cues_p = jdir / "audio" / "04b_music_cues.json"
+        return self.update_after_volume(
+            state=state,
+            glossary=glossary,
+            volume_index=volume_index,
+            job_id=jdir.name,
+            input_path=manifest.input_path,
+            manifest=manifest,
+            bible=bible,
+            script=script,
+            audio_manifest=audio_manifest,
+            output_mp4=(out_mp4 if out_mp4.exists() else None),
+            seed_cast=seed_cast,
+            llm=llm,
+            cues_json_path=(cues_p if cues_p.exists() else None),
+        )

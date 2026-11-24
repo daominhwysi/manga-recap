@@ -518,3 +518,10 @@ def test_series_orchestrator_discovers_natural_order_and_runs_two_volumes(tmp_pa
         (cfg.project.jobs_dir / "test_saga_v02" / "03b_script_final.json").read_text(encoding="utf-8")
     )
     assert "Chào mừng" not in v2_script.beats[0].narration_vi
+
+    # Test import_completed_job bootstrapping a brand-new series from an existing completed job
+    imported_store = SeriesStore(tmp_path / "series" / "bootstrapped_saga", "bootstrapped_saga")
+    imp_state, _ = imported_store.import_completed_job(cfg.project.jobs_dir / "test_saga_v01", volume_index=1)
+    assert [e.volume_index for e in imp_state.ledger] == [1]
+    assert imp_state.last_handoff is not None and imp_state.last_handoff.volume_index == 1
+    assert imported_store.glossary_path.exists()

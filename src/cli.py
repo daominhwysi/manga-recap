@@ -393,5 +393,29 @@ def series_glossary(
     console.print(store.glossary_path.read_text(encoding="utf-8"))
 
 
+@series_app.command("import-job")
+def series_import_job(
+    series_id: str = typer.Argument(..., help="Target series identifier under series/<id>/"),
+    job_dir: Path = typer.Argument(..., help="Path to an existing completed job directory (e.g. jobs/my_vol1)"),
+    volume: int = typer.Option(1, "--vol", "-v", help="Volume index (1-based) for the imported job"),
+    config_path: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="Path to config.yaml"),
+) -> None:
+    """Bootstrap Series Memory & Portrait Vault from an already-completed volume job without re-running it."""
+    from src.llm.client import LLMClient
+    from src.series.memory import SeriesStore
+
+    cfg = load_config(config_path)
+    store = SeriesStore(cfg.project.series_dir / series_id, series_id)
+    llm = LLMClient(cfg.llm)
+    state, glossary = store.import_completed_job(job_dir=job_dir, volume_index=volume, llm=llm)
+    portraits_saved = sum(1 for ch in state.characters if ch.portrait_path and Path(ch.portrait_path).exists())
+    console.print(
+        f"[bold green]Imported Vol {volume} from {job_dir} into series '{series_id}'![/]\n"
+        f"  Characters: {len(state.characters)} ({portraits_saved} portraits in Vault)\n"
+        f"  Active threads: {len(state.active_plot_threads)} | Terminology: {len(glossary.terminology)} | Pronouns: {len(glossary.pronoun_pairs)}\n"
+        f"  Glossary: {store.glossary_path.resolve()}"
+    )
+
+
 if __name__ == "__main__":
     app()

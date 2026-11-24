@@ -50,6 +50,7 @@ uv run pytest -v
 # Chạy pipeline đầy đủ (đơn tập hoặc theo chuỗi Series nhiều tập) và xem thông tin job/series
 uv run manga-recap run <cbz_or_folder> --job-id <job_id> --persona kich_tinh
 uv run manga-recap inspect jobs/<job_id>
+uv run manga-recap series import-job <series_id> jobs/<vol1_job> --vol 1
 uv run manga-recap series run <folder_24_vols> --series-id <series_id> --mode episodic --compile-every 4 --compile-all
 uv run manga-recap series compile <series_id> --volumes 1-6
 uv run manga-recap series status <series_id>
