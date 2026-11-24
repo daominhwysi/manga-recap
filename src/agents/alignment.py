@@ -371,6 +371,34 @@ def verify_beats_alignment(
         if best_j in quote_flagged_pages:
             continue
 
+        # Respect monotonic neighbor bounds: if the beat already sits cleanly between its
+        # neighbors and best_j lies strictly BEFORE prev_max_pg (impossible without jumping
+        # backwards), ignore false lexical echoes on earlier pages unless prev beat also lagged.
+        prev_max_pg = (
+            max(
+                (index.page_idx[_panel_to_page_id(p)] for p in beats[bi - 1].panel_ids if _panel_to_page_id(p) in index.page_idx),
+                default=-1,
+            )
+            if bi > 0
+            else -1
+        )
+        next_min_pg = (
+            min(
+                (index.page_idx[_panel_to_page_id(p)] for p in beats[bi + 1].panel_ids if _panel_to_page_id(p) in index.page_idx),
+                default=n_pg,
+            )
+            if bi + 1 < len(beats)
+            else n_pg
+        )
+        prev_had_issue = any(iss.beat_idx == bi - 1 for iss in issues)
+        if (
+            best_j < prev_max_pg
+            and not prev_had_issue
+            and prev_max_pg <= min(assigned_idxs)
+            and max(assigned_idxs) <= next_min_pg
+        ):
+            continue
+
         # Require concrete lexical specificity so short abstract commentary beats never false-positive
         has_concrete_match = (best_b >= 1 and best_u >= 3) or (best_u >= 4)
         if not has_concrete_match:
@@ -398,6 +426,61 @@ def verify_beats_alignment(
                 )
             )
     return issues
+
+
+def repair_part_panel_alignment_deterministic(
+    beats: list[ScriptBeat],
+    pages: list[PageAlignmentRecord],
+    allowed_panels: list[str],
+) -> int:
+    """Deterministic monotonic panel repair safety-net for quote_mismatch & visual_desync."""
+    if not beats or len(pages) < 3 or not allowed_panels:
+        return 0
+    repaired = pin_missing_quote_panels(beats, pages, allowed_panels)
+    allowed_set = set(allowed_panels)
+    panel_rank = {pid: i for i, pid in enumerate(allowed_panels)}
+    index = _PartAlignmentIndex(pages)
+
+    issues = verify_beats_alignment(beats, pages)
+    # Process right-to-left first so forward-shifting phase-lagged tail beats unblock earlier beats
+    for iss in reversed(issues):
+        bi = iss.beat_idx
+        if not (0 <= bi < len(beats)):
+            continue
+        target_pg_idx = index.page_idx.get(iss.expected_page_id)
+        if target_pg_idx is None:
+            continue
+        prev_max_pg = (
+            max(
+                (index.page_idx[_panel_to_page_id(p)] for p in beats[bi - 1].panel_ids if _panel_to_page_id(p) in index.page_idx),
+                default=-1,
+            )
+            if bi > 0
+            else -1
+        )
+        next_min_pg = (
+            min(
+                (index.page_idx[_panel_to_page_id(p)] for p in beats[bi + 1].panel_ids if _panel_to_page_id(p) in index.page_idx),
+                default=len(pages),
+            )
+            if bi + 1 < len(beats)
+            else len(pages)
+        )
+        if not (prev_max_pg <= target_pg_idx <= next_min_pg):
+            continue
+        page_panels = [pid for pid, _ in pages[target_pg_idx].panels if pid in allowed_set]
+        if not page_panels:
+            continue
+        if iss.expected_panel_id and iss.expected_panel_id in page_panels:
+            chosen = [iss.expected_panel_id]
+            for pid in page_panels:
+                if pid not in chosen and len(chosen) < 3:
+                    chosen.append(pid)
+        else:
+            chosen = page_panels[:3]
+        beats[bi].panel_ids = list(dict.fromkeys(sorted(chosen, key=lambda p: panel_rank.get(p, 0))))
+        repaired += 1
+    return repaired
 
 
 def pin_missing_quote_panels(
@@ -441,12 +524,17 @@ def pin_missing_quote_panels(
             if q_pg in cur_pages or q_pid not in panel_rank:
                 continue
             if prev_max_pg <= q_pgi <= next_min_pg:
-                new_pids = list(beat.panel_ids)
-                if len(new_pids) >= 4:
-                    new_pids[-1] = q_pid
+                # Drop stale panels >=2 pages away from the verified quote page so phase-lagged neighbors unblock
+                near_pids = [
+                    p
+                    for p in beat.panel_ids
+                    if abs(index.page_idx.get(_panel_to_page_id(p), q_pgi) - q_pgi) <= 1
+                ]
+                if len(near_pids) >= 4:
+                    near_pids[-1] = q_pid
                 else:
-                    new_pids.append(q_pid)
-                beat.panel_ids = list(dict.fromkeys(sorted(new_pids, key=lambda p: panel_rank.get(p, 0))))
+                    near_pids.append(q_pid)
+                beat.panel_ids = list(dict.fromkeys(sorted(near_pids, key=lambda p: panel_rank.get(p, 0))))
                 cur_pages.add(q_pg)
                 pinned += 1
     return pinned

@@ -1138,3 +1138,110 @@ def test_semantic_panel_alignment_anchors_verifier_and_pass2_retry(tmp_path: Pat
     assert align_turns["n"] == 2
     assert align_turns["saw_feedback"] is True
     assert "ch01_p006_P2" in script.beats[-1].panel_ids
+
+
+def test_critic_v37_monotonic_desync_filter_and_surgical_panel_repair(tmp_path: Path) -> None:
+    from src.agents.alignment import PageAlignmentRecord, verify_beats_alignment
+    from src.agents.critic import _PanelRepairItem, _PanelRepairResponse
+    from src.schemas.analysis import PageAnalysis, PanelAnalysis
+
+    pages = [
+        PageAlignmentRecord(
+            page_id="ch01_p001",
+            full_text="Cậu bé tìm thấy chiếc chìa khóa đồng cổ trong vườn hoa hồng.",
+            panels=[("ch01_p001_P1", "Chiếc chìa khóa đồng cổ nằm giữa vườn hoa hồng.")],
+        ),
+        PageAlignmentRecord(
+            page_id="ch01_p002",
+            full_text="Sức mạnh của tổ chức nghiên cứu bí mật đe dọa nhóm nhân vật.",
+            panels=[("ch01_p002_P1", "Tổ chức nghiên cứu uy hiếp bằng sức mạnh trận pháp.")],
+        ),
+        PageAlignmentRecord(
+            page_id="ch01_p003",
+            full_text="Con búp bê sứ rơi xuống nền đá rồi bùng cháy dữ dội giữa lửa đen.",
+            panels=[("ch01_p003_P1", "Con búp bê sứ bùng cháy dữ dội trong lửa đen.")],
+        ),
+        PageAlignmentRecord(
+            page_id="ch01_p004",
+            full_text="Nhân vật chính chắn ngang bảo vệ đồng đội trước đòn tấn công.",
+            panels=[("ch01_p004_P1", "Lao ra chắn ngang bảo vệ đồng đội giữa sảnh.")],
+        ),
+        PageAlignmentRecord(
+            page_id="ch01_p005",
+            full_text='Cậu vạch trần kế hoạch giấu kín và tuyên bố: "Nếu các người làm hại cô ấy, tôi sẽ không hợp tác nữa!"',
+            panels=[
+                ("ch01_p005_P1", "Cậu bình tĩnh vạch trần kế hoạch giấu kín của đối phương."),
+                ("ch01_p005_P2", 'Cậu tuyên bố: "Nếu các người làm hại cô ấy, tôi sẽ không hợp tác nữa!"'),
+            ],
+        ),
+    ]
+
+    # 1) Monotonicity filter suppresses false backward lexical echo (p005 beat echoing p002 words
+    # while sitting cleanly between p004 and p005)
+    clean_monotonic_beats = [
+        ScriptBeat(beat_id="b01", narration_vi="Cậu tìm thấy chiếc chìa khóa đồng cổ trong vườn hoa hồng.", panel_ids=["ch01_p001_P1"]),
+        ScriptBeat(beat_id="b02", narration_vi="Con búp bê sứ bùng cháy dữ dội giữa lửa đen.", panel_ids=["ch01_p003_P1"]),
+        ScriptBeat(beat_id="b03", narration_vi="Nhân vật chính lao ra chắn ngang bảo vệ đồng đội.", panel_ids=["ch01_p004_P1"]),
+        ScriptBeat(beat_id="b04", narration_vi="Cậu không thắng bằng sức mạnh, mà bằng cách nhận ra nhóm này giấu tổ chức nghiên cứu.", panel_ids=["ch01_p005_P1"]),
+        ScriptBeat(beat_id="b05", narration_vi='"Nếu các người làm hại cô ấy, tôi sẽ không hợp tác nữa!"', panel_ids=["ch01_p005_P2"]),
+    ]
+    assert verify_beats_alignment(clean_monotonic_beats, pages) == []
+
+    # 2) Critic V3.7 Surgical Panel Repair fixes both visual_desync and quote_mismatch via LLM + rollback guard
+    manifest, _ = _make_dummy_manifest(5, panels_per_page=2)
+    pa_list = [
+        PageAnalysis(
+            page_id=pg.page_id,
+            chapter_id="ch01",
+            page_index=i,
+            page_summary=pg.full_text,
+            panels=[PanelAnalysis(panel_id=pid, action_summary=txt, dialogue_summary=txt) for pid, txt in pg.panels],
+        )
+        for i, pg in enumerate(pages)
+    ]
+    broken_beats = [
+        ScriptBeat(beat_id="b001", narration_vi="Cậu tìm thấy chiếc chìa khóa đồng cổ trong vườn hoa hồng.", panel_ids=["ch01_p001_P1"]),
+        ScriptBeat(beat_id="b002", narration_vi="Con búp bê sứ rơi xuống nền đá rồi bùng cháy dữ dội giữa lửa đen.", panel_ids=["ch01_p001_P1"]),
+        ScriptBeat(beat_id="b003", narration_vi='Cậu tuyên bố dứt khoát: "Nếu các người làm hại cô ấy, tôi sẽ không hợp tác nữa!"', panel_ids=["ch01_p002_P1"]),
+    ]
+    llm = LLMClient(LLMConfig(api_key="dummy"))
+    seen_agents: list[str] = []
+
+    def fake_panel_repair_xml(agent_name, system_prompt, user_prompt, xml_template, parse_fn, **kw):
+        seen_agents.append(agent_name)
+        return _PanelRepairResponse(
+            repairs=[
+                _PanelRepairItem(beat_id="b002", panel_ids=["ch01_p003_P1"]),
+                _PanelRepairItem(beat_id="b003", panel_ids=["ch01_p005_P2"]),
+            ]
+        )
+
+    llm.complete_xml = fake_panel_repair_xml  # type: ignore
+    bible = StoryBible(series_title_guess="Test", characters=[], pronunciation_map={})
+    final_s, rep = CriticAgent(llm, polish_seams=True).review(
+        RecapScript(title_vi="Repair", persona="phan_tich", beats=broken_beats),
+        manifest,
+        bible,
+        tmp_path / "j_panel_rep",
+        page_analyses=pa_list,
+    )
+    assert "CriticPanelRepairer" in seen_agents
+    assert final_s.beats[1].panel_ids == ["ch01_p003_P1"]
+    assert final_s.beats[2].panel_ids == ["ch01_p005_P2"]
+    # Narration prose untouched 100%
+    assert final_s.beats[1].narration_vi == broken_beats[1].narration_vi
+    assert final_s.beats[2].narration_vi == broken_beats[2].narration_vi
+    assert not any(i.category == "panel_sync" for i in rep.issues)
+
+    # 3) Deterministic safety-net works even offline (no LLM credentials)
+    llm_off = LLMClient(LLMConfig(offline_fallback=True))
+    final_off, rep_off = CriticAgent(llm_off, polish_seams=False).review(
+        RecapScript(title_vi="RepairOff", persona="phan_tich", beats=broken_beats),
+        manifest,
+        bible,
+        tmp_path / "j_panel_rep_off",
+        page_analyses=pa_list,
+    )
+    assert final_off.beats[1].panel_ids == ["ch01_p003_P1"]
+    assert "ch01_p005_P2" in final_off.beats[2].panel_ids
+    assert not any(i.category == "panel_sync" for i in rep_off.issues)

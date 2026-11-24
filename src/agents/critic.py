@@ -12,7 +12,9 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 from src.agents.alignment import (
+    build_alignment_anchors,
     page_analyses_to_alignment_records,
+    repair_part_panel_alignment_deterministic,
     verify_beats_alignment,
 )
 from src.agents.page_index import extract_distinctive_char_patterns
@@ -239,6 +241,15 @@ class _SemanticAuditResponse(BaseModel):
     flags: list[_SemanticAuditFlag] = Field(default_factory=list)
 
 
+class _PanelRepairItem(BaseModel):
+    beat_id: str
+    panel_ids: list[str] = Field(default_factory=list)
+
+
+class _PanelRepairResponse(BaseModel):
+    repairs: list[_PanelRepairItem] = Field(default_factory=list)
+
+
 _SEAM_POLISH_XML_TEMPLATE = """<rewrites>
   <rewrite beat_id="b001">Câu kể văn nói tiếng Việt đã được sửa đúng lỗi...</rewrite>
 </rewrites>"""
@@ -246,6 +257,12 @@ _SEAM_POLISH_XML_TEMPLATE = """<rewrites>
 _SEMANTIC_AUDIT_XML_TEMPLATE = """<audit>
   <flag beat_id="b021" reason="Lặp lại hành động vừa kết ở b020"/>
 </audit>"""
+
+_PANEL_REPAIR_XML_TEMPLATE = """<panel_repairs>
+  <repair beat_id="b015">
+    <panels>ch01_p030_P3, ch01_p030_P4</panels>
+  </repair>
+</panel_repairs>"""
 
 
 def _parse_seam_polish_xml(xml_text: str) -> _SeamPolishResponse:
@@ -274,6 +291,17 @@ def _parse_semantic_audit_xml(xml_text: str) -> _SemanticAuditResponse:
             if bid and reason:
                 flags.append(_SemanticAuditFlag(beat_id=bid, reason=reason))
     return _SemanticAuditResponse(flags=flags)
+
+
+def _parse_panel_repair_xml(xml_text: str) -> _PanelRepairResponse:
+    repairs: list[_PanelRepairItem] = []
+    for attrs, body in iter_xml_blocks(xml_text, "repair"):
+        bid = extract_xml_attr(attrs, "beat_id") or extract_xml_attr(attrs, "id") or extract_xml_tag(body, "beat_id")
+        raw_panels = extract_xml_tag(body, "panels") or extract_xml_tag(body, "panel_ids") or re.sub(r"<[^>]+>", "", body)
+        pids = [p.strip("[]() \"',.") for p in re.split(r"[\s,;]+", raw_panels.strip()) if p.strip("[]() \"',.")]
+        if bid and pids:
+            repairs.append(_PanelRepairItem(beat_id=bid, panel_ids=pids))
+    return _PanelRepairResponse(repairs=repairs)
 
 
 def _has_dialogue_quote(text: str) -> bool:
@@ -835,6 +863,141 @@ class CriticAgent:
             pass
         return beats
 
+    def _repair_panel_alignment(
+        self,
+        beats: list[ScriptBeat],
+        issues_eval: list[CriticIssue],
+        page_analyses: list[PageAnalysis],
+        all_pages: list[str],
+        page_order: dict[str, int],
+        valid_ids: list[str],
+        part_bounds: list[dict],
+    ) -> list[ScriptBeat]:
+        """Layer 3 (Visual): Surgical panel_ids repair (LLM allowlist + rollback guard + deterministic safety-net)."""
+        panel_err_ids = {
+            iss.beat_id
+            for iss in issues_eval
+            if iss.severity == "error" and iss.category in ("panel_sync", "coverage_gap") and iss.beat_id != "global"
+        }
+        if not panel_err_ids or not page_analyses:
+            return beats
+
+        groups: list[tuple[int, int, list[str], list[str]]] = []
+        if part_bounds:
+            for pmeta in part_bounds:
+                s_i = int(pmeta.get("start_beat_idx", 0))
+                e_i = int(pmeta.get("end_beat_idx", -1))
+                if not (0 <= s_i <= e_i < len(beats)):
+                    continue
+                allowed_p = [pid for pid in pmeta.get("allowed_panels", []) if pid]
+                part_pgs = list(dict.fromkeys(re.sub(r"_P\d+$", "", pid) for pid in allowed_p))
+                if len(part_pgs) >= 3 and any(beats[i].beat_id in panel_err_ids for i in range(s_i, e_i + 1)):
+                    groups.append((s_i, e_i, part_pgs, allowed_p))
+        elif len(all_pages) >= 3:
+            groups.append((0, len(beats) - 1, all_pages, valid_ids))
+
+        def _count_group_errors(grp: list[ScriptBeat], recs: list) -> tuple[int, int]:
+            align_errs = len(verify_beats_alignment(grp, recs))
+            back_errs = 0
+            prev_p: int | None = None
+            for b in grp:
+                if b.beat_type == "hook_montage":
+                    continue
+                pos = [p for pid in b.panel_ids if (p := _page_pos_from_panel(pid, page_order)) is not None]
+                if pos:
+                    if prev_p is not None and min(pos) < prev_p:
+                        back_errs += 1
+                    prev_p = max(prev_p or 0, max(pos))
+            return align_errs, back_errs
+
+        for s_i, e_i, grp_pages, allowed_p in groups:
+            grp_beats = beats[s_i : e_i + 1]
+            recs = page_analyses_to_alignment_records(page_analyses, grp_pages)
+            if len(recs) < 3:
+                continue
+            allowed_set = set(allowed_p)
+            panel_rank = {pid: i for i, pid in enumerate(allowed_p)}
+            before_align, before_back = _count_group_errors(grp_beats, recs)
+            if before_align == 0 and before_back == 0:
+                continue
+
+            # Tier 1: Allowlisted LLM Surgical Panel Re-Aligner with strict rollback guard
+            if self.polish_seams and self.llm.has_text_credentials:
+                local_err_idxs = {
+                    i for i, b in enumerate(grp_beats) if b.beat_id in panel_err_ids
+                }
+                editable_local: set[int] = set()
+                for li in local_err_idxs:
+                    for nb in (li - 1, li, li + 1):
+                        if 0 <= nb < len(grp_beats):
+                            editable_local.add(nb)
+                editable_bids = {grp_beats[i].beat_id for i in editable_local}
+                anchor_md = build_alignment_anchors(" ".join(b.narration_vi for b in grp_beats), recs)
+
+                beat_lines = []
+                for i, b in enumerate(grp_beats):
+                    mode = 'editable="true"' if i in editable_local else 'readonly="true"'
+                    msgs = [iss.message for iss in issues_eval if iss.beat_id == b.beat_id and iss.category in ("panel_sync", "coverage_gap")]
+                    reason_xml = f"\n    <fix_reason>{' ; '.join(msgs)}</fix_reason>" if msgs else ""
+                    beat_lines.append(
+                        f'  <beat id="{b.beat_id}" {mode}>\n'
+                        f"    <panels>{', '.join(b.panel_ids)}</panels>\n"
+                        f"    <narration>{b.narration_vi}</narration>{reason_xml}\n"
+                        "  </beat>"
+                    )
+                page_lines = []
+                for rec in recs:
+                    p_str = " ; ".join(f"[{pid}] {txt[:100]}" for pid, txt in rec.panels)
+                    page_lines.append(f"- {rec.page_id}: {p_str}")
+
+                try:
+                    res = self.llm.complete_xml(
+                        agent_name="CriticPanelRepairer",
+                        system_prompt=(
+                            "Bạn là Kỹ Sư Phẫu Thuật Đồng Bộ Hình–Tiếng. "
+                            "CHỈ sửa danh sách `<panels>` của các beat có `editable=\"true\"` để khớp chính xác hành động và lời thoại gốc, "
+                            "tiến đơn điệu từ đầu tới cuối hồi. TUYỆT ĐỐI KHÔNG sửa beat `readonly=\"true\"` và KHÔNG viết lại lời đọc."
+                        ),
+                        user_prompt=(
+                            f"Allowlist beat được phép sửa panel: {sorted(editable_bids)}\n\n"
+                            f"### BẢN ĐỒ NEO TRANG:\n{anchor_md}\n\n"
+                            f"### DANH SÁCH TRANG & PANEL HỢP LỆ:\n" + "\n".join(page_lines) + "\n\n"
+                            f"### CÁC BEAT TRONG HỒI:\n<beats>\n" + "\n".join(beat_lines) + "\n</beats>\n\n"
+                            "Trả về XML `<panel_repairs>` chứa 1–4 `panel_id` hợp lệ cho từng beat cần chỉnh."
+                        ),
+                        xml_template=_PANEL_REPAIR_XML_TEMPLATE,
+                        parse_fn=_parse_panel_repair_xml,
+                        temperature_override=0.15,
+                    )
+                    if res.repairs:
+                        cand_grp = [b.model_copy(deep=True) for b in grp_beats]
+                        bid_map = {b.beat_id: idx for idx, b in enumerate(cand_grp)}
+                        applied = False
+                        for rep_item in res.repairs:
+                            if rep_item.beat_id not in editable_bids:
+                                continue
+                            li = bid_map.get(rep_item.beat_id)
+                            if li is None:
+                                continue
+                            valid_new = [pid for pid in rep_item.panel_ids if pid in allowed_set]
+                            valid_new = list(dict.fromkeys(sorted(valid_new, key=lambda p: panel_rank.get(p, 0))))[:4]
+                            if valid_new and valid_new != cand_grp[li].panel_ids:
+                                cand_grp[li].panel_ids = valid_new
+                                applied = True
+                        if applied:
+                            after_align, after_back = _count_group_errors(cand_grp, recs)
+                            if after_back <= before_back and (after_align + after_back) < (before_align + before_back):
+                                for offset, cb in enumerate(cand_grp):
+                                    beats[s_i + offset].panel_ids = cb.panel_ids
+                                grp_beats = beats[s_i : e_i + 1]
+                except Exception:
+                    pass
+
+            # Tier 2: Deterministic monotonic safety-net for any residual quote/desync issue
+            repair_part_panel_alignment_deterministic(grp_beats, recs, allowed_p)
+
+        return beats
+
     def review(
         self,
         script: RecapScript,
@@ -933,6 +1096,30 @@ class CriticAgent:
             page_analyses=page_analyses,
             part_bounds=part_bounds,
         )
+
+        # Layer 3a (Visual): Surgical Panel Repair when alignment/coverage errors survive Stage 3a
+        if page_analyses and any(
+            i.severity == "error" and i.category in ("panel_sync", "coverage_gap") for i in issues_eval
+        ):
+            cleaned_beats = self._repair_panel_alignment(
+                cleaned_beats,
+                issues_eval=issues_eval,
+                page_analyses=page_analyses,
+                all_pages=all_pages,
+                page_order=page_order,
+                valid_ids=valid_ids,
+                part_bounds=part_bounds,
+            )
+            issues_eval, flagged_indices, flagged_notes = self._evaluate_issues(
+                cleaned_beats,
+                all_pages=all_pages,
+                page_order=page_order,
+                beat_to_allowed=beat_to_allowed,
+                target_total_words=target_total_words,
+                bible=bible,
+                page_analyses=page_analyses,
+                part_bounds=part_bounds,
+            )
 
         # Layer 2 (Read-Only Semantic Auditor) + Layer 3 (Allowlisted Surgical Repairer, up to 2 rounds)
         if self.polish_seams and self.llm.has_text_credentials and len(cleaned_beats) >= 6:
