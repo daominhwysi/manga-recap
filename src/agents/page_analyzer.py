@@ -10,6 +10,7 @@ import secrets
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -24,6 +25,9 @@ from src.llm.client import (
 )
 from src.schemas.analysis import PageAnalysis, PanelAnalysis
 from src.schemas.ingestion import JobManifest, PageInfo, PanelInfo
+
+if TYPE_CHECKING:
+    from src.schemas.series import SeriesContext
 
 _VERIFY_ALPHABET = "ACDEFGHJKMNPQRTUVWXY34679"
 
@@ -54,6 +58,7 @@ class SeedCharacter(BaseModel):
     evidence_quote: str = ""
     appearance_vi: str = ""
     best_panel_id: str = ""
+    portrait_path: str = ""
 
 
 class PrePassCastResult(BaseModel):
@@ -368,7 +373,7 @@ def _build_cast_sheet(
     seed_cast: list[SeedCharacter],
     manifest: JobManifest,
     out_path: Path,
-    max_cards: int = 12,
+    max_cards: int = 16,
 ) -> Path | None:
     """Assemble discovered character portraits into a single labeled cast_sheet.jpg reference grid."""
     panel_map: dict[str, PanelInfo] = {
@@ -389,24 +394,34 @@ def _build_cast_sheet(
     tile_w, tile_h = 188, 192
 
     for ch_entry in seed_cast[:max_cards]:
-        pnl = panel_map.get(ch_entry.best_panel_id)
-        if pnl is None:
-            continue
-        # If chosen panel has >1 faces, check same page for a clean single-face panel first
-        face_count = sum(1 for fp in pnl.focal_points if fp.kind == "face")
-        if face_count > 1 and ch_entry.best_panel_id in page_by_panel:
-            pg = page_by_panel[ch_entry.best_panel_id]
-            single_face_pnls = [
-                cand
-                for cand in pg.panels
-                if sum(1 for fp in cand.focal_points if fp.kind == "face") == 1
-            ]
-            if len(single_face_pnls) == 1:
-                pnl = single_face_pnls[0]
+        portrait: np.ndarray | None = None
+        # Prefer persistent Portrait Vault tile when inherited from Series Memory
+        if ch_entry.portrait_path and Path(ch_entry.portrait_path).exists():
+            loaded = cv2.imread(ch_entry.portrait_path)
+            if loaded is not None and loaded.size > 0:
+                if loaded.shape[0] != tile_h or loaded.shape[1] != tile_w:
+                    loaded = cv2.resize(loaded, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+                portrait = loaded
 
-        portrait = _crop_face_portrait(pnl, target_w=tile_w, target_h=tile_h)
         if portrait is None:
-            continue
+            pnl = panel_map.get(ch_entry.best_panel_id)
+            if pnl is None:
+                continue
+            # If chosen panel has >1 faces, check same page for a clean single-face panel first
+            face_count = sum(1 for fp in pnl.focal_points if fp.kind == "face")
+            if face_count > 1 and ch_entry.best_panel_id in page_by_panel:
+                pg = page_by_panel[ch_entry.best_panel_id]
+                single_face_pnls = [
+                    cand
+                    for cand in pg.panels
+                    if sum(1 for fp in cand.focal_points if fp.kind == "face") == 1
+                ]
+                if len(single_face_pnls) == 1:
+                    pnl = single_face_pnls[0]
+
+            portrait = _crop_face_portrait(pnl, target_w=tile_w, target_h=tile_h)
+            if portrait is None:
+                continue
 
         card = np.full((card_h, card_w, 3), 18, dtype=np.uint8)
         card[6 : 6 + tile_h, 6 : 6 + tile_w] = portrait
@@ -457,6 +472,7 @@ class PageAnalyzerAgent:
         max_workers: int = 4,
         exclude_pages: set[str] | None = None,
         prev_job_dir: Path | None = None,
+        series_ctx: SeriesContext | None = None,
     ) -> tuple[list[SeedCharacter], Path | None]:
         """Stage 1.5 Pre-Pass: scan face/dialogue-rich sample pages to lock cast names + build cast_sheet.jpg."""
         all_pages = [pg for ch in manifest.chapters for pg in ch.pages]
@@ -472,10 +488,40 @@ class PageAnalyzerAgent:
                 pass
 
         if len(all_pages) < 8 or not self.llm.has_vision_credentials:
+            if series_ctx is not None and series_ctx.state.characters:
+                from src.series.memory import SeriesStore
+
+                inherited = SeriesStore.select_active_cast_for_volume(
+                    series_ctx.state,
+                    series_ctx.volume_index,
+                    local_seed_cast=[],
+                    max_cards=16,
+                )
+                if inherited:
+                    repo_dir.mkdir(parents=True, exist_ok=True)
+                    seed_path.write_text(
+                        PrePassCastResult(characters=inherited).model_dump_json(indent=2),
+                        encoding="utf-8",
+                    )
+                    built_sheet = _build_cast_sheet(inherited, manifest, sheet_path, max_cards=16)
+                    return inherited, built_sheet
             return [], None
 
         samples = _select_prepass_pages(manifest, max_samples=16, exclude_pages=exclude_pages)
         batches = [samples[i : i + 4] for i in range(0, len(samples), 4)]
+        series_cast_hint = ""
+        if series_ctx is not None and series_ctx.state.characters:
+            known_lines = [
+                f"- {ch.canonical_name} ({ch.appearance[:80]})"
+                for ch in series_ctx.state.characters[:20]
+                if ch.status != "deceased"
+            ]
+            if known_lines:
+                series_cast_hint = (
+                    "\nNHÂN VẬT ĐÃ BIẾT TỪ CÁC TẬP TRƯỚC (ưu tiên giữ đúng tên chuẩn này nếu nhận ra gương mặt):\n"
+                    + "\n".join(known_lines)
+                    + "\n"
+                )
 
         def _scan_sample_batch(batch: list[PageInfo]) -> list[SeedCharacter]:
             imgs = [Path(p.som_paths[0]) if p.som_paths else Path(p.source_path) for p in batch]
@@ -489,7 +535,8 @@ class PageAnalyzerAgent:
                 "1) CHỈ đưa vào danh sách nhân vật có TÊN ĐƯỢC GỌI RÕ trong bóng thoại/chú thích/bìa của các trang này "
                 "(hoặc nhân vật chính/quan trọng lộ mặt rõ với mô tả ngoại hình cụ thể).\n"
                 "2) Bắt buộc điền `evidence_quote` là câu thoại/chữ gốc trên trang nhắc tới tên đó; TUYỆT ĐỐI KHÔNG tự bịa tên từ kiến thức ngoài truyện.\n"
-                "3) `best_panel_id`: chọn đúng 1 panel_id nơi nhân vật lộ mặt to, rõ nhất (ưu tiên panel chỉ có 1 người).\n\n"
+                "3) `best_panel_id`: chọn đúng 1 panel_id nơi nhân vật lộ mặt to, rõ nhất (ưu tiên panel chỉ có 1 người).\n"
+                f"{series_cast_hint}\n"
                 f"Các trang đính kèm:\n{specs}\n"
                 "Trả về XML `<cast>` chứa các thẻ `<character>` (name, best_panel_id, aliases, evidence_quote, appearance)."
             )
@@ -548,35 +595,48 @@ class PageAnalyzerAgent:
         else:
             merged = grounded
 
-        # Python deduplication safety net (optionally inheriting prior volume cast)
+        # Python deduplication safety net (Series Portrait Vault takes precedence over legacy --prev-job)
         deduped: list[SeedCharacter] = []
-        seen_keys: set[str] = set()
-        if prev_job_dir is not None:
-            prev_seed_path = prev_job_dir / "repo" / "seed_cast.json"
-            if prev_seed_path.exists():
-                try:
-                    prev_res = PrePassCastResult.model_validate_json(
-                        prev_seed_path.read_text(encoding="utf-8")
-                    )
-                    for pc in prev_res.characters:
-                        pk = pc.canonical_name.strip().lower()
-                        if pk and pk not in seen_keys:
-                            seen_keys.add(pk)
-                            deduped.append(pc)
-                except Exception:
-                    pass
-        for c in merged:
-            key = c.canonical_name.strip().lower()
-            if key and key not in seen_keys:
-                seen_keys.add(key)
-                deduped.append(c)
+        if series_ctx is not None:
+            from src.series.memory import SeriesStore
+
+            deduped = SeriesStore.select_active_cast_for_volume(
+                series_ctx.state,
+                series_ctx.volume_index,
+                local_seed_cast=merged,
+                max_cards=16,
+            )
+        else:
+            seen_keys: set[str] = set()
+            if prev_job_dir is not None:
+                prev_seed_path = prev_job_dir / "repo" / "seed_cast.json"
+                if prev_seed_path.exists():
+                    try:
+                        prev_res = PrePassCastResult.model_validate_json(
+                            prev_seed_path.read_text(encoding="utf-8")
+                        )
+                        for pc in prev_res.characters:
+                            pk = pc.canonical_name.strip().lower()
+                            if pk and pk not in seen_keys:
+                                seen_keys.add(pk)
+                                # Clear stale panel_id from prior volume so we never mis-crop
+                                pc_copy = pc.model_copy(deep=True)
+                                pc_copy.best_panel_id = ""
+                                deduped.append(pc_copy)
+                    except Exception:
+                        pass
+            for c in merged:
+                key = c.canonical_name.strip().lower()
+                if key and key not in seen_keys:
+                    seen_keys.add(key)
+                    deduped.append(c)
 
         repo_dir.mkdir(parents=True, exist_ok=True)
         seed_path.write_text(
             PrePassCastResult(characters=deduped).model_dump_json(indent=2),
             encoding="utf-8",
         )
-        built_sheet = _build_cast_sheet(deduped, manifest, sheet_path)
+        built_sheet = _build_cast_sheet(deduped, manifest, sheet_path, max_cards=16)
         return deduped, built_sheet
 
     @staticmethod
@@ -584,9 +644,12 @@ class PageAnalyzerAgent:
         lines: list[str] = []
         if seed_cast:
             lines.append("### BẢNG NHÂN VẬT CHUẨN ĐÃ KHÓA (đối chiếu với cast_sheet.jpg nếu đính kèm):")
-            for c in seed_cast[:12]:
+            for c in seed_cast[:16]:
                 als = f" (còn gọi: {', '.join(c.aliases[:3])})" if c.aliases else ""
                 lines.append(f"- {c.canonical_name}{als}: {c.appearance_vi}")
+        if scene_state.get("glossary_terms"):
+            terms = "; ".join(f"{k} -> {v}" for k, v in list(scene_state["glossary_terms"].items())[:20])
+            lines.append(f"\n### TỪ ĐIỂN THUẬT NGỮ CHUẨN CỦA SERIES (dịch nhất quán): {terms}")
         if scene_state.get("recent_summaries"):
             lines.append("\n### NGỮ CẢNH CẢNH NGAY TRƯỚC ĐÓ (Rolling Scene State):")
             if scene_state.get("active_characters"):
@@ -833,6 +896,7 @@ class PageAnalyzerAgent:
         max_workers: int = 4,
         batch_size: int = 4,
         prev_job_dir: Path | None = None,
+        series_ctx: SeriesContext | None = None,
     ) -> list[PageAnalysis]:
         out_all = job_dir / "02a_all_pages.json"
         pages_dir = job_dir / "02a_pages"
@@ -871,6 +935,7 @@ class PageAnalyzerAgent:
             max_workers=max_workers,
             exclude_pages=dup_spread_pages,
             prev_job_dir=prev_job_dir,
+            series_ctx=series_ctx,
         )
         known_cast_seed = [c.canonical_name for c in seed_cast]
 
@@ -886,12 +951,28 @@ class PageAnalyzerAgent:
             ]
 
             def _run_chunk(chunk_pages: list[PageInfo]) -> list[PageAnalysis]:
-                # Initialize RollingSceneState from cached predecessors if available, else 2 overlap images on first batch
+                # Initialize RollingSceneState from cached predecessors (or Series handoff on page 0)
                 state: dict = {
                     "active_characters": [],
                     "recent_summaries": [],
+                    "glossary_terms": (
+                        dict(series_ctx.glossary.terminology)
+                        if series_ctx is not None and series_ctx.glossary.terminology
+                        else {}
+                    ),
                 }
                 first_global_idx = page_idx_map.get(chunk_pages[0].page_id, 0)
+                if (
+                    first_global_idx == 0
+                    and series_ctx is not None
+                    and series_ctx.state.last_handoff is not None
+                    and series_ctx.state.last_handoff.volume_index < series_ctx.volume_index
+                ):
+                    ho = series_ctx.state.last_handoff
+                    if ho.ending_characters:
+                        state["active_characters"] = list(ho.ending_characters[:8])
+                    if ho.ending_summary:
+                        state["recent_summaries"].append(f"[Cuối tập {ho.volume_index}] {ho.ending_summary}")
                 overlap_for_first: list[PageInfo] = []
                 for prev_i in range(max(0, first_global_idx - 2), first_global_idx):
                     prev_pg = all_pages[prev_i]

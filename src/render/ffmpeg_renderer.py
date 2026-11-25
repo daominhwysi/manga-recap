@@ -152,6 +152,19 @@ class FFmpegOpenCVRenderer:
                 except Exception:
                     pass
 
+            series_music_p = output_path.parent / "audio" / "series_music_context.json"
+            genre_prefs_ov: dict[str, float] | None = None
+            avoid_init_tracks: list[str] | None = None
+            if series_music_p.exists():
+                try:
+                    sm_data = json.loads(series_music_p.read_text(encoding="utf-8"))
+                    if isinstance(sm_data.get("genre_preferences"), dict) and sm_data["genre_preferences"]:
+                        genre_prefs_ov = {str(k): float(v) for k, v in sm_data["genre_preferences"].items()}
+                    if isinstance(sm_data.get("avoid_initial_track_ids"), list):
+                        avoid_init_tracks = [str(x) for x in sm_data["avoid_initial_track_ids"] if x]
+                except Exception:
+                    pass
+
             dyn_bgm = output_path.parent / "audio" / "04b_bgm_dynamic.wav"
             custom_dir = Path(timeline.bgm_path).parent if timeline.bgm_path else None
             build_dynamic_timeline_bgm(
@@ -164,6 +177,8 @@ class FFmpegOpenCVRenderer:
                 min_cue_duration_ms=int(round(self.min_bgm_cue_sec * 1000)),
                 credits_path=output_path.parent / "exports" / "music_credits.txt",
                 cues_json_path=output_path.parent / "audio" / "04b_music_cues.json",
+                genre_prefs_override=genre_prefs_ov,
+                avoid_initial_track_ids=avoid_init_tracks,
             )
             active_bgm_path = str(dyn_bgm.resolve())
         elif timeline.bgm_path:

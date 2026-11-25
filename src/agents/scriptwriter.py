@@ -39,6 +39,34 @@ def _panel_to_page_id(panel_id: str) -> str:
     return re.sub(r"_P\d+$", "", panel_id)
 
 
+def _series_flags(series_ctx) -> tuple[bool, bool, bool]:
+    """Return (is_continuation, is_seamless, has_more_volumes) safely for optional SeriesContext."""
+    if series_ctx is None:
+        return False, False, False
+    is_cont = int(getattr(series_ctx, "volume_index", 1) or 1) > 1
+    is_seam = getattr(series_ctx, "continuity_mode", "episodic") == "seamless"
+    tot = getattr(series_ctx, "total_volumes", None)
+    has_more = bool(tot is not None and int(getattr(series_ctx, "volume_index", 1)) < int(tot))
+    return is_cont, is_seam, has_more
+
+
+def _build_series_memory_block(
+    series_ctx,
+    bible: StoryBible,
+    text_hint: str = "",
+) -> str:
+    if series_ctx is None:
+        return ""
+    from src.series.memory import SeriesStore
+
+    active_chars = [ch.canonical_name for ch in bible.characters if ch.canonical_name]
+    return SeriesStore.retrieve_bounded_memory_prompt(
+        series_ctx,
+        active_characters=active_chars,
+        current_text_hint=text_hint,
+    )
+
+
 def _collect_part_panels(
     tree: PageIndexTree,
     scene_ids: list[str],
@@ -403,6 +431,8 @@ class ScriptwriterAgent:
         persona: str,
         job_dir: Path,
         force: bool = False,
+        series_memory_block: str = "",
+        series_ctx=None,
     ) -> ScriptOutline:
         outline_path = job_dir / "repo" / "OUTLINE.json"
         outline_path.parent.mkdir(parents=True, exist_ok=True)
@@ -420,11 +450,26 @@ class ScriptwriterAgent:
             scene_groups[-2].extend(scene_groups.pop())
         num_parts = max(1, len(scene_groups))
 
+        is_cont, is_seam, _ = _series_flags(series_ctx)
+        series_outline_rule = ""
+        if series_memory_block:
+            if is_seam and is_cont:
+                series_outline_rule = (
+                    "6) CHẾ ĐỘ GHÉP LIỀN MẠCH (SEAMLESS CONTINUATION): Tập này nối trực tiếp ngay sau tập trước trong cùng 1 video dài "
+                    "-> KHÔNG làm cold open chào khán giả hay tóm tắt lại tập cũ; mở đầu đi thẳng vào diễn biến tiếp nối.\n"
+                )
+            elif is_cont:
+                series_outline_rule = (
+                    "6) CHẾ ĐỘ NỐI TẬP (EPISODIC CONTINUATION): Khán giả ĐÃ xem tập trước -> mở đầu chỉ nối 1–2 câu từ nút thắt cuối tập trước, "
+                    "TUYỆT ĐỐI KHÔNG giới thiệu lại tiểu sử nhân vật cũ hay bối cảnh đã nêu ở Tập 1.\n"
+                )
+
         user_prompt = (
             f"Persona: {persona}\n"
             f"Mục tiêu tổng thời lượng video tham chiếu: ~{self.cfg.target_duration_min:.1f} phút "
             f"(~{total_words} từ tiếng Việt với tốc độ {self.cfg.words_per_minute} wpm, chia thành {num_parts} hồi nối tiếp KHÔNG chồng lặp scene).\n\n"
-            f"{memory_md}\n\n"
+            + (f"{series_memory_block}\n\n" if series_memory_block else "")
+            + f"{memory_md}\n\n"
             f"{tree.compact_outline_view()}\n\n"
             "QUY TẮC LẬP DÀN Ý NGỮ NGHĨA & CHỌN HOOK BẮT BUỘC:\n"
             "1) Chọn `hook_strategy` phù hợp nhất với mở đầu tập truyện (`in_medias_res` / `world_premise` / `montage_tease`) và viết `hook_summary` thật cuốn theo giọng kể chuyện gần gũi.\n"
@@ -437,7 +482,8 @@ class ScriptwriterAgent:
             f"{total_words} từ (nhưng ưu tiên độ sâu cho các hồi `spotlight`).\n"
             "4) `required_callbacks` CHỈ chứa tối đa 1-2 `scene_id` xa thực sự cần đối chiếu (KHÔNG cần thêm scene ngay liền trước).\n"
             "5) Ghi rõ `focus_notes`: điểm bắt đầu, trọng tâm phân tích/cảm xúc và điểm dừng của hồi.\n"
-            "Hãy lập ScriptOutline dạng JSON: title_vi, hook_strategy, hook_summary, và `parts` "
+            + series_outline_rule
+            + "Hãy lập ScriptOutline dạng JSON: title_vi, hook_strategy, hook_summary, và `parts` "
             "(part_id='part_01'.., title, section='hook/setup/rising/climax/cliffhanger', pacing_mode='skim/steady/spotlight', "
             "scene_ids, required_callbacks, target_beats, target_words, focus_notes)."
         )
@@ -780,6 +826,7 @@ class ScriptwriterAgent:
         story_temperature: float,
         job_dir: Path,
         force: bool = False,
+        series_ctx=None,
     ) -> dict[str, str]:
         """Pass 1 (Decoupled Pure Storyteller): Write flowing multi-scene Acts with ZERO panel_id/XML beat tax."""
         acts_dir = job_dir / "repo" / "script" / "acts"
@@ -791,6 +838,27 @@ class ScriptwriterAgent:
         part_index_lookup = {p.part_id: i + 1 for i, p in enumerate(outline.parts)}
         total_parts = len(outline.parts)
         acts = _group_parts_into_acts(outline.parts)
+        is_cont, is_seam, has_more_vols = _series_flags(series_ctx)
+        series_mem_full = _build_series_memory_block(
+            series_ctx,
+            bible,
+            text_hint=" ".join(sc.summary for sc in tree.scenes[:6]),
+        )
+        glossary_reminder = ""
+        if series_ctx is not None:
+            g_bits: list[str] = []
+            if series_ctx.glossary.terminology:
+                g_bits.append(
+                    "Thuật ngữ chuẩn: "
+                    + "; ".join(f"{k} -> {v}" for k, v in list(series_ctx.glossary.terminology.items())[:20])
+                )
+            if series_ctx.glossary.pronoun_pairs:
+                g_bits.append(
+                    "Xưng hô cố định: "
+                    + "; ".join(f"{k}: {v}" for k, v in list(series_ctx.glossary.pronoun_pairs.items())[:12])
+                )
+            if g_bits:
+                glossary_reminder = "\n5) NHẤT QUÁN CHUỖI TẬP (BẮT BUỘC): " + " | ".join(g_bits)
 
         part_prose_map: dict[str, str] = {}
         prev_tail_paragraphs = ""
@@ -834,16 +902,38 @@ class ScriptwriterAgent:
                     if unrevealed
                     else ""
                 )
-                hook_note = (
-                    f"\n  - MỞ ĐẦU VIDEO (hook_strategy={outline.hook_strategy}): Bắt đầu thật cuốn từ nghịch lý/câu hỏi cốt lõi. Gợi ý: {outline.hook_summary}"
-                    if p_num == 1
-                    else ""
-                )
-                outro_note = (
-                    "\n  - KẾT TẬP: Khép lại đoạn cuối bằng suy ngẫm lắng đọng hoặc câu hỏi mở tự nhiên nối sang tập sau."
-                    if p_num == total_parts
-                    else ""
-                )
+                if p_num == 1:
+                    if is_seam and is_cont:
+                        hook_note = (
+                            "\n  - MỞ ĐẦU NỐI LIỀN MẠCH (SEAMLESS): Video này ghép trực tiếp ngay sau giây cuối tập trước. "
+                            "TUYỆT ĐỐI KHÔNG chào khán giả, KHÔNG nói 'ở tập trước' hay giới thiệu lại nhân vật cũ; "
+                            "hãy nối nhịp tự nhiên ngay từ tình huống vừa kết sang cảnh đầu của tập này."
+                        )
+                    elif is_cont:
+                        hook_note = (
+                            f"\n  - MỞ ĐẦU TẬP {series_ctx.volume_index} (EPISODIC CONTINUATION): "
+                            "Chỉ mở bằng 1–2 câu cầu nối cực gọn nhắc lại nút thắt cuối tập trước rồi lao thẳng vào diễn biến mới. "
+                            "TUYỆT ĐỐI KHÔNG giới thiệu lại tiểu sử nhân vật cũ hay thế giới quan đã biết từ Tập 1."
+                        )
+                    else:
+                        hook_note = (
+                            f"\n  - MỞ ĐẦU VIDEO (hook_strategy={outline.hook_strategy}): Bắt đầu thật cuốn từ nghịch lý/câu hỏi cốt lõi. Gợi ý: {outline.hook_summary}"
+                        )
+                else:
+                    hook_note = ""
+
+                if p_num == total_parts:
+                    if is_seam and has_more_vols:
+                        outro_note = (
+                            "\n  - CHUYỂN TẬP LIỀN MẠCH (SEAMLESS): Còn tập tiếp theo nối thẳng trong cùng video -> "
+                            "KHÔNG viết lời chào kết video/hẹn gặp lại; kết gọn ở đúng cao trào/dư âm của cảnh cuối để tập sau nối liền lập tức."
+                        )
+                    else:
+                        outro_note = (
+                            "\n  - KẾT TẬP: Khép lại đoạn cuối bằng suy ngẫm lắng đọng hoặc câu hỏi mở tự nhiên nối sang tập sau."
+                        )
+                else:
+                    outro_note = ""
                 digest_chunks = [
                     _strip_cv_metadata_for_prose(tree.get_scene_text(sid))
                     for sid in p.scene_ids
@@ -870,7 +960,9 @@ class ScriptwriterAgent:
             expected_ids = [p.part_id for p in act_parts]
             act_target_words = sum(p.target_words for p in act_parts)
             act_max_words = int(round(act_target_words * 1.28))
+            act_series_block = f"{series_mem_full}\n\n" if (act_idx == 1 and series_mem_full) else ""
             base_prompt = (
+                f"{act_series_block}"
                 f"### HỒ SƠ NHÂN VẬT & MẠCH BÍ ẨN:\n{scoped_memory}\n\n"
                 f"{prev_line}"
                 f"### NHIỆM VỤ VIẾT KỊCH BẢN LIỀN MẠCH — CHƯƠNG {act_idx}/{len(acts)} (gồm các hồi {expected_ids}, TỔNG TỐI ĐA ~{act_target_words} chữ tiếng Việt / âm tiết tách bởi dấu cách):\n\n"
@@ -881,6 +973,7 @@ class ScriptwriterAgent:
                 f"2) Mỗi hồi đặt trong đúng 1 thẻ `<part id=\"part_XX\">...</part>`. ĐỘ DÀI CÔ ĐỌNG ĐÚNG NGÂN SÁCH: tổng cả Chương {act_idx} nằm gọn quanh ~{act_target_words} chữ (âm tiết tiếng Việt tách bằng dấu cách, TUYỆT ĐỐI không vượt quá {act_max_words} chữ — hãy chắt lọc tình tiết đắt, đừng kể lan man mọi khung tranh nhỏ). Giữa các hồi nối tiếp chuyển mạch tự nhiên, không lặp lại ý vừa kết.\n"
                 "3) Viết câu tiếng Việt có nhạc tính, liên kết nhân-quả mượt mà (đa phần câu 16–30 chữ, chỉ dùng câu ngắn 7–12 chữ ở đúng cú twist/cao trào). Hạn chế tối đa dấu hai chấm (:), KHÔNG viết kiểu liệt kê cụt lủn, KHÔNG rắc khẩu ngữ giả tạo ('nha', 'nhé', 'kìa', 'để ý nha', 'nghe kỹ nha', 'anh em ơi'), KHÔNG dùng ký tự biểu tượng (♡, ♪, ★).\n"
                 "4) Giữ chính xác sự thật, kể theo đúng trình tự thời gian các trang `[pXXX]` (mỗi khi chuyển sang địa điểm, đối tượng hoặc bước ngoặt mới, hãy tách câu tự nhiên thay vì dồn 2–3 cảnh xa nhau vào một câu) & lồng ghép câu thoại gốc đắt giá trong ngoặc kép (\"...\"). Tuân thủ tuyệt đối quy tắc CHỐNG SPOIL TÊN ở từng hồi."
+                + glossary_reminder
                 + avoid_line
             )
 
@@ -957,6 +1050,7 @@ class ScriptwriterAgent:
         total_parts: int,
         source_prose: str,
         tree: PageIndexTree,
+        series_ctx=None,
     ) -> list[ScriptBeat]:
         """Pass 2 (Panel Aligner): Slice Pass 1 prose into natural beats & bind monotonic panel_ids WITHOUT rewriting."""
         allowed_panels, first_pg, last_pg = _collect_part_panels(tree, part.scene_ids)
@@ -1013,15 +1107,16 @@ class ScriptwriterAgent:
         best_beats: list[ScriptBeat] = []
         best_score = -1e9
 
+        is_cont, is_seam, has_more_vols = _series_flags(series_ctx)
         def _postprocess(raw_beats: list[ScriptBeat]) -> list[ScriptBeat]:
-            if part_idx < total_parts:
+            if part_idx < total_parts or (is_seam and has_more_vols):
                 for b in raw_beats:
                     if b.beat_type == "outro":
                         b.beat_type = "narrative"
             elif raw_beats and raw_beats[-1].beat_type != "outro":
                 raw_beats[-1].beat_type = "outro"
             if part_idx == 1 and raw_beats:
-                raw_beats[0].section = "hook"
+                raw_beats[0].section = "setup" if (is_seam and is_cont) else "hook"
             return raw_beats
 
         for turn in range(3):
@@ -1196,6 +1291,7 @@ class ScriptwriterAgent:
         job_dir: Path,
         tree: PageIndexTree | None = None,
         force: bool = False,
+        series_ctx=None,
     ) -> RecapScript:
         draft_path = job_dir / "03a_script_draft.json"
         if draft_path.exists() and not force:
@@ -1210,20 +1306,35 @@ class ScriptwriterAgent:
         if not self.llm.has_text_credentials:
             if not self.llm.config.offline_fallback:
                 raise RuntimeError("No text API credentials available for ScriptwriterAgent.")
-            script = self._offline_fallback_script(bible, page_analyses, persona, p_cfg)
+            script = self._offline_fallback_script(bible, page_analyses, persona, p_cfg, series_ctx=series_ctx)
             draft_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
             return script
+
+        series_mem_block = _build_series_memory_block(
+            series_ctx,
+            bible,
+            text_hint=" ".join(pa.page_summary for pa in page_analyses[:10]),
+        )
+        is_cont, is_seam, has_more_vols = _series_flags(series_ctx)
 
         # Path 1: Fast Path for short inputs (<= fast_path_max_pages)
         if len(page_analyses) <= self.cfg.fast_path_max_pages or tree is None:
             compact_md = format_pages_compact_md(page_analyses)
             moods_txt = ", ".join(VALID_MOODS)
+            cont_rule = ""
+            if is_seam and is_cont:
+                cont_rule = " CHẾ ĐỘ GHÉP LIỀN MẠCH: không chào khán giả, không tóm tắt lại tập trước, nối thẳng từ cuối tập trước."
+            elif is_cont:
+                cont_rule = " CHẾ ĐỘ NỐI TẬP: mở gọn 1-2 câu nối từ tập trước, không giới thiệu lại nhân vật cũ."
+            if is_seam and has_more_vols:
+                cont_rule += " Không viết lời chào kết/outro vì còn tập sau nối thẳng."
             user_prompt = (
                 f"Persona: {persona}\n"
-                f"StoryBible:\n{bible.model_dump_json(indent=2)}\n\n"
+                + (f"{series_mem_block}\n\n" if series_mem_block else "")
+                + f"StoryBible:\n{bible.model_dump_json(indent=2)}\n\n"
                 f"Nội dung chi tiết ({len(page_analyses)} trang):\n{compact_md}\n\n"
                 "Viết kịch bản `<script>` dạng XML bằng VĂN NÓI 100% (tránh văn viết sáo rỗng), "
-                f"mỗi `<beat>` gắn 2-4 `panel_id` liên tiếp đúng diễn biến, `mood` thuộc [{moods_txt}]."
+                f"mỗi `<beat>` gắn 2-4 `panel_id` liên tiếp đúng diễn biến, `mood` thuộc [{moods_txt}].{cont_rule}"
             )
             script = self.llm.complete_xml(
                 agent_name="ScriptwriterAgent",
@@ -1242,7 +1353,15 @@ class ScriptwriterAgent:
             if memory_path.exists()
             else render_memory_md(bible, tree)
         )
-        outline = self._plan_outline(tree, memory_md, persona, job_dir, force=force)
+        outline = self._plan_outline(
+            tree,
+            memory_md,
+            persona,
+            job_dir,
+            force=force,
+            series_memory_block=series_mem_block,
+            series_ctx=series_ctx,
+        )
         panel_images = self._build_panel_image_map(job_dir)
 
         parts_dir = job_dir / "repo" / "script" / "parts"
@@ -1268,6 +1387,7 @@ class ScriptwriterAgent:
                 story_temperature=story_temp,
                 job_dir=job_dir,
                 force=force,
+                series_ctx=series_ctx,
             )
 
         for idx, part in enumerate(outline.parts, start=1):
@@ -1280,7 +1400,7 @@ class ScriptwriterAgent:
                     ScriptBeat.model_validate(b)
                     for b in json.loads(part_file.read_text(encoding="utf-8"))
                 ]
-                if idx < total_parts:
+                if idx < total_parts or (is_seam and has_more_vols):
                     for b in part_beats:
                         if b.beat_type == "outro":
                             b.beat_type = "narrative"
@@ -1293,6 +1413,7 @@ class ScriptwriterAgent:
                         total_parts=total_parts,
                         source_prose=part_prose_map[part.part_id],
                         tree=tree,
+                        series_ctx=series_ctx,
                     )
                 if not part_beats:
                     part_beats = self._write_part_with_lookup(
@@ -1359,19 +1480,32 @@ class ScriptwriterAgent:
         page_analyses: list[PageAnalysis],
         persona: str,
         p_cfg: dict,
+        series_ctx=None,
     ) -> RecapScript:
         all_panels = [pnl for pa in page_analyses for pnl in pa.panels]
         beats: list[ScriptBeat] = []
         chunk_size = 2 if len(all_panels) > 4 else 1
+        is_cont, is_seam, _ = _series_flags(series_ctx)
         for idx in range(0, min(len(all_panels), 30), chunk_size):
             chunk = all_panels[idx : idx + chunk_size]
             b_num = len(beats) + 1
-            section = "hook" if b_num == 1 else ("climax" if b_num >= 8 else "rising")
+            section = ("setup" if (is_seam and is_cont) else "hook") if b_num == 1 else ("climax" if b_num >= 8 else "rising")
             if b_num == 1:
-                text = (
-                    f"Chào mừng các bạn đến với phần tóm tắt {bible.series_title_guess}, "
-                    "nơi mọi bí mật và biến cố bất ngờ bắt đầu hé lộ."
-                )
+                if is_seam and is_cont:
+                    text = (
+                        f"Ngay sau biến cố ở tập {series_ctx.volume_index - 1}, "
+                        f"mạch truyện của {bible.series_title_guess} lập tức đẩy sang diễn biến mới."
+                    )
+                elif is_cont:
+                    text = (
+                        f"Tiếp nối tập {series_ctx.volume_index - 1} của {bible.series_title_guess}, "
+                        "tập mới mở ra những manh mối quan trọng tiếp theo."
+                    )
+                else:
+                    text = (
+                        f"Chào mừng các bạn đến với phần tóm tắt {bible.series_title_guess}, "
+                        "nơi mọi bí mật và biến cố bất ngờ bắt đầu hé lộ."
+                    )
             else:
                 text = (
                     f"Diễn biến tiếp theo đẩy câu chuyện lên cao trào mới tại phân cảnh {b_num}, "

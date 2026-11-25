@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from src.agents.choreographer import ChoreographerAgent
 from src.agents.critic import CriticAgent
-from src.agents.page_analyzer import PageAnalyzerAgent
+from src.agents.page_analyzer import PageAnalyzerAgent, PrePassCastResult
 from src.agents.page_index import PageIndexBuilder
 from src.agents.scriptwriter import ScriptwriterAgent
 from src.audio.stage import run_stage4_audio
@@ -19,6 +21,9 @@ from src.llm.client import LLMClient
 from src.render import RENDERER_REGISTRY
 from src.render import ffmpeg_renderer  # noqa: F401
 from src.render.subtitles import write_srt
+
+if TYPE_CHECKING:
+    from src.schemas.series import SeriesContext
 
 
 class MangaRecapPipeline:
@@ -35,10 +40,15 @@ class MangaRecapPipeline:
         force: bool = False,
         skip_render: bool = False,
         prev_job_dir: Path | None = None,
+        series_ctx: SeriesContext | None = None,
     ) -> Path:
         job_dir = self.config.project.jobs_dir / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
-        chosen_persona = persona or self.config.project.default_persona
+        chosen_persona = persona or (
+            series_ctx.state.persona
+            if series_ctx is not None and series_ctx.state.persona
+            else self.config.project.default_persona
+        )
 
         telemetry = TelemetryTracker(
             job_id=job_id,
@@ -70,6 +80,7 @@ class MangaRecapPipeline:
                 max_workers=self.config.script.vision_max_workers,
                 batch_size=self.config.script.vision_batch_size,
                 prev_job_dir=prev_job_dir,
+                series_ctx=series_ctx,
             )
             index_builder = PageIndexBuilder(
                 llm, pages_per_scene=self.config.script.pages_per_scene
@@ -80,6 +91,7 @@ class MangaRecapPipeline:
                 job_dir,
                 force=force,
                 prev_job_dir=prev_job_dir,
+                series_ctx=series_ctx,
             )
             d["pages"] = len(page_analyses)
             d["scenes"] = tree.total_scenes
@@ -96,6 +108,7 @@ class MangaRecapPipeline:
                 job_dir=job_dir,
                 tree=tree,
                 force=force,
+                series_ctx=series_ctx,
             )
             critic = CriticAgent(llm, polish_seams=self.config.script.polish_seams)
             final_script, report = critic.review(
@@ -106,6 +119,7 @@ class MangaRecapPipeline:
                 force=force,
                 script_config=self.config.script,
                 page_analyses=page_analyses,
+                series_ctx=series_ctx,
             )
             d["beats"] = len(final_script.beats)
             d["critic_issues"] = len(report.issues)
@@ -141,6 +155,31 @@ class MangaRecapPipeline:
         srt_path = write_srt(timeline.subtitles, job_dir / "06_subtitles.srt")
         output_mp4 = job_dir / "06_output.mp4"
 
+        # Persist series sonic identity hint for Smart Music Director before rendering
+        if series_ctx is not None:
+            sm_path = job_dir / "audio" / "series_music_context.json"
+            sm_path.parent.mkdir(parents=True, exist_ok=True)
+            avoid_ids = list(series_ctx.state.recent_bgm_track_ids)
+            if (
+                series_ctx.state.last_handoff
+                and series_ctx.state.last_handoff.last_bgm_track_id
+                and series_ctx.state.last_handoff.last_bgm_track_id not in avoid_ids
+            ):
+                avoid_ids.append(series_ctx.state.last_handoff.last_bgm_track_id)
+            sm_path.write_text(
+                json.dumps(
+                    {
+                        "series_id": series_ctx.series_id,
+                        "volume_index": series_ctx.volume_index,
+                        "genre_preferences": series_ctx.state.music_genre_prefs,
+                        "avoid_initial_track_ids": avoid_ids,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
         # Stage 6a: Render MP4
         if not skip_render:
             with telemetry.stage("stage6a_render_mp4") as d:
@@ -171,6 +210,41 @@ class MangaRecapPipeline:
                 exporter.export(timeline, job_dir)
                 exported.append(exp_name)
             d["exporters"] = exported
+
+        # Series Memory Consolidation (Portrait Vault + 3-Tier Ledger/Handoff + Glossary sync)
+        if series_ctx is not None:
+            with telemetry.stage("stage6c_series_memory_update") as d:
+                from src.series.memory import SeriesStore
+
+                seed_cast = []
+                seed_p = job_dir / "repo" / "seed_cast.json"
+                if seed_p.exists():
+                    try:
+                        seed_cast = PrePassCastResult.model_validate_json(
+                            seed_p.read_text(encoding="utf-8")
+                        ).characters
+                    except Exception:
+                        seed_cast = []
+                store = SeriesStore(series_ctx.series_dir, series_ctx.series_id)
+                updated_state, _ = store.update_after_volume(
+                    state=series_ctx.state,
+                    glossary=series_ctx.glossary,
+                    volume_index=series_ctx.volume_index,
+                    job_id=job_id,
+                    input_path=input_path,
+                    manifest=manifest,
+                    bible=bible,
+                    script=final_script,
+                    audio_manifest=audio_manifest,
+                    output_mp4=(output_mp4 if not skip_render and output_mp4.exists() else None),
+                    seed_cast=seed_cast,
+                    llm=llm,
+                    cues_json_path=job_dir / "audio" / "04b_music_cues.json",
+                )
+                d["series_id"] = series_ctx.series_id
+                d["volume_index"] = series_ctx.volume_index
+                d["series_characters"] = len(updated_state.characters)
+                d["ledger_volumes"] = len(updated_state.ledger)
 
         telemetry.save(job_dir / "telemetry.json")
         return output_mp4 if not skip_render else job_dir

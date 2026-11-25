@@ -1,27 +1,28 @@
 # ==============================================================================
-# Manga Recap Generator - Cấu hình toàn bộ hệ thống
+# Manga Recap Generator - Global System Configuration
 # ==============================================================================
 
 project:
   name: manga_recap_generator
   jobs_dir: jobs
+  series_dir: series
   downloads_dir: downloads
   default_language: vi                  # vi | en
-  default_persona: kich_tinh            # kich_tinh | hai_huoc | phan_tich (xem configs/personas.yaml)
+  default_persona: kich_tinh            # kich_tinh | hai_huoc | phan_tich (see configs/personas.yaml)
 
 llm:
-  provider: aixingialaire               # Provider cho text LLM qua unified-llm-proxy (hỗ trợ gpt-6-luna, gpt-6.2-sol, claude-haiku-5-5, claude-sonnet-4-6)
-  vision_provider: null                 # null = auto routing trên proxy (agy -> gemini-3.8-flash-medium-vision 200 OK)
-  default_model: gpt-6.2-sol            # Mặc định GPT 6.2 Sol (văn nói tiếng Việt mượt & nhanh)
-  fallback_model: gpt-6-luna            # Chuyển sang GPT 6 Luna nếu model chính lỗi
-  vision_model: gemini-3.8-flash-medium-vision  # Model đọc trang manga Set-of-Mark + Cast Sheet
+  provider: aixingialaire               # Text LLM provider via unified-llm-proxy (supports gpt-6-luna, gpt-6.2-sol, claude-haiku-5-5, claude-sonnet-4-6)
+  vision_provider: null                 # null = auto-routing on proxy (agy -> gemini-3.8-flash-medium-vision 200 OK)
+  default_model: gpt-6.2-sol            # Default GPT 6.2 Sol (smooth & fast Vietnamese spoken narration)
+  fallback_model: gpt-6-luna            # Fallback to GPT 6 Luna if the primary model fails
+  vision_model: gemini-3.8-flash-medium-vision  # Vision model for reading Set-of-Mark manga pages + Cast Sheet
   temperature: 0.4
-  max_tokens: 32768                     # Thả phanh theo trần model proxy để không cắt cụt JSON
-  timeout_sec: 150
+  max_tokens: 32768                     # High ceiling matching proxy model limit to avoid truncated JSON/XML
+  timeout_sec: 240
   max_retries: 2
-  offline_fallback: true                # true: dùng fallback mẫu nếu thiếu API key
-  base_url: http://127.0.0.1:8765/v1    # unified-llm-proxy (hoặc ghi đè bằng OPENAI_BASE_URL)
-  api_key: unified-llm-proxy            # hoặc ghi đè bằng OPENAI_API_KEY trong .env
+  offline_fallback: true                # true: use sample fallback responses when API key is missing
+  base_url: http://127.0.0.1:8765/v1    # unified-llm-proxy (or override via OPENAI_BASE_URL)
+  api_key: unified-llm-proxy            # or override via OPENAI_API_KEY in .env
 
 cv:
   detector: auto                        # auto | manga_yolo | manhwa_slicer
@@ -29,65 +30,65 @@ cv:
   yolo_labels_path: models/manga109_yolo/v2023.12.07_m_yv11/labels.json
   confidence_threshold: 0.35
   iou_threshold: 0.45
-  reading_order: rtl                    # rtl (Manga Nhật) | ltr (Comic) | vertical (Manhwa)
-  max_pages_per_chapter: null           # null = toàn bộ trang; hoặc đặt số nguyên (vd 30)
+  reading_order: rtl                    # rtl (Japanese Manga) | ltr (Western Comics) | vertical (Manhwa/Webtoon)
+  max_pages_per_chapter: null           # null = all pages; or set an integer limit (e.g., 30)
 
 script:
-  target_duration_min: 9.0              # Thời lượng mục tiêu cho 1 tập/job (phút)
-  pages_per_scene: 20                   # Số trang gom thành 1 Scene node mặc định (fallback khi tắt semantic segmentation)
-  fast_path_max_pages: 30               # <= 30 trang: chạy 1-pass nhanh không cần chia hồi
-  vision_batch_size: 4                  # Số trang cơ sở mỗi request Vision (Adaptive Panel Batching ~16-18 panels/call)
-  vision_max_workers: 4                 # 4 luồng Chunked Parallel Rolling (+ Pre-Pass cast_sheet)
-  words_per_minute: 225                 # Khớp tốc độ đọc thực tế giọng VieNeu Ngọc Linh (~232 wpm)
-  polish_seams: true                    # true: bật Read-Aloud Showrunner Pass & Closed-Loop Auto-Repair (khóa cứng panel_ids)
-  decoupled_two_pass: true              # true: tách Pass 1 (Viết văn liền mạch theo Hồi lớn) khỏi Pass 2 (Gán panel_ids)
-  story_temperature: 0.72               # Nhiệt độ viết văn sáng tạo cho Pass 1 (mượt, không lặp từ)
-  align_temperature: 0.15               # Nhiệt độ thấp cho Pass 2 gán panel_id chính xác
+  target_duration_min: 9.0              # Target duration per volume/job (minutes)
+  pages_per_scene: 20                   # Default pages per Scene node (fallback when semantic segmentation is disabled)
+  fast_path_max_pages: 30               # <= 30 pages: run fast 1-pass mode without splitting into acts/parts
+  vision_batch_size: 4                  # Base pages per Vision request (Adaptive Panel Batching ~16-18 panels/call)
+  vision_max_workers: 4                 # 4 workers for Chunked Parallel Rolling (+ Pre-Pass cast_sheet)
+  words_per_minute: 225                 # Matches actual VieNeu Ngoc Linh speaking pace (~232 wpm)
+  polish_seams: true                    # true: enable Read-Aloud Showrunner Pass & Closed-Loop Auto-Repair (panel_ids locked)
+  decoupled_two_pass: true              # true: decouple Pass 1 (seamless act-level prose) from Pass 2 (panel_id alignment)
+  story_temperature: 0.72               # Creative prose temperature for Pass 1 (fluid, minimal repetition)
+  align_temperature: 0.15               # Low temperature for Pass 2 accurate panel_id alignment
 
 tts:
   backend: vieneu                       # vieneu (local offline) | edge_tts (cloud)
-  # --- Giọng VieNeu (25 giọng preset tiếng Việt) ---
-  # Nam Bắc : "Thiện Minh" (kể chuyện), "Adam bựa" (tự nhiên), "Hải Đăng", "Thiền Tâm Đức", "Thanh Bình", "Minh Đức", "Phạm Tuyên", "Xuân Vĩnh", "Quốc Tuấn"
-  # Nam Nam : "Thái Sơn" (kể chuyện), "Đức Trí" (đọc truyện), "Adam", "Minh Triết"
-  # Nam Trung: "Quang Sơn"
-  # Nữ Bắc  : "Trúc Ly" (tự nhiên), "Ngọc Linh" (kể chuyện), "Quỳnh Anh" (đọc truyện), "Ngọc Huyền", "Mai Anh", "Đoan Trang"
-  # Nữ Nam  : "Mỹ Duyên" (đọc truyện), "Kim Thanh" (đọc truyện), "Thục Đoan" (kể chuyện), "Thùy Dung"
-  # Nữ Trung: "Ngọc Trân"
+  # --- VieNeu Voices (25 Vietnamese preset voices) ---
+  # Northern Male : "Thiện Minh" (storytelling), "Adam bựa" (natural), "Hải Đăng", "Thiền Tâm Đức", "Thanh Bình", "Minh Đức", "Phạm Tuyên", "Xuân Vĩnh", "Quốc Tuấn"
+  # Southern Male : "Thái Sơn" (storytelling), "Đức Trí" (audiobook), "Adam", "Minh Triết"
+  # Central Male  : "Quang Sơn"
+  # Northern Female: "Trúc Ly" (natural), "Ngọc Linh" (storytelling), "Quỳnh Anh" (audiobook), "Ngọc Huyền", "Mai Anh", "Đoan Trang"
+  # Southern Female: "Mỹ Duyên" (audiobook), "Kim Thanh" (audiobook), "Thục Đoan" (storytelling), "Thùy Dung"
+  # Central Female : "Ngọc Trân"
   vieneu_voice: Ngọc Huyền
-  # --- Giọng Edge-TTS ---
-  # Tiếng Việt: vi-VN-NamMinhNeural (Nam) | vi-VN-HoaiMyNeural (Nữ)
-  # Tiếng Anh : en-US-ChristopherNeural | en-US-AriaNeural
+  # --- Edge-TTS Voices ---
+  # Vietnamese: vi-VN-NamMinhNeural (Male) | vi-VN-HoaiMyNeural (Female)
+  # English   : en-US-ChristopherNeural | en-US-AriaNeural
   voice: vi-VN-NamMinhNeural
-  rate: "+5%"                           # Chỉ áp dụng cho edge_tts
+  rate: "+5%"                           # Applies to edge_tts only
   sample_rate: 48000
 
 render:
   backend: ffmpeg_opencv
-  aspect_ratio: "16:9"                  # "16:9" (1280x720 / 1920x1080) hoặc "9:16" (720x1280 / 1080x1920)
+  aspect_ratio: "16:9"                  # "16:9" (1280x720 / 1920x1080) or "9:16" (720x1280 / 1080x1920)
   width: 1280
   height: 720
   fps: 24
-  crf: 22                               # 18 (rất nét) -> 28 (nhẹ file)
+  crf: 22                               # 18 (sharpest) -> 28 (smaller file)
   preset: veryfast                      # ultrafast | veryfast | fast | medium
   audio_bitrate: 192k
-  audio_channels: 2                     # 2 = stereo AAC (tương thích mọi trình phát)
-  max_shot_duration_ms: 3500            # Thời lượng tối đa 1 khung hình trước khi chuyển/cắt
-  burn_subtitles: true                  # true: đốt phụ đề vào video; false: chỉ xuất file .srt
+  audio_channels: 2                     # 2 = stereo AAC (compatible with all players)
+  max_shot_duration_ms: 3500            # Maximum duration for a single shot before cutting/transitioning
+  burn_subtitles: true                  # true: burn subtitles into video; false: export .srt file only
   subtitle_font_ratio: 0.036
-  # --- Điều chỉnh tốc độ & biên độ camera zoom (chuẩn hóa theo thời lượng shot) ---
-  zoom_speed_per_sec: 0.055             # Mức zoom mỗi giây (0.04 = chậm êm, 0.08 = nhanh kịch tính)
-  min_zoom_delta: 0.06                  # Biên độ zoom tối thiểu cho shot ngắn
-  max_zoom_delta: 0.18                  # Biên độ zoom tối đa cho shot dài
-  face_zoom_bonus: 0.04                 # Cộng thêm độ zoom khi focus vào khuôn mặt nhân vật
-  margin_ratio: 0.06                    # Viền nền mờ xung quanh panel (0.06 = 6%)
-  bottom_safe_ratio: 0.14               # Chừa vùng an toàn dưới đáy (14%) để phụ đề không đè lên panel
-  enable_transitions: true              # Bật crossfade / flash_white / fade_black mượt giữa các cảnh
-  enable_diptych: true                  # Ghép đôi 2 panel dọc hẹp cạnh nhau cho cân khung 16:9
-  bgm_path: assets/bgm/default_dark_fantasy.wav  # Nhạc nền fallback (khi có assets/music_library/catalog.json sẽ tự dùng Smart Music Director)
-  bgm_volume: 0.17                      # Âm lượng nhạc nền khi trộn với voiceover (sidechain tự nén nhỏ khi đọc)
-  bgm_ducking: true                     # Tự động nén nhỏ BGM khi giọng đọc vang lên (sidechain)
-  music_library_dir: assets/music_library # Kho dataset nhạc nền & SFX thật (quản lý bằng `manga-recap music fetch/index`)
-  min_bgm_cue_sec: 28.0                 # Thời lượng tối thiểu mỗi cue nhạc nền để tránh đổi bài liên tục theo từng beat
+  # --- Camera zoom speed & amplitude (normalized by shot duration) ---
+  zoom_speed_per_sec: 0.055             # Zoom rate per second (0.04 = slow/smooth, 0.08 = fast/dramatic)
+  min_zoom_delta: 0.06                  # Minimum zoom delta for short shots
+  max_zoom_delta: 0.18                  # Maximum zoom delta for long shots
+  face_zoom_bonus: 0.04                 # Extra zoom delta when focusing on a character's face
+  margin_ratio: 0.06                    # Blurred background margin around panel (0.06 = 6%)
+  bottom_safe_ratio: 0.14               # Bottom safe zone (14%) so subtitles do not overlap the panel
+  enable_transitions: true              # Enable smooth crossfade / flash_white / fade_black between scenes
+  enable_diptych: true                  # Pair 2 narrow vertical panels side-by-side to balance 16:9 frames
+  bgm_path: assets/bgm/default_dark_fantasy.wav  # Fallback BGM (automatically uses Smart Music Director when assets/music_library/catalog.json exists)
+  bgm_volume: 0.17                      # BGM volume when mixed with voiceover (sidechain automatically ducks during speech)
+  bgm_ducking: true                     # Automatically duck BGM volume when narration plays (sidechain)
+  music_library_dir: assets/music_library # Real BGM & SFX dataset directory (managed via `manga-recap music fetch/index`)
+  min_bgm_cue_sec: 28.0                 # Minimum duration per BGM cue to avoid switching tracks on every beat
 
 exporters:
   enabled:

@@ -538,10 +538,23 @@ def extract_distinctive_char_patterns(
     return out_pats
 
 
-def _compute_character_reveal_pages(page_analyses: list[PageAnalysis], bible: StoryBible) -> None:
-    """Populate first_named_page_id from the earliest page where a character's name is actually spoken."""
+def _compute_character_reveal_pages(
+    page_analyses: list[PageAnalysis],
+    bible: StoryBible,
+    already_revealed_names: set[str] | None = None,
+) -> None:
+    """Populate first_named_page_id from the earliest page where a character's name is actually spoken.
+
+    Characters already officially revealed in an earlier volume (already_revealed_names) keep
+    first_named_page_id = "" so Stage 3 can name them freely from page 1 of the new volume.
+    """
+    revealed_low = {n.strip().lower() for n in (already_revealed_names or set()) if n.strip()}
     canonical_set = {c.canonical_name.strip().lower() for c in bible.characters if c.canonical_name.strip()}
     for ch in bible.characters:
+        char_keys = {ch.canonical_name.strip().lower()} | {a.strip().lower() for a in ch.aliases if a.strip()}
+        if revealed_low and (char_keys & revealed_low):
+            ch.first_named_page_id = ""
+            continue
         pats = extract_distinctive_char_patterns(ch, canonical_set)
         if not pats:
             continue
@@ -956,6 +969,7 @@ class PageIndexBuilder:
         job_dir: Path,
         force: bool = False,
         prev_job_dir: Path | None = None,
+        series_ctx=None,
     ) -> tuple[PageIndexTree, StoryBible]:
         repo_dir = job_dir / "repo"
         notes_dir = repo_dir / "notes"
@@ -1228,7 +1242,7 @@ class PageIndexBuilder:
                 seed_cast_txt = ""
 
         prev_bible: StoryBible | None = None
-        if prev_job_dir is not None and (prev_job_dir / "02b_story_bible.json").exists():
+        if series_ctx is None and prev_job_dir is not None and (prev_job_dir / "02b_story_bible.json").exists():
             try:
                 prev_bible = StoryBible.model_validate_json(
                     (prev_job_dir / "02b_story_bible.json").read_text(encoding="utf-8")
@@ -1236,11 +1250,36 @@ class PageIndexBuilder:
             except Exception:
                 prev_bible = None
 
-        prev_bible_note = (
-            f"\nHồ sơ tập trước để giữ đồng bộ tên & phiên âm:\n{prev_bible.model_dump_json(indent=2)}\n"
-            if prev_bible
-            else ""
-        )
+        if series_ctx is not None:
+            s_chars = [
+                f"- {ch.canonical_name}"
+                + (f" (bí danh: {', '.join(ch.aliases[:4])})" if ch.aliases else "")
+                + f" [{ch.role}, {ch.status}]: {ch.appearance[:90]}"
+                for ch in series_ctx.state.characters[:28]
+            ]
+            terms_str = (
+                "; ".join(f"{k} -> {v}" for k, v in list(series_ctx.glossary.terminology.items())[:25])
+                if series_ctx.glossary.terminology
+                else ""
+            )
+            prev_bible_note = (
+                f"\nHồ sơ chuỗi tập (Series: {series_ctx.state.series_title or series_ctx.series_id}, Tập {series_ctx.volume_index}) "
+                f"— BẮT BUỘC giữ đồng bộ `canonical_name` và thuật ngữ:\n"
+                + ("\n".join(s_chars) if s_chars else "(chưa có nhân vật cũ)")
+                + (f"\nThuật ngữ chuẩn: {terms_str}" if terms_str else "")
+                + (
+                    f"\nMạch bí ẩn đang mở: {series_ctx.state.active_plot_threads[:8]}"
+                    if series_ctx.state.active_plot_threads
+                    else ""
+                )
+                + "\n"
+            )
+        else:
+            prev_bible_note = (
+                f"\nHồ sơ tập trước để giữ đồng bộ tên & phiên âm:\n{prev_bible.model_dump_json(indent=2)}\n"
+                if prev_bible
+                else ""
+            )
 
         # Build StoryBible (keep pronunciation_map empty by default unless user provides custom glossary)
         if self.llm.has_text_credentials:
@@ -1249,7 +1288,10 @@ class PageIndexBuilder:
                 system_prompt=(
                     "Bạn là StoryBibleAgent quản lý hồ sơ nhân vật chuẩn (canonical_name, aliases, role, "
                     "appearance, personality_notes, relationships) và mạch cốt truyện. "
-                    "Để trống `pronunciation_map` ({})."
+                    "VIẾT CÔ ĐỌNG, CHÍNH XÁC: chỉ giữ tối đa 16 nhân vật thực sự xuất hiện trong tập này "
+                    "(mỗi mô tả appearance/personality_notes tối đa 1 câu ngắn, relationships tối đa 3 mục), "
+                    "chapter_summaries ngắn gọn 2 câu (để trống important_panel_ids: []), ongoing_plot_threads tối đa 8 mục, "
+                    "và để trống `pronunciation_map` ({})."
                 ),
                 user_prompt=(
                     f"Series: {manifest.job_id}\n"
@@ -1316,7 +1358,31 @@ class PageIndexBuilder:
         else:
             pron_path.write_text("{}", encoding="utf-8")
 
-        _compute_character_reveal_pages(resolved_analyses, bible)
+        already_revealed: set[str] | None = None
+        if series_ctx is not None:
+            from src.series.memory import SeriesStore
+
+            # Series glossary overrides take precedence for title, character names, and TTS pronunciation
+            if series_ctx.state.series_title:
+                bible.series_title_guess = series_ctx.state.series_title
+            if series_ctx.glossary.pronunciation_map:
+                bible.pronunciation_map.update(series_ctx.glossary.pronunciation_map)
+            if series_ctx.glossary.character_name_overrides:
+                ov = {k.strip().lower(): v.strip() for k, v in series_ctx.glossary.character_name_overrides.items() if k.strip() and v.strip()}
+                for ch in bible.characters:
+                    if ch.canonical_name.strip().lower() in ov:
+                        new_n = ov[ch.canonical_name.strip().lower()]
+                        if new_n != ch.canonical_name:
+                            if ch.canonical_name not in ch.aliases:
+                                ch.aliases.append(ch.canonical_name)
+                            ch.canonical_name = new_n
+            already_revealed = SeriesStore.get_previously_revealed_names(
+                series_ctx.state, series_ctx.volume_index
+            )
+
+        _compute_character_reveal_pages(
+            resolved_analyses, bible, already_revealed_names=already_revealed
+        )
         tree_path.write_text(tree.model_dump_json(indent=2), encoding="utf-8")
         memory_path.write_text(render_memory_md(bible, tree), encoding="utf-8")
         bible_path.write_text(bible.model_dump_json(indent=2), encoding="utf-8")

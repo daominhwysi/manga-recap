@@ -1,52 +1,52 @@
-# Báo Cáo Tổng Kết Dự Án: Manga Recap Generator
+# Project Summary Report: Manga Recap Generator
 
-## 1. Nghiên cứu thị trường & Phương án tối ưu
+## 1. Market Research & Optimal Architecture
 
-### 1.1. Các giải pháp hiện có trên thị trường
-- **SaaS / Desktop thương mại:** *RecapManga*, *Magarecap*, *ScrollBard*, *WTN Suite*, *TofuToon*, *ToonRecap Desktop* (VN). Điểm mạnh là cắt dải webtoon nhanh, xuất timeline CapCut; điểm yếu là xử lý Manga 2D đọc phải→trái còn hạn chế và dễ bị "hội chứng robot" khi giữ mạch nhiều chương.
-- **Open-Source:** *AniFlow*, *Manhwa-Recap*, *Manga2Animate*, *Magi v2*. Mạnh ở lõi CV/prototyping nhưng thiếu kiến trúc multi-agent có Story Bible xuyên chương và Critic kiểm duyệt.
+### 1.1. Existing Market Solutions
+- **Commercial SaaS / Desktop:** *RecapManga*, *Magarecap*, *ScrollBard*, *WTN Suite*, *TofuToon*, *ToonRecap Desktop* (VN). Strengths include fast webtoon strip slicing and CapCut timeline export; weaknesses include limited support for 2D right-to-left Manga reading order and "robotic narration syndrome" across multi-chapter arcs.
+- **Open-Source:** *AniFlow*, *Manhwa-Recap*, *Manga2Animate*, *Magi v2*. Strong in CV/prototyping cores, but lack a multi-agent architecture with a cross-chapter Story Bible and a Critic verification gate.
 
-### 1.2. Phương án kiến trúc tối ưu đã chọn: Hybrid CV + Multi-Agent + Deterministic Render
-Thay vì giao 100% cho VLM (dễ cắt khung lệch, tốn chi phí API, sai nhịp video), hệ thống phân vai rõ ràng:
-1. **CV Truyền thống (ONNX YOLO Manga109 + OpenCV Gutter Slicer):** Tách khung chính xác từng pixel, phát hiện `face`/`body`, sắp xếp thứ tự đọc RTL/LTR/vertical và sinh ảnh **Set-of-Mark (SoM)** đánh số `[P1]`, `[P2]`...
+### 1.2. Selected Architecture: Hybrid CV + Multi-Agent + Deterministic Render
+Rather than delegating 100% of the pipeline to a VLM (which leads to misaligned panel crops, high API costs, and erratic video pacing), the system cleanly separates responsibilities:
+1. **Traditional CV (ONNX YOLO Manga109 + OpenCV Gutter Slicer):** Pixel-accurate panel extraction, `face`/`body`/`text` detection, RTL/LTR/vertical reading-order sorting, and **Set-of-Mark (SoM)** image annotation (`[P1]`, `[P2]`, ...).
 2. **Multi-Agent (`gpt-6-luna` + `gemini-3.8-flash-low-vision`):**
-   - `PageAnalyzerAgent`: Đọc ảnh SoM hiểu hành động, hội thoại, cảm xúc từng panel.
-   - `StoryBibleAgent`: Duy trì hồ sơ nhân vật & mạch cốt truyện xuyên nhiều chương.
-   - `ScriptwriterAgent`: Viết kịch bản theo persona (`kich_tinh`, `hai_huoc`, `phan_tich`).
-   - `CriticAgent`: Kiểm tra grounding `panel_id` hợp lệ và nhịp độ câu chữ.
-   - `ChoreographerAgent`: Phân bổ shot camera (`focus_face`, `zoom_in`, `zoom_out`, `shake_impact`) và phụ đề.
-3. **Audio & Render xác định:** VieNeu TTS (local tiếng Việt) / Edge-TTS + FFmpeg/OpenCV render `1280x720@24fps` kèm audio **AAC 48kHz stereo**, đồng thời xuất SRT, CapCut Draft (`capcut_draft/draft_content.json`) và HTML Storyboard (`preview.html`).
+   - `PageAnalyzerAgent`: Reads SoM pages to extract actions, dialogue, and emotion per panel.
+   - `StoryBibleAgent`: Maintains character profiles and plot threads across chapters.
+   - `ScriptwriterAgent`: Writes narration scripts matching the chosen persona (`kich_tinh`, `hai_huoc`, `phan_tich`).
+   - `CriticAgent`: Enforces valid `panel_id` grounding and script pacing invariants.
+   - `ChoreographerAgent`: Assigns camera motions (`focus_face`, `zoom_in`, `zoom_out`, `shake_impact`) and subtitle cues.
+3. **Deterministic Audio & Rendering:** VieNeu TTS (local Vietnamese) / Edge-TTS + FFmpeg/OpenCV rendering at `1280x720@24fps` with **AAC 48kHz stereo** audio, exporting SRT, CapCut Draft (`capcut_draft/draft_content.json`), and HTML Storyboard (`preview.html`).
 
 ---
 
-## 2. Cấu trúc Module hóa (Môi trường `uv`)
+## 2. Modular Structure (`uv` Environment)
 
-- `pyproject.toml`: Quản lý dependencies & CLI entrypoint `manga-recap` bằng `uv`.
-- `config.yaml`: Cấu hình trung tâm với `llm.default_model: gpt-6-luna`, `llm.vision_model: gemini-3.8-flash-low-vision`, `tts.backend: vieneu`, `render.audio_channels: 2`.
-- `configs/personas.yaml`: Khai báo các persona biên kịch.
+- `pyproject.toml`: Dependency management & `manga-recap` CLI entrypoint via `uv`.
+- `config.yaml`: Central configuration with `llm.default_model: gpt-6-luna`, `llm.vision_model: gemini-3.8-flash-low-vision`, `tts.backend: vieneu`, `render.audio_channels: 2`.
+- `configs/personas.yaml`: Scriptwriter persona definitions.
 - `src/core/`: `protocols.py`, `registry.py`, `telemetry.py`.
 - `src/schemas/`: `ingestion.py`, `analysis.py`, `script.py`, `timeline.py`.
-- `src/llm/client.py`: Client chuẩn OpenAI-compatible hỗ trợ text + vision, retry, telemetry và `offline_fallback`.
-- `src/cv/`: `loader.py` (hỗ trợ folder ảnh & CBZ/ZIP), `manga_detector.py`, `manhwa_slicer.py`, `som.py`, `stage.py`.
-- `src/downloaders/nyaa.py`: Tích hợp tải torrent từ `https://nyaa.si/view/<id>` qua `libtorrent`, lọc theo volume và tự động giải nén `.cbz`.
-- `src/agents/`: `page_analyzer.py`, `story_bible.py`, `scriptwriter.py`, `critic.py`, `choreographer.py`.
+- `src/llm/client.py`: OpenAI-compatible client supporting text + vision, retries, telemetry, and `offline_fallback`.
+- `src/cv/`: `loader.py` (image folders & CBZ/ZIP), `manga_detector.py`, `manhwa_slicer.py`, `som.py`, `stage.py`.
+- `src/downloaders/nyaa.py`: Torrent download integration from `https://nyaa.si/view/<id>` via `libtorrent`, with volume filtering and automatic `.cbz` extraction.
+- `src/agents/`: `page_analyzer.py`, `page_index.py`, `scriptwriter.py`, `critic.py`, `choreographer.py`.
 - `src/audio/`: `base.py`, `vieneu_tts.py`, `edge_tts_backend.py`, `stage.py`.
 - `src/render/` & `src/exporters/`: `compositor.py`, `subtitles.py`, `ffmpeg_renderer.py`, `capcut_draft.py`, `srt_exporter.py`, `html_preview.py`.
 
 ---
 
-## 3. Kết quả triển khai & Kiểm thử
+## 3. Implementation & Test Results
 
-### 3.1. Bộ kiểm thử tự động (`uv run pytest -q`)
-- **13/13 test cases PASSED** trong `1.47s` (`tests/test_config_and_registry.py`, `tests/test_schemas_and_json.py`, `tests/test_cv.py`, `tests/test_audio.py`, `tests/test_renderer_and_exporters.py`, `tests/test_downloader.py`).
+### 3.1. Automated Test Suite (`uv run pytest -q`)
+- **13/13 baseline test cases PASSED** in `1.47s` (`tests/test_config_and_registry.py`, `tests/test_schemas_and_json.py`, `tests/test_cv.py`, `tests/test_audio.py`, `tests/test_renderer_and_exporters.py`, `tests/test_downloader.py`).
 
-### 3.2. Sửa lỗi âm thanh `jobs/e2e_manga_multichap/06_output.mp4`
-- Đã re-mux âm thanh từ `04_voiceover.wav` sang chuẩn **AAC 48kHz stereo (`187 kb/s`)** và cập nhật mặc định `audio_channels: 2` trong `FFmpegOpenCVRenderer` (`mean_volume: -22.2 dB`, `max_volume: -4.1 dB`).
+### 3.2. Audio Fix for `jobs/e2e_manga_multichap/06_output.mp4`
+- Re-muxed audio from `04_voiceover.wav` to **AAC 48kHz stereo (`187 kb/s`)** and updated the `audio_channels: 2` default in `FFmpegOpenCVRenderer` (`mean_volume: -22.2 dB`, `max_volume: -4.1 dB`).
 
-### 3.3. Tải & tạo video review Pandora Hearts Vol 1 (`https://nyaa.si/view/1246645`)
-- Đã tải và giải nén thành công từ Nyaa.si vào `downloads/pandora_hearts/extracted/`.
-- Đã chạy pipeline hoàn chỉnh cho **Pandora Hearts Vol 1** (`--job-id pandora_hearts_vol1 --max-pages 30 --tts vieneu`):
-  - Stage 1 CV: Phát hiện `120` panels từ `30` trang đầu.
-  - Stage 4 TTS (`vieneu`, giọng `Thiện Minh`): `101.36s`.
-  - Stage 5–6 Render: `jobs/pandora_hearts_vol1/06_output.mp4` (`00:01:41.36`, `1280x720@24fps`, `aac 48kHz stereo`, `mean_volume: -22.0 dB`, `9,987,870 bytes`), kèm `06_subtitles.srt`, `capcut_draft/`, `preview.html`, `telemetry.json`.
-  - *Lưu ý:* Do môi trường hiện tại chưa cấu hình `OPENAI_API_KEY` / `VISION_API_KEY` trong `.env`, Stage 2–3 chạy qua `offline_fallback`. Chỉ cần thêm API key vào `.env` để kích hoạt phân tích hình ảnh và viết kịch bản trực tiếp qua `gpt-6-luna` và `gemini-3.8-flash-low-vision`.
+### 3.3. End-to-End Run: Pandora Hearts Vol 1 (`https://nyaa.si/view/1246645`)
+- Downloaded and extracted from Nyaa.si into `downloads/pandora_hearts/extracted/`.
+- Executed the full pipeline on **Pandora Hearts Vol 1** (`--job-id pandora_hearts_vol1 --max-pages 30 --tts vieneu`):
+  - Stage 1 CV: Detected `120` panels across the first `30` pages.
+  - Stage 4 TTS (`vieneu`, voice `Thiện Minh`): `101.36s`.
+  - Stage 5–6 Render: `jobs/pandora_hearts_vol1/06_output.mp4` (`00:01:41.36`, `1280x720@24fps`, `aac 48kHz stereo`, `mean_volume: -22.0 dB`, `9,987,870 bytes`), alongside `06_subtitles.srt`, `capcut_draft/`, `preview.html`, and `telemetry.json`.
+  - *Note:* When `OPENAI_API_KEY` / `VISION_API_KEY` are not configured in `.env`, Stages 2–3 execute via `offline_fallback`. Add API keys to `.env` to enable live vision analysis and scriptwriting via `gpt-6-luna` and `gemini-3.8-flash-low-vision`.

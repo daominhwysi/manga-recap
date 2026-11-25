@@ -124,6 +124,7 @@ _TEXT_FIXABLE_CATEGORIES = {
     "tic_repeat",
     "seam_echo",
     "semantic_repeat",
+    "series_continuity",
 }
 
 # General Vietnamese conversational filler tics/particles (capped globally across any position in beat)
@@ -357,6 +358,7 @@ class CriticAgent:
         bible: StoryBible | None = None,
         page_analyses: list[PageAnalysis] | None = None,
         part_bounds: list[dict] | None = None,
+        series_ctx=None,
     ) -> tuple[list[CriticIssue], set[int], list[str]]:
         """Layer 1: Evaluate hard invariants + semantic panel alignment + statistical opener/seam repetition."""
         issues: list[CriticIssue] = []
@@ -627,6 +629,87 @@ class CriticAgent:
                 for li in longest_indices:
                     flagged_indices.add(li)
                 flagged_notes.append(b_msg)
+
+        # Series Continuity Gate: glossary/override drift, cross-volume opening echo & seamless hygiene
+        if series_ctx is not None and beats:
+            gl = getattr(series_ctx, "glossary", None)
+            if gl is not None:
+                deprecated_map: dict[str, str] = {}
+                for raw_k, canon_v in gl.character_name_overrides.items():
+                    rk, cv = raw_k.strip(), canon_v.strip()
+                    if rk and cv and rk.lower() != cv.lower() and len(rk) >= 2:
+                        deprecated_map[rk] = cv
+                for raw_k, canon_v in gl.terminology.items():
+                    rk, cv = raw_k.strip(), canon_v.strip()
+                    # Skip explanatory expansions where canonical form already contains the source term (e.g. "X" -> "X (explanation)")
+                    if rk and cv and rk.lower() not in cv.lower() and len(rk) >= 2:
+                        deprecated_map[rk] = cv
+                for rk, cv in deprecated_map.items():
+                    pat = re.compile(rf"(?<!\w){re.escape(rk)}(?!\w)", flags=re.IGNORECASE | re.UNICODE)
+                    for idx, b in enumerate(beats):
+                        if pat.search(b.narration_vi) and cv.lower() not in b.narration_vi.lower():
+                            g_msg = (
+                                f"{b.beat_id} dùng thuật ngữ/tên chưa đồng nhất '{rk}' — "
+                                f"hãy đổi sang bản chuẩn trong glossary: '{cv}'."
+                            )
+                            issues.append(
+                                CriticIssue(
+                                    beat_id=b.beat_id,
+                                    severity="warning",
+                                    category="series_continuity",
+                                    message=g_msg,
+                                )
+                            )
+                            flagged_indices.add(idx)
+                            flagged_notes.append(g_msg)
+
+            ho = getattr(getattr(series_ctx, "state", None), "last_handoff", None)
+            vol_idx = int(getattr(series_ctx, "volume_index", 1) or 1)
+            if ho is not None and ho.volume_index < vol_idx and ho.last_beats_tail:
+                tail_ngrams: set[str] = set()
+                for t_line in ho.last_beats_tail[-2:]:
+                    tail_ngrams |= _content_ngrams(t_line)
+                if len(tail_ngrams) >= 4:
+                    for idx in range(min(2, len(beats))):
+                        b_ng = _content_ngrams(beats[idx].narration_vi)
+                        if len(b_ng) >= 4:
+                            ov = len(b_ng & tail_ngrams) / min(len(b_ng), len(tail_ngrams))
+                            if ov >= 0.45:
+                                e_msg = (
+                                    f"{beats[idx].beat_id} lặp lại gần nguyên văn đoạn kết của tập {ho.volume_index} "
+                                    f"(overlap={ov:.0%}) — hãy nối gọn và đi thẳng vào diễn biến mới."
+                                )
+                                issues.append(
+                                    CriticIssue(
+                                        beat_id=beats[idx].beat_id,
+                                        severity="warning",
+                                        category="series_continuity",
+                                        message=e_msg,
+                                    )
+                                )
+                                flagged_indices.add(idx)
+                                flagged_notes.append(e_msg)
+
+            if getattr(series_ctx, "continuity_mode", "episodic") == "seamless" and vol_idx > 1:
+                first_low = beats[0].narration_vi.lower()
+                seamless_banned = ("chào mừng", "quay trở lại với tập", "ở tập trước chúng ta")
+                for sb in seamless_banned:
+                    if sb in first_low:
+                        s_msg = (
+                            f"{beats[0].beat_id} có lời chào/nhắc tập rời '{sb}' trong chế độ seamless "
+                            f"— hãy bỏ câu chào để ghép liền mạch trực tiếp với tập {vol_idx - 1}."
+                        )
+                        issues.append(
+                            CriticIssue(
+                                beat_id=beats[0].beat_id,
+                                severity="warning",
+                                category="series_continuity",
+                                message=s_msg,
+                            )
+                        )
+                        flagged_indices.add(0)
+                        flagged_notes.append(s_msg)
+                        break
 
         return issues, flagged_indices, flagged_notes
 
@@ -1007,6 +1090,7 @@ class CriticAgent:
         force: bool = False,
         script_config: ScriptConfig | None = None,
         page_analyses: list[PageAnalysis] | None = None,
+        series_ctx=None,
     ) -> tuple[RecapScript, CriticReport]:
         job_dir.mkdir(parents=True, exist_ok=True)
         final_path = job_dir / "03b_script_final.json"
@@ -1085,7 +1169,7 @@ class CriticAgent:
             else None
         )
 
-        # Layer 1: Deterministic Gate + Semantic Visual-Audio Alignment + Repetition Scanner
+        # Layer 1: Deterministic Gate + Semantic Visual-Audio Alignment + Repetition Scanner + Series Continuity
         issues_eval, flagged_indices, flagged_notes = self._evaluate_issues(
             cleaned_beats,
             all_pages=all_pages,
@@ -1095,6 +1179,7 @@ class CriticAgent:
             bible=bible,
             page_analyses=page_analyses,
             part_bounds=part_bounds,
+            series_ctx=series_ctx,
         )
 
         # Layer 3a (Visual): Surgical Panel Repair when alignment/coverage errors survive Stage 3a
@@ -1119,6 +1204,7 @@ class CriticAgent:
                 bible=bible,
                 page_analyses=page_analyses,
                 part_bounds=part_bounds,
+                series_ctx=series_ctx,
             )
 
         # Layer 2 (Read-Only Semantic Auditor) + Layer 3 (Allowlisted Surgical Repairer, up to 2 rounds)
@@ -1165,6 +1251,7 @@ class CriticAgent:
                     bible=bible,
                     page_analyses=page_analyses,
                     part_bounds=part_bounds,
+                    series_ctx=series_ctx,
                 )
 
                 # Round 2: ONLY if text-fixable severity="error" remains (never waste LLM calls on structural errors)
@@ -1206,6 +1293,7 @@ class CriticAgent:
                             bible=bible,
                             page_analyses=page_analyses,
                             part_bounds=part_bounds,
+                            series_ctx=series_ctx,
                         )
 
         # Step 3: Populate TTS pronunciation-normalized strings without mutating display subtitles

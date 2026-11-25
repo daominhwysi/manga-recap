@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 class ProjectConfig(BaseModel):
     name: str = "manga_recap_generator"
     jobs_dir: Path = Path("jobs")
+    series_dir: Path = Path("series")
     downloads_dir: Path = Path("downloads")
     default_language: str = "vi"
     default_persona: str = "kich_tinh"

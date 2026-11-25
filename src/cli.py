@@ -16,7 +16,9 @@ from src.pipeline import MangaRecapPipeline
 
 app = typer.Typer(help="Automated multi-agent Manga & Manhwa Recap Video Generator")
 music_app = typer.Typer(help="Manage automated royalty-free BGM & SFX music dataset")
+series_app = typer.Typer(help="Manage multi-volume Series continuity, glossary, batch runs & Arc compilations")
 app.add_typer(music_app, name="music")
+app.add_typer(series_app, name="series")
 console = Console()
 
 
@@ -29,6 +31,9 @@ def run(
     tts_backend: Optional[str] = typer.Option(None, "--tts", help="Override TTS backend (edge_tts, vieneu)"),
     max_pages: Optional[int] = typer.Option(None, "--max-pages", help="Limit pages per chapter"),
     prev_job: Optional[Path] = typer.Option(None, "--prev-job", help="Optional previous volume job dir for cast continuity"),
+    series_id: Optional[str] = typer.Option(None, "--series-id", "-s", help="Series identifier for persistent multi-volume memory"),
+    volume: int = typer.Option(1, "--vol", help="Volume index (1-based) when running with --series-id"),
+    continuity_mode: str = typer.Option("episodic", "--mode", help="Series continuity mode: episodic | seamless | standalone"),
     force: bool = typer.Option(False, "--force", "-f", help="Ignore cached checkpoints"),
     skip_render: bool = typer.Option(False, "--skip-render", help="Run stages 1-5 + exporters without MP4 render"),
 ) -> None:
@@ -39,7 +44,23 @@ def run(
     if max_pages is not None:
         cfg.cv.max_pages_per_chapter = max_pages
 
-    console.print(f"[bold cyan]Starting job:[/] {job_id} (model={cfg.llm.default_model})")
+    series_ctx = None
+    if series_id:
+        from src.series.memory import SeriesStore
+
+        store = SeriesStore(cfg.project.series_dir / series_id, series_id)
+        series_ctx = store.build_context(
+            volume_index=volume,
+            continuity_mode=continuity_mode,
+            persona=persona or cfg.project.default_persona,
+            tts_voice=cfg.tts.voice,
+        )
+
+    console.print(
+        f"[bold cyan]Starting job:[/] {job_id} (model={cfg.llm.default_model}"
+        + (f", series={series_id} vol={volume} mode={continuity_mode}" if series_id else "")
+        + ")"
+    )
     pipeline = MangaRecapPipeline(cfg)
     result = pipeline.run(
         input_path=input_path,
@@ -48,6 +69,7 @@ def run(
         force=force,
         skip_render=skip_render,
         prev_job_dir=prev_job,
+        series_ctx=series_ctx,
     )
     console.print(f"[bold green]Done![/] Output: {result}")
 
@@ -206,6 +228,193 @@ def music_list(
             f"{tr.duration_sec:.0f}",
         )
     console.print(tbl)
+
+
+@series_app.command("run")
+def series_run(
+    input_dir: Path = typer.Argument(..., help="Directory containing volume CBZs/ZIPs or volume subfolders"),
+    series_id: str = typer.Option(..., "--series-id", "-s", help="Series identifier stored under series/<id>/"),
+    config_path: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="Path to config.yaml"),
+    persona: Optional[str] = typer.Option(None, "--persona", "-p", help="Narration persona locked across the series"),
+    tts_backend: Optional[str] = typer.Option(None, "--tts", help="Override TTS backend (edge_tts, vieneu)"),
+    mode: str = typer.Option("episodic", "--mode", "-m", help="Continuity mode: episodic (separate episodes) | seamless (merge-ready)"),
+    from_vol: int = typer.Option(1, "--from-vol", help="Start volume index (1-based)"),
+    to_vol: Optional[int] = typer.Option(None, "--to-vol", help="End volume index (1-based, inclusive)"),
+    compile_every: Optional[int] = typer.Option(None, "--compile-every", help="Auto-compile Arc video every N volumes"),
+    compile_all: bool = typer.Option(False, "--compile-all", help="Auto-compile all completed volumes into 1 full-series MP4"),
+    force: bool = typer.Option(False, "--force", "-f", help="Ignore cached volume checkpoints"),
+    skip_render: bool = typer.Option(False, "--skip-render", help="Run stages 1-5 + exporters + Series Memory without MP4 render"),
+) -> None:
+    """Run an entire multi-volume manga series sequentially with Portrait Vault & 3-tier Series Memory."""
+    from src.series.orchestrator import SeriesOrchestrator
+
+    cfg = load_config(config_path)
+    if tts_backend:
+        cfg.tts.backend = tts_backend
+
+    orch = SeriesOrchestrator(cfg)
+    console.print(
+        f"[bold cyan]Starting series run:[/] {series_id} (mode={mode}, from={from_vol}, to={to_vol or 'end'})"
+    )
+    rep = orch.run_series(
+        input_dir=input_dir,
+        series_id=series_id,
+        continuity_mode=mode,
+        persona=persona,
+        from_vol=from_vol,
+        to_vol=to_vol,
+        compile_every=compile_every,
+        compile_all=compile_all,
+        force=force,
+        skip_render=skip_render,
+        on_volume_start=lambda v, tot, p, jid: console.print(
+            f"[bold magenta]>>> Volume {v}/{tot}:[/] {p.name} -> job={jid}"
+        ),
+    )
+    console.print(
+        f"[bold green]Series complete![/] Processed {len(rep.volumes_processed)} volume(s): {rep.volumes_processed}"
+    )
+    console.print(f"[cyan]Glossary (editable anytime):[/] {Path(rep.series_dir) / 'glossary.yaml'}")
+    for comp in rep.compilations:
+        console.print(
+            f"[bold green]Compiled video:[/] {comp.output_mp4} (vols={comp.volumes_included}, {comp.total_duration_sec:.1f}s)"
+        )
+
+
+@series_app.command("compile")
+def series_compile(
+    series_id: str = typer.Argument(..., help="Series identifier under series/<id>/"),
+    volumes: Optional[str] = typer.Option(None, "--volumes", "-v", help="Volume range e.g. '1-6' or '1,2,3' (default: all)"),
+    output_name: Optional[str] = typer.Option(None, "--name", "-n", help="Custom output filename stem"),
+    reencode: bool = typer.Option(False, "--reencode", help="Re-encode via libx264 instead of lossless stream copy"),
+    config_path: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="Path to config.yaml"),
+) -> None:
+    """Merge already-rendered volumes into 1 seamless Arc or Full-Series MP4 + SRT + YouTube Chapters + Credits."""
+    from src.series.compiler import compile_series_videos, parse_volume_range
+    from src.series.memory import SeriesStore
+
+    cfg = load_config(config_path)
+    store = SeriesStore(cfg.project.series_dir / series_id, series_id)
+    if not store.state_path.exists():
+        console.print(f"[bold red]Series not found:[/] {store.series_dir}")
+        raise typer.Exit(code=1)
+
+    state, _ = store.load_or_init()
+    avail = [e.volume_index for e in state.ledger]
+    selected = parse_volume_range(volumes, avail)
+    if not selected:
+        console.print(f"[bold yellow]No matching completed volumes.[/] Available: {avail}")
+        raise typer.Exit(code=1)
+
+    res = compile_series_videos(
+        state=state,
+        jobs_dir=cfg.project.jobs_dir,
+        out_dir=store.compilations_dir,
+        volumes=selected,
+        output_name=output_name,
+        reencode=reencode,
+    )
+    console.print(f"[bold green]Compiled MP4:[/] {res.output_mp4} ({res.total_duration_sec:.1f}s)")
+    console.print(f"[cyan]Merged SRT:[/] {res.output_srt}")
+    console.print(f"[cyan]YouTube Chapters:[/] {res.chapters_path}")
+    console.print(f"[cyan]Music Credits:[/] {res.credits_path}")
+
+
+@series_app.command("status")
+def series_status(
+    series_id: str = typer.Argument(..., help="Series identifier under series/<id>/"),
+    config_path: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="Path to config.yaml"),
+) -> None:
+    """Inspect processed volumes, Portrait Vault characters, active plot threads, and glossary."""
+    from src.series.memory import SeriesStore
+
+    cfg = load_config(config_path)
+    store = SeriesStore(cfg.project.series_dir / series_id, series_id)
+    if not store.state_path.exists():
+        console.print(f"[bold red]Series not found:[/] {store.series_dir}")
+        raise typer.Exit(code=1)
+
+    state, glossary = store.load_or_init()
+    console.print(
+        f"[bold cyan]Series:[/] {state.series_title or state.series_id} | "
+        f"Volumes: {len(state.ledger)} | Characters: {len(state.characters)} | "
+        f"Glossary terms: {len(glossary.terminology)} | Pronouns: {len(glossary.pronoun_pairs)}"
+    )
+    if state.ledger:
+        t_vol = Table(title="Completed Volumes")
+        t_vol.add_column("Vol", justify="right")
+        t_vol.add_column("Job ID")
+        t_vol.add_column("Title")
+        t_vol.add_column("Dur (s)", justify="right")
+        t_vol.add_column("MP4")
+        for e in state.ledger:
+            t_vol.add_row(
+                str(e.volume_index),
+                e.job_id,
+                e.title_vi[:44],
+                f"{e.duration_sec:.1f}",
+                "OK" if (e.output_mp4 and Path(e.output_mp4).exists()) else "-",
+            )
+        console.print(t_vol)
+
+    if state.characters:
+        t_ch = Table(title="Series Cast & Portrait Vault")
+        t_ch.add_column("ID")
+        t_ch.add_column("Canonical Name")
+        t_ch.add_column("Status")
+        t_ch.add_column("Vols")
+        t_ch.add_column("Revealed")
+        t_ch.add_column("Portrait")
+        for ch in state.characters[:24]:
+            has_p = bool(ch.portrait_path and Path(ch.portrait_path).exists())
+            t_ch.add_row(
+                ch.char_id,
+                ch.canonical_name,
+                ch.status,
+                f"{ch.first_seen_vol}..{ch.last_seen_vol}",
+                f"v{ch.first_revealed_vol}" if ch.first_revealed_vol else "-",
+                "YES" if has_p else "no",
+            )
+        console.print(t_ch)
+
+
+@series_app.command("glossary")
+def series_glossary(
+    series_id: str = typer.Argument(..., help="Series identifier under series/<id>/"),
+    config_path: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="Path to config.yaml"),
+) -> None:
+    """Display path and contents of the human-editable series glossary.yaml."""
+    from src.series.memory import SeriesStore
+
+    cfg = load_config(config_path)
+    store = SeriesStore(cfg.project.series_dir / series_id, series_id)
+    store.load_or_init()
+    console.print(f"[bold cyan]Glossary path:[/] {store.glossary_path.resolve()}")
+    console.print(store.glossary_path.read_text(encoding="utf-8"))
+
+
+@series_app.command("import-job")
+def series_import_job(
+    series_id: str = typer.Argument(..., help="Target series identifier under series/<id>/"),
+    job_dir: Path = typer.Argument(..., help="Path to an existing completed job directory (e.g. jobs/my_vol1)"),
+    volume: int = typer.Option(1, "--vol", "-v", help="Volume index (1-based) for the imported job"),
+    config_path: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="Path to config.yaml"),
+) -> None:
+    """Bootstrap Series Memory & Portrait Vault from an already-completed volume job without re-running it."""
+    from src.llm.client import LLMClient
+    from src.series.memory import SeriesStore
+
+    cfg = load_config(config_path)
+    store = SeriesStore(cfg.project.series_dir / series_id, series_id)
+    llm = LLMClient(cfg.llm)
+    state, glossary = store.import_completed_job(job_dir=job_dir, volume_index=volume, llm=llm)
+    portraits_saved = sum(1 for ch in state.characters if ch.portrait_path and Path(ch.portrait_path).exists())
+    console.print(
+        f"[bold green]Imported Vol {volume} from {job_dir} into series '{series_id}'![/]\n"
+        f"  Characters: {len(state.characters)} ({portraits_saved} portraits in Vault)\n"
+        f"  Active threads: {len(state.active_plot_threads)} | Terminology: {len(glossary.terminology)} | Pronouns: {len(glossary.pronoun_pairs)}\n"
+        f"  Glossary: {store.glossary_path.resolve()}"
+    )
 
 
 if __name__ == "__main__":

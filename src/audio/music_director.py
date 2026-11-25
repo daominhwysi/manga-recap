@@ -176,12 +176,14 @@ def select_tracks_for_cues(
     cues: list[MusicCue],
     catalog: MusicCatalog,
     genre_prefs: dict[str, float] | None = None,
+    avoid_initial_track_ids: list[str] | None = None,
 ) -> list[MusicCue]:
     """Assign optimal, non-repeating catalog tracks to each cue based on mood, genre palette & energy."""
     if not catalog.tracks:
         return cues
 
     prefs = genre_prefs or {"general": 1.0}
+    avoid_first = set(avoid_initial_track_ids or [])
     target_energy = {
         "calm": 1.8,
         "warm": 2.3,
@@ -195,7 +197,7 @@ def select_tracks_for_cues(
     prev_track_id = ""
     planned: list[MusicCue] = []
 
-    for cue in cues:
+    for cue_idx, cue in enumerate(cues):
         best_track: MusicTrack | None = None
         best_score = -1e9
         t_eng = target_energy.get(cue.mood, 3.0)
@@ -217,9 +219,11 @@ def select_tracks_for_cues(
             # Energy fit
             sc += max(0.0, 1.0 - abs(tr.energy - t_eng) * 0.35)
 
-            # Anti-repeat penalties (strong penalty for immediate consecutive reuse)
+            # Anti-repeat penalties (strong penalty for immediate consecutive reuse + cross-volume opener variety)
             if tr.track_id == prev_track_id:
                 sc -= 4.2
+            if cue_idx == 0 and tr.track_id in avoid_first:
+                sc -= 3.2
             sc -= used_counts.get(tr.track_id, 0) * 1.4
 
             # Slightly prefer tracks longer than cue duration to minimize looping
@@ -367,6 +371,8 @@ def mix_directed_bgm(
     sample_rate: int = 48000,
     credits_path: Path | None = None,
     cues_json_path: Path | None = None,
+    genre_prefs_override: dict[str, float] | None = None,
+    avoid_initial_track_ids: list[str] | None = None,
 ) -> Path | None:
     """Render full-length BGM track from catalog.json using scene-level cues, LUFS matching & equal-power crossfade.
 
@@ -377,9 +383,18 @@ def mix_directed_bgm(
         return None
 
     lib_root = Path(library_dir)
-    genre_prefs = infer_genre_preferences(tone_summary=tone_summary, title=title)
+    genre_prefs = (
+        dict(genre_prefs_override)
+        if genre_prefs_override
+        else infer_genre_preferences(tone_summary=tone_summary, title=title)
+    )
     raw_cues = plan_music_cues(timeline, min_cue_duration_ms=min_cue_duration_ms)
-    planned_cues = select_tracks_for_cues(raw_cues, catalog, genre_prefs=genre_prefs)
+    planned_cues = select_tracks_for_cues(
+        raw_cues,
+        catalog,
+        genre_prefs=genre_prefs,
+        avoid_initial_track_ids=avoid_initial_track_ids,
+    )
     track_lookup = {t.track_id: t for t in catalog.tracks}
 
     dur_sec = max(1.0, timeline.total_duration_ms / 1000.0)
