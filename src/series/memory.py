@@ -30,11 +30,11 @@ if TYPE_CHECKING:
     from src.llm.client import LLMClient
 
 
-_GLOSSARY_HEADER = """# Từ điển Series (có thể sửa tay bất cứ lúc nào giữa các tập — luôn được ưu tiên tuyệt đối)
-# - terminology: khóa cách dịch cố định cho chiêu thức, tổ chức, địa danh, vật phẩm (VD: "Source Term": "Bản dịch chuẩn")
-# - pronoun_pairs: khóa cặp đại từ xưng hô giữa 2 nhân vật (VD: "Nhân vật A -> Nhân vật B": "cậu - cô")
-# - character_name_overrides: ép đổi tên cũ/sai sang tên chuẩn mới (VD: "Tên sai": "Tên chuẩn")
-# - pronunciation_map: ghi đè phiên âm cho TTS nếu cần (mặc định để trống để TTS đọc tự nhiên)
+_GLOSSARY_HEADER = """# Series Glossary (human-editable at any time between volumes — always takes absolute precedence)
+# - terminology: lock canonical translations for techniques, organizations, locations, items (e.g., "Source Term": "Canonical Translation")
+# - pronoun_pairs: lock pronoun/addressing pairs between two characters (e.g., "Character A -> Character B": "cậu - cô")
+# - character_name_overrides: force-replace old/misspelled names with the canonical name (e.g., "Wrong Name": "Canonical Name")
+# - pronunciation_map: override TTS phonetic pronunciation if needed (empty by default for natural TTS delivery)
 """
 
 
